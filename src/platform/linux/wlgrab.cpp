@@ -12,6 +12,7 @@
 #include "src/video.h"
 #include "vaapi.h"
 #include "wayland.h"
+#include "wayland_stats.h"
 
 using namespace std::literals;
 
@@ -172,6 +173,30 @@ namespace wl {
      * @return Capture status reported to the streaming pipeline.
      */
     inline platf::capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor) {
+      auto status = request_frame(timeout, cursor);
+
+      // Reinitializing destroys the display and with it every capture buffer
+      const auto counters = wl::stats::snapshot();
+      if (wl::stats::over_cap(counters)) {
+        BOOST_LOG(warning) << "[wayland] Too many live capture buffers, reinitializing capture: "sv << wl::stats::format(counters, platf::count_open_fds());
+        return platf::capture_e::reinit;
+      }
+
+      if (stats_gate.due(std::chrono::steady_clock::now())) {
+        BOOST_LOG(info) << "[wayland] capture buffers: "sv << wl::stats::format(counters, platf::count_open_fds());
+      }
+
+      return status;
+    }
+
+    /**
+     * @brief Request a screencopy frame and wait for it.
+     *
+     * @param timeout Maximum time to wait for the frame.
+     * @param cursor Whether the compositor should include the cursor.
+     * @return Capture status reported to the streaming pipeline.
+     */
+    platf::capture_e request_frame(std::chrono::milliseconds timeout, bool cursor) {
       auto to = std::chrono::steady_clock::now() + timeout;
 
       // Dispatch events until we get a new frame or the timeout expires
@@ -205,6 +230,7 @@ namespace wl {
     dmabuf_t dmabuf;  ///< DMA-BUF feedback and format state advertised by the compositor.
 
     wl_output *output;  ///< Wayland output selected for capture.
+    wl::stats::periodic_gate_t stats_gate {60s};  ///< Limits the capture buffer statistics log line to about once a minute.
   };
 
   /**

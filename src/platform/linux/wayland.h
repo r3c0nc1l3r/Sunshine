@@ -9,6 +9,7 @@
 #include <bitset>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -192,9 +193,17 @@ namespace wl {
      */
     void listen(zwlr_screencopy_manager_v1 *screencopy_manager, zwp_linux_dmabuf_v1 *dmabuf_interface, const std::map<std::uint32_t, std::vector<std::uint64_t>> *supported_modifiers, wl_output *output, bool blend_cursor = false);
     /**
+     * @brief Cancel the screencopy request that is still waiting, if any.
+     *
+     * Destroys the pending frame (the library drops its late events), releases the request's GBM buffer, `wl_buffer`
+     * and the exported descriptors of the next frame, and leaves the state at `READY`. A buffer-params request still in
+     * flight is kept as an orphan and cleaned up when the compositor answers it.
+     */
+    void cancel();
+    /**
      * @brief Store the Wayland buffer created for a DMA-BUF parameter request.
      *
-     * @param data Pointer to the `dmabuf_t` instance associated with the callback.
+     * @param data Pointer to the `params_request_t` that tracks the request.
      * @param params DMA-BUF parameter object that completed buffer creation.
      * @param wl_buffer Wayland buffer created from the DMA-BUF planes.
      */
@@ -202,7 +211,7 @@ namespace wl {
     /**
      * @brief Mark DMA-BUF buffer creation as failed.
      *
-     * @param data Pointer to the `dmabuf_t` instance associated with the callback.
+     * @param data Pointer to the `params_request_t` that tracks the request.
      * @param params DMA-BUF parameter object that failed buffer creation.
      */
     static void buffer_params_failed(void *data, struct zwp_linux_buffer_params_v1 *params);
@@ -279,8 +288,21 @@ namespace wl {
     zwlr_screencopy_frame_v1_listener listener;  ///< Callback table registered on screencopy frames.
 
   private:
+    /**
+     * @brief One `zwp_linux_buffer_params_v1` create request that has not been answered yet.
+     */
+    struct params_request_t {
+      dmabuf_t *owner;  ///< Capture state that sent the request.
+      zwlr_screencopy_frame_v1 *frame;  ///< Screencopy frame the request belongs to, or nullptr once it is an orphan.
+      zwp_linux_buffer_params_v1 *params;  ///< The pending parameter object.
+    };
+
     bool init_gbm();
     void cleanup_gbm();
+    void destroy_bo();
+    void destroy_wl_buffer();
+    void finish_request(zwlr_screencopy_frame_v1 *frame);
+    void erase_params_request(const params_request_t *request);
     void create_and_copy_dmabuf(zwlr_screencopy_frame_v1 *frame);
 
     zwp_linux_dmabuf_v1 *dmabuf_interface {nullptr};
@@ -301,6 +323,8 @@ namespace wl {
       std::uint32_t height;
     } dmabuf_info;
 
+    zwlr_screencopy_frame_v1 *pending_frame {nullptr};  ///< Screencopy frame of the request in flight, or nullptr.
+    std::vector<std::unique_ptr<params_request_t>> params_requests;  ///< Unanswered params requests, including orphans.
     gbm_device_t gbm;  ///< GBM device and render-node descriptor used to allocate capture buffers.
     struct gbm_bo *current_bo {nullptr};
     struct wl_buffer *current_wl_buffer {nullptr};
