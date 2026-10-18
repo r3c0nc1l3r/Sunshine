@@ -72,6 +72,8 @@ The rules above are upstream's. This section adds the rules for this fork.
 - The Arch package comes from `packaging/linux/Arch/PKGBUILD`, configured with
   `cmake -DSUNSHINE_CONFIGURE_ONLY=ON -DSUNSHINE_CONFIGURE_PKGBUILD=ON` and the env vars `BRANCH`, `BUILD_VERSION`,
   `CLONE_URL` (this fork) and `COMMIT` (a pushed commit). Set `_use_cuda=false` for the VA-API build.
+- `scripts/lanternbox/build_arch_pkg.sh --commit <sha> --base-version <ver> --release <n> --out <dir>` builds that package
+  in a disposable `archlinux:base-devel` container; run it with `--help` for options.
 
 ## Rules
 - Never open issues, PRs or comments on LizardByte projects. Fork changes stay upstream-ready (clean, opt-in where they
