@@ -17,6 +17,7 @@
 #include <Simple-Web-Server/server_https.hpp>
 
 // local includes
+#include "rtsp.h"
 #include "thread_safe.h"
 
 /**
@@ -77,6 +78,31 @@ namespace confighttp {
   void browseDirectory(const resp_https_t &response, const req_https_t &request);
   void getLocale(const resp_https_t &response, const req_https_t &request);
   void getCSRFToken(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief List the active streaming sessions.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void getSessions(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief Close one streaming session by id (`POST /api/sessions/<id>/close`).
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client; `path_match[1]` is the session id.
+   */
+  void closeSession(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief Convert a session description to the JSON object returned by `GET /api/sessions`.
+   *
+   * @param info Session description.
+   * @return Object with `id`, `client_name`, `client_uuid`, `peer_address`, `app_id`, `started` (Unix seconds),
+   *         `width`, `height`, `fps`, `video_format`, `dynamic_range` and `state`.
+   */
+  nlohmann::json session_info_to_json(const rtsp_stream::session_info_t &info);
 
   /**
    * @brief List authenticated pairing requests awaiting operator approval.
