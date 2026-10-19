@@ -12,7 +12,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
-#include <map>
 #include <mutex>
 #include <poll.h>
 #include <sstream>
@@ -331,36 +330,6 @@ namespace handoff {
      * @brief Identity of a socket file: device and inode.
      */
     using file_id_t = std::pair<dev_t, ino_t>;
-
-    std::mutex bound_mutex;  ///< Guards `bound_ids`.
-    std::map<const control_server_t *, file_id_t> bound_ids;  ///< Socket file each server bound, by server.
-
-    /**
-     * @brief Record the socket file a server bound (the header has no member for it).
-     *
-     * @param server Server.
-     * @param id Device and inode of the socket file; `std::nullopt` forgets the entry.
-     */
-    void set_bound_id(const control_server_t *server, std::optional<file_id_t> id) {
-      std::lock_guard lock(bound_mutex);
-      if (id) {
-        bound_ids[server] = *id;
-      } else {
-        bound_ids.erase(server);
-      }
-    }
-
-    /**
-     * @brief The socket file a server bound.
-     *
-     * @param server Server.
-     * @return Device and inode, or `std::nullopt` when none is recorded.
-     */
-    std::optional<file_id_t> get_bound_id(const control_server_t *server) {
-      std::lock_guard lock(bound_mutex);
-      const auto it = bound_ids.find(server);
-      return it == bound_ids.end() ? std::nullopt : std::optional<file_id_t> {it->second};
-    }
 
     /**
      * @brief Make a directory and its missing parents; created directories get mode 0700.
@@ -815,7 +784,8 @@ namespace handoff {
 
     _listen_fd = listener.release();
     _wake_fd = wake.release();
-    set_bound_id(this, id);
+    _bound_dev = id.first;
+    _bound_ino = id.second;
     BOOST_LOG(info) << "Drain handoff: control socket listening";
     return true;
   }
@@ -827,14 +797,14 @@ namespace handoff {
     }
 
     // Unlink only the socket this server bound: the path may have been replaced by another process since.
-    const auto id = get_bound_id(this);
     struct stat st {};
-    if (id && ::lstat(_path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) && st.st_dev == id->first && st.st_ino == id->second) {
+    if (_bound_ino != 0 && ::lstat(_path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) && st.st_dev == _bound_dev && st.st_ino == _bound_ino) {
       if (::unlink(_path.c_str()) != 0 && errno != ENOENT) {
         BOOST_LOG(warning) << "Drain handoff: cannot remove the control socket: " << std::strerror(errno);
       }
     }
-    set_bound_id(this, std::nullopt);
+    _bound_dev = 0;
+    _bound_ino = 0;
 
     ::close(_listen_fd);
     _listen_fd = -1;
@@ -867,7 +837,8 @@ namespace handoff {
     }
 
     _listen_fd = listen_fd;
-    set_bound_id(this, id);
+    _bound_dev = id.first;
+    _bound_ino = id.second;
     signal_wake(_wake_fd);  // the thread polls the new listener once a running handler has returned
     BOOST_LOG(info) << "Drain handoff: control socket listening again";
     return true;
@@ -903,7 +874,6 @@ namespace handoff {
 
   control_server_t::~control_server_t() {
     stop();
-    set_bound_id(this, std::nullopt);
     std::lock_guard lock(_mutex);
     if (_wake_fd >= 0 && !_thread.joinable()) {
       ::close(_wake_fd);
