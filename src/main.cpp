@@ -149,41 +149,6 @@ WINAPI BOOL ConsoleCtrlHandler(DWORD type) {
 }
 #endif
 
-#ifdef __linux__
-/**
- * @brief Owner of the input deinit guard that can be released once, early (by the drain exit) or at scope exit.
- */
-struct input_release_t {
-  std::once_flag once;  ///< Makes the release run at most once.
-  std::unique_ptr<platf::deinit_t> guard;  ///< The guard from `input::init()`.
-
-  /**
-   * @brief Take the guard.
-   *
-   * @param input_guard The guard to own.
-   */
-  explicit input_release_t(std::unique_ptr<platf::deinit_t> input_guard):
-      guard {std::move(input_guard)} {
-  }
-
-  /**
-   * @brief Release the devices (destroy the guard) if that has not happened yet.
-   */
-  void release() {
-    std::call_once(once, [this]() {
-      guard.reset();
-    });
-  }
-
-  /**
-   * @brief Release the devices.
-   */
-  ~input_release_t() {
-    release();
-  }
-};
-#endif
-
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
 constexpr bool tray_is_enabled = true;  ///< Compile-time flag indicating tray support is enabled.
 #else
@@ -559,10 +524,7 @@ int main(int argc, char *argv[]) {
 
   reed_solomon_init();
 #ifdef __linux__
-  input_release_t input_deinit_guard {input::init()};
-  handoff::register_device_release([&input_deinit_guard]() {
-    input_deinit_guard.release();
-  });
+  handoff::entry::device_release_t input_deinit_guard {input::init()};
 #else
   auto input_deinit_guard = input::init();
 #endif
@@ -631,6 +593,15 @@ int main(int argc, char *argv[]) {
 
   // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
   if (shutdown_event->peek()) {
+    // Released here as at the end of main, before the guards.
+    if (sync_upnp.valid()) {
+      sync_upnp.wait();
+    }
+    if (sync_mDNS.valid()) {
+      sync_mDNS.wait();
+    }
+    upnp_unmap.reset();
+    mDNS.reset();
     return lifetime::desired_exit_code;
   }
 
@@ -661,14 +632,18 @@ int main(int argc, char *argv[]) {
   std::jthread httpThread;
   std::jthread configThread;
   std::jthread rtspThread;
-  if (start_servers) {
 #ifdef __linux__
-    if (handoff::hooks::started_by_handoff()) {
-      if (const auto inherited = handoff::runtime().inherited()) {
-        rtsp_stream::adopt_listener(inherited->rtsp, true);
+  if (start_servers && handoff::hooks::started_by_handoff()) {
+    const auto inherited = handoff::runtime().inherited();
+    if (!inherited || !rtsp_stream::adopt_listener(inherited->rtsp, true)) {
+      if (auto *new_ops = handoff_process.new_ops()) {
+        new_ops->servers_failed("rtsp adopt");
       }
+      start_servers = false;
     }
+  }
 #endif
+  if (start_servers) {
     httpThread = std::jthread {nvhttp::start};
     configThread = std::jthread {confighttp::start};
     rtspThread = std::jthread {rtsp_stream::start};
