@@ -32,6 +32,12 @@
 #include <src/stream.h>
 #include <src/stream_liveness.h>
 
+#ifdef __linux__
+  #include <src/handoff/hooks.h>
+  #include <src/handoff/runtime.h>
+  #include <src/handoff/settings.h>
+#endif
+
 namespace {
   /**
    * @brief Name of the log file the unit-test logger writes to.
@@ -416,3 +422,94 @@ TEST_F(HandoffStopReasonSessionTest, DrainDeadlineSessionNeverLogsTerminated) {
   EXPECT_EQ(count_fragment(logged, "reason=drain-deadline"), 1U)
     << "the session ended with drain_deadline must be logged once with reason=drain-deadline";
 }
+
+#ifdef __linux__
+/**
+ * @brief Test fixture for the shutdown path. Returns the handoff runtime to a fresh process and removes fake sessions.
+ *
+ * The RTSP loop's exit `clear()` is not reachable from a test (it runs inside `rtsp_stream::start()`), so these tests
+ * drive the reason the way that path does: the runtime's shutdown reason, mapped by `to_stop_reason`, passed to
+ * `testing::clear`.
+ */
+class HandoffShutdownReasonTest: public BaseTest {  // NOSONAR(cpp:S3656): protected members are intentional for test fixture subclassing
+protected:
+  /**
+   * @brief Start from a fresh runtime (mode disabled, no shutdown latched).
+   */
+  void SetUp() override {
+    handoff::runtime().reset_for_test();
+    BaseTest::SetUp();
+  }
+
+  /**
+   * @brief Remove fake sessions and return the runtime to a fresh process.
+   */
+  void TearDown() override {
+    rtsp_stream::testing::remove_all();
+    handoff::runtime().reset_for_test();
+    BaseTest::TearDown();
+  }
+};
+
+/**
+ * @brief Test: with the feature disabled, a shutdown request leaves the shutdown reason `terminated`, and the sessions
+ *        ended through the shutdown path record `terminated`.
+ */
+TEST_F(HandoffShutdownReasonTest, DisabledFeatureShutdownRecordsTerminated) {
+  ASSERT_EQ(handoff::hooks::shutdown_reason(), handoff::shutdown_reason_e::terminated)
+    << "a fresh process with the feature disabled must report the shutdown reason terminated";
+
+  handoff::runtime().request_shutdown();
+
+  ASSERT_EQ(handoff::hooks::shutdown_reason(), handoff::shutdown_reason_e::terminated)
+    << "with the feature disabled a requested shutdown must still report terminated";
+  auto session = rtsp_stream::testing::insert_fake_session(1301, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+
+  rtsp_stream::testing::clear(true, rtsp_stream::to_stop_reason(handoff::hooks::shutdown_reason()));
+
+  EXPECT_EQ(stream::session::stop_reason(*session), stream::stop_reason_e::terminated)
+    << "a normal shutdown must end its sessions with terminated";
+}
+
+/**
+ * @brief Test: a draining process reports the shutdown reason `stop` before and after a shutdown request, and the
+ *        sessions ended through the shutdown path record `stop`.
+ */
+TEST_F(HandoffShutdownReasonTest, DrainingShutdownRecordsStop) {
+  handoff::settings_t settings;
+  settings.enabled = true;
+  handoff::runtime().configure(settings);
+  ASSERT_TRUE(handoff::runtime().transition(handoff::runtime_t::mode_e::normal, handoff::runtime_t::mode_e::draining))
+    << "setup failed: a normal process must be able to move to draining";
+
+  EXPECT_EQ(handoff::hooks::shutdown_reason(), handoff::shutdown_reason_e::stop)
+    << "a draining process must report the shutdown reason stop even before a shutdown is requested";
+
+  handoff::runtime().request_shutdown();
+
+  ASSERT_EQ(handoff::hooks::shutdown_reason(), handoff::shutdown_reason_e::stop)
+    << "after a shutdown request on a draining process the reason must stay stop";
+  auto session = rtsp_stream::testing::insert_fake_session(1302, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+
+  rtsp_stream::testing::clear(true, rtsp_stream::to_stop_reason(handoff::hooks::shutdown_reason()));
+
+  EXPECT_EQ(stream::session::stop_reason(*session), stream::stop_reason_e::stop)
+    << "a draining session ended by the shutdown path must record stop";
+}
+
+/**
+ * @brief Test: an enabled, normal process that is shut down records `terminated`, not `stop`.
+ */
+TEST_F(HandoffShutdownReasonTest, EnabledNormalShutdownRecordsTerminated) {
+  handoff::settings_t settings;
+  settings.enabled = true;
+  handoff::runtime().configure(settings);
+
+  handoff::runtime().request_shutdown();
+
+  EXPECT_EQ(rtsp_stream::to_stop_reason(handoff::hooks::shutdown_reason()), stream::stop_reason_e::terminated)
+    << "a normal (non-draining) process must map its shutdown to terminated";
+}
+#endif
