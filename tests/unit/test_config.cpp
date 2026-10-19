@@ -161,23 +161,39 @@ namespace {
   class ConfigGamepadOptionsTest: public testing::Test {
   protected:
     /**
-     * @brief Save the input configuration and modified-setting tracking before each test.
+     * @brief Save every configuration global and clear the gamepad driver policy before each test.
      */
     void SetUp() override {
-      original_input_ = config::input;  ///< Copy of the input configuration.
+      original_video_ = config::video;
+      original_audio_ = config::audio;
+      original_stream_ = config::stream;
+      original_nvhttp_ = config::nvhttp;
+      original_input_ = config::input;
+      original_sunshine_ = config::sunshine;
       original_modified_config_settings_ = config::modified_config_settings;
+      config::input.gamepad_driver.clear();
     }
 
     /**
-     * @brief Restore the input configuration and modified-setting tracking after each test.
+     * @brief Restore every configuration global after each test.
      */
     void TearDown() override {
+      config::video = std::move(original_video_);
+      config::audio = std::move(original_audio_);
+      config::stream = std::move(original_stream_);
+      config::nvhttp = std::move(original_nvhttp_);
       config::input = std::move(original_input_);
+      config::sunshine = std::move(original_sunshine_);
       config::modified_config_settings = std::move(original_modified_config_settings_);
     }
 
   private:
+    config::video_t original_video_;  ///< Video configuration restored after each test.
+    config::audio_t original_audio_;  ///< Audio configuration restored after each test.
+    config::stream_t original_stream_;  ///< Stream configuration restored after each test.
+    config::nvhttp_t original_nvhttp_;  ///< HTTP configuration restored after each test.
     config::input_t original_input_;  ///< Input configuration restored after each test.
+    config::sunshine_t original_sunshine_;  ///< Core configuration restored after each test.
     decltype(config::modified_config_settings) original_modified_config_settings_;  ///< Modified settings restored after each test.
   };
 
