@@ -165,6 +165,7 @@ namespace {
     protocol::hello_t hello_value;  ///< Returned by `hello()`.
     int pidfd_value {-1};  ///< Returned by `self_pidfd()`.
     bool in_flight_ok {true};  ///< Result of a bounded `wait_in_flight`.
+    std::string pause_reason;  ///< Result of `pause_accept` (empty: all four confirmed).
     std::string recheck_reason;  ///< Result of `recheck`.
     bool save_ok {true};  ///< Result of `save_state`.
     std::atomic<bool> shutdown_flag {false};  ///< Result of `shutdown_requested`.
@@ -187,8 +188,9 @@ namespace {
       return pidfd_value;
     }
 
-    void pause_accept() override {
+    std::string pause_accept() override {
       note("pause_accept");
+      return pause_reason;
     }
 
     void resume_accept() override {
@@ -1220,6 +1222,45 @@ TEST_F(HandoffOldSideTest, SelfPidfdFailureFailsTheStartKillFirst) {
   ASSERT_TRUE(outcome.has_value());
   EXPECT_EQ(old_outcome_e::rolled_back, *outcome);
   verify_rollback(0, false, start_tail(), {"answer:failed"});
+}
+
+TEST_F(HandoffOldSideTest, PauseReasonFailsTheSwitchAndCarriesTheReason) {
+  ops.pause_reason = "the http server did not confirm the pause in time";
+  start();
+  ASSERT_TRUE(to_ready());
+  const auto outcome = finish();
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::rolled_back, *outcome) << "a non-empty pause_accept() reason must fail the switch (rollback)";
+  verify_rollback(1, false, {"answer:failed", "remove_new_instance_file", "resume_accept"}, {"answer:failed"});
+  std::lock_guard lock {replies_mutex};
+  ASSERT_EQ(1u, replies.size()) << "the helper must be answered exactly once";
+  EXPECT_EQ(reply_kind_e::failed, replies[0].kind) << "a failed pause is a failure (helper exit 2), not a refusal";
+  EXPECT_NE(std::string::npos, replies[0].reason.find(ops.pause_reason)) << "the helper's reason must carry the pause_accept() reason; got: " << replies[0].reason;
+}
+
+TEST_F(HandoffOldSideTest, PauseReasonStopsTheSwitchBeforeTheGate) {
+  ops.pause_reason = "the rtsp server did not confirm the pause in time";
+  start();
+  ASSERT_TRUE(to_ready());
+  const auto outcome = finish();
+  ASSERT_TRUE(outcome.has_value());
+  const auto v = log.all();
+  for (const auto *later : {"raise_gate", "recheck", "save_state", "freeze", "withdraw_mdns", "remove_tray", "take_snapshot", "set_released:1"}) {
+    EXPECT_EQ(0, count_of(v, later)) << later << " must not run after a failed pause_accept()";
+  }
+  EXPECT_EQ(0, count_of(v, "answer:committed")) << "a failed pause never commits";
+  EXPECT_EQ(0, count_of(v, "enter_drain_mode")) << "a failed pause never drains";
+}
+
+TEST_F(HandoffOldSideTest, EmptyPauseReasonLetsTheSwitchContinue) {
+  // Control for the two tests above: an empty reason gets past substep 1.
+  ops.pause_reason.clear();
+  start();
+  ASSERT_TRUE(to_ready());
+  ASSERT_TRUE(peer->expect<protocol::go_t>().has_value()) << "an empty pause_accept() result must let the switch reach GO";
+  EXPECT_EQ(1, count_of(log.all(), "raise_gate")) << "substep 2 must run after a successful pause";
+  peer->channel.close();
+  finish();
 }
 
 TEST_F(HandoffOldSideTest, WaitInFlightTimeoutRollsBackAfterGate) {
