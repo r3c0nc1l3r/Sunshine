@@ -65,12 +65,17 @@ namespace file_handler {
    * existing file), write all of `contents`, `fsync` it, close it, `rename` it over `path`, then `fsync` the directory
    * (best effort). On any failure after the temporary file was created, it is unlinked and `path` is untouched. The
    * parent directory must already exist; it is not created. A symlink at `path` is replaced by the new file, not
-   * followed. Thread-safe as long as callers do not write the same path concurrently (the callers hold their own
+   * followed (a change from `write_file`, which writes through the link; note it in `CHANGELOG.md`). Non-POSIX: the
+   * function is declared on every platform; on Windows it writes the temporary file and replaces `path` with
+   * `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, permission bits are ignored, and errors are
+   * `std::error_code(GetLastError(), std::system_category())`. The handoff does not run there, so only the callers'
+   * ordinary saves use it. Thread-safe as long as callers do not write the same path concurrently (the callers hold their own
    * locks).
    *
    * @param path The path of the file.
    * @param contents The contents to write.
-   * @return A cleared error code on success; otherwise the `errno` of the step that failed.
+   * @return A cleared error code on success; otherwise the failure of the step that failed, as
+   *         `std::error_code(errno, std::generic_category())` on POSIX.
    * @examples
    * if (auto ec = write_file_atomic("path/to/file", "file contents")) {
    *   // handle ec

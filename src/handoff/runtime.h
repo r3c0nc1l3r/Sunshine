@@ -39,11 +39,16 @@ namespace handoff {
    *
    * Legal transitions (everything else is refused by `runtime_t::transition()`):
    * - `normal` to `draining` (the old process at the switch) and back (a rollback);
-   * - `new_pending` to `new_active` (`COMMIT` installed), and `new_active` to `normal` (`MAIN` received);
-   * - `normal` to `disabled` and back are done only by `runtime_t::configure()` and `runtime_t::disable()`.
+   * - `new_pending` to `new_active` (`COMMIT` installed), and `new_active` to `normal` (`MAIN` received).
+   *
+   * A fresh `runtime_t` is `disabled`. `runtime_t::configure()` raises it to `normal` only when the options are enabled
+   * (and `check_enable` passed, which the caller reports by passing `enabled = false` otherwise); `early_init` sets
+   * `new_pending` directly for a handoff child; `disabled` and `normal` change into each other only through
+   * `configure()` and `disable()`, never through `transition()`.
    */
   enum class mode_e {
-    disabled,  ///< The feature is off (option off, or `check_enable` refused): no control socket, no handoff code runs.
+    disabled,  ///< The initial mode; the feature is off (option off, `check_enable` refused, or `configure()` not yet
+               ///< called): no control socket, no handoff code runs.
     normal,  ///< Feature on; a normal start, or a handoff child that has become the main process. Accepts connections.
     new_pending,  ///< Started by a handoff and not yet committed: nothing adopted, accepting paused, role `pending`.
     new_active,  ///< Started by a handoff, committed, but not yet the main process (before `MAIN`).
@@ -81,10 +86,13 @@ namespace handoff {
   class runtime_t {
   public:
     /**
-     * @brief Create the state: mode `normal`, default settings, generation 0, no UDP base override, main process, not
-     * frozen, no shutdown requested, no instance file, no channel.
+     * @brief Create the state: mode `disabled` (so `enabled()` is `false` until `configure()` or a handoff start),
+     * default settings, generation 0, no UDP base override, main process, not frozen, no handoff in progress, no
+     * shutdown requested, no instance file, no channel.
      *
      * The shutdown eventfd (`EFD_CLOEXEC | EFD_NONBLOCK`) is created here; if that fails `shutdown_wake_fd()` is -1.
+     * The process-wide instance is constructed on the first `runtime()` call, which `main()` makes through
+     * `early_init` before any thread starts and before the `SIGTERM` handler is installed.
      */
     runtime_t();
 
@@ -104,18 +112,23 @@ namespace handoff {
      * - `SUNSHINE_HANDOFF_FDS` and `SUNSHINE_HANDOFF_CHANNEL` both unset: a normal start. Then `SUNSHINE_UDP_BASE`
      *   (decimal, 1 to 65535) and `SUNSHINE_GENERATION` (decimal, 0 to 65535) are read when set, so that an in-place
      *   restart keeps both; a value that does not parse is ignored (the defaults stay: no override, generation 0).
-     *   Mode stays `normal`, `is_main()` stays `true`.
+     *   Mode stays `disabled` until `configure()`, `is_main()` stays `true`.
      * - exactly one of the two set, or both set but not accepted by `parse_inherited_fds`, or
      *   `SUNSHINE_HANDOFF_UDP_BASE` (decimal, 1 to 65535) or `SUNSHINE_HANDOFF_GENERATION` (decimal, 1 to 65535)
-     *   missing or invalid: an error; nothing is stored, `scrub_fds` is not called, the mode stays `normal`.
+     *   missing or invalid: an error; nothing is stored, `scrub_fds` is not called, the mode stays `disabled`.
      * - both set and valid: a handoff start. `inherited()` holds the fds, `started_by_handoff()` is `true`, the mode
-     *   is `new_pending`, `is_main()` is `false`, the UDP base override and generation come from the
+     *   is set directly to `new_pending` (so `enabled()` is `true`), `is_main()` is `false`, the UDP base override and generation come from the
      *   `SUNSHINE_HANDOFF_` variables, and `SUNSHINE_HANDOFF_HOST_SINK` (optional, may be empty) is kept for
      *   `host_sink()`.
      *
+     * Every value is copied into a `std::string` before any variable is removed (`getenv` pointers die at `unsetenv`).
      * On every non-error path, afterwards: `env.scrub_fds()` is called once, and `SUNSHINE_UDP_BASE` and
      * `SUNSHINE_GENERATION` are removed with `env.unsetenv`, so apps and commands inherit none of them. The restart
-     * code sets the two again just before `execv`.
+     * code sets the two again just before `execv` (see `hooks::restart_environment()`).
+     *
+     * Caller contract in `main()`: call it before the environment is sanitized (`sanitize_process_environment`), which
+     * could drop the variables. If `early_init` succeeded, `started_by_handoff()` is `true` and the process runs with
+     * privileged execution, `main()` prints an Error and exits with status 1 (a handoff start is refused there).
      *
      * @param env Environment to read; tests pass fakes.
      * @return Empty on success; otherwise a one-line reason. The caller prints it to stderr and exits with status 1.
@@ -126,12 +139,12 @@ namespace handoff {
      * @brief Apply the parsed configuration. Call after `apply_config` and after the `validate` and `check_enable`
      * results are known.
      *
-     * Stores `settings`. For a normal start the mode becomes `normal` when `settings.enabled` and `disabled`
-     * otherwise. After a handoff start the mode is left unchanged (the new side's validation reports the drift).
+     * Stores `settings`. For a normal start (mode `disabled` or `normal`) the mode becomes `normal` when
+     * `settings.enabled` and `disabled` otherwise. After a handoff start the mode is left unchanged (the new side's
+     * validation reports the drift).
      * Calling it after a handoff has begun (mode `draining`, `new_active`) only stores the settings.
      *
-     * @param settings Options as configured (after validation; an invalid or refused set arrives with `enabled`
-     *        false).
+     * @param settings Options as configured, with `enabled` already `false` when `validate` or `check_enable` refused.
      */
     void configure(const settings_t &settings);
 
@@ -186,16 +199,16 @@ namespace handoff {
     settings_t settings() const;
 
     /**
-     * @brief Handoff generation: 0 for a normal start, the value of `SUNSHINE_HANDOFF_GENERATION` for a handoff
-     * child, kept across in-place restarts through `SUNSHINE_GENERATION`.
+     * @brief Handoff generation: 0 unless inherited, from `SUNSHINE_HANDOFF_GENERATION` (a handoff child) or
+     * `SUNSHINE_GENERATION` (an in-place restart of a process whose generation was above 0).
      *
      * @return Generation.
      */
     unsigned generation() const;
 
     /**
-     * @brief The UDP base set by the environment (`SUNSHINE_HANDOFF_UDP_BASE` or `SUNSHINE_UDP_BASE`) or by
-     * `set_udp_base()`.
+     * @brief The UDP base set by the environment (`SUNSHINE_HANDOFF_UDP_BASE` or `SUNSHINE_UDP_BASE`) (
+     * in tests also `set_udp_base_for_test()`).
      *
      * @return The base, or `std::nullopt` when this process uses the configured `port`.
      */
@@ -208,13 +221,6 @@ namespace handoff {
      * @return `udp_base()` when set, else `configured_port`.
      */
     int effective_udp_base(int configured_port) const;
-
-    /**
-     * @brief Override the UDP base (tests, and the coordinator for a process that keeps its base).
-     *
-     * @param base UDP base.
-     */
-    void set_udp_base(int base);
 
     /**
      * @brief Whether this process is systemd's main process of the unit. `true` at a normal start, `false` in a
@@ -249,6 +255,24 @@ namespace handoff {
     void set_frozen(bool value);
 
     /**
+     * @brief Whether a handoff started by this process is in progress.
+     *
+     * The coordinator (old side) sets it when it spawns the child and clears it when the handoff has ended, either way:
+     * handed over (after `MAIN` and the socket copies are closed) or rolled back (after the rollback completed), also
+     * when the attempt failed early. `hooks::restart_blocked()` reads it.
+     *
+     * @return `true` while a handoff runs.
+     */
+    bool handoff_in_progress() const;
+
+    /**
+     * @brief Set or clear the handoff-in-progress flag.
+     *
+     * @param value New value.
+     */
+    void set_handoff_in_progress(bool value);
+
+    /**
      * @brief Tag for log lines of this process in its current mode: `drain` while the mode is `draining`, else
      * empty. The glue passes it to `logging::set_process_tag`.
      *
@@ -257,7 +281,9 @@ namespace handoff {
     std::string process_tag() const;
 
     /**
-     * @brief Record that `SIGTERM` arrived. Async-signal-safe: only atomic stores and one `write` to the eventfd.
+     * @brief Record that `SIGTERM` arrived. Async-signal-safe once `runtime()` has been constructed (that is, after
+     * `early_init` in `main()`, so the handler never constructs it): only atomic stores and one `write` to the
+     * eventfd, no allocation, no lock.
      *
      * Latches the shutdown reason (`stop` when the mode is `draining`, else `terminated`) before it returns, so a
      * caller can raise the shutdown event right after. The first call latches; later calls change nothing.
@@ -281,7 +307,8 @@ namespace handoff {
 
     /**
      * @brief The eventfd that `note_sigterm()` writes. Threads that block (the coordinator, the notifier) poll it
-     * next to their own wake source.
+     * next to their own wake source. Nothing ever reads (drains) it, so once `SIGTERM` has arrived it stays readable
+     * for the rest of the process, which is what a level-triggered poll wants.
      *
      * @return The fd, or -1 if it could not be created. Owned by the runtime; do not close it.
      */
@@ -304,7 +331,7 @@ namespace handoff {
     /**
      * @brief Create this process's instance writer and write the first file.
      *
-     * Replaces (without removing the file of) an earlier writer.
+     * Replaces (without removing the file of) an earlier writer. The first write runs outside the runtime's mutex.
      *
      * @param dir Instances directory.
      * @param initial Initial content (`pid`, `start_time`, role, UDP base, sessions, state).
@@ -314,6 +341,10 @@ namespace handoff {
 
     /**
      * @brief Update the role in the instance file. Does nothing and returns `false` when no writer is installed.
+     *
+     * All `instance_*` functions copy the writer pointer under the runtime's mutex and call the writer (which does
+     * file I/O under its own lock) after releasing it, so a slow disk never blocks `mode()`-style readers of the mutex
+     * and a concurrent `instance_remove()` is safe (the writer then writes nothing).
      *
      * @param role New role.
      * @return `true` when written.
@@ -378,13 +409,32 @@ namespace handoff {
      */
     std::shared_ptr<drain_peer_t> peer() const;
 
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief Test-only: set the UDP base override.
+     *
+     * @param base UDP base.
+     */
+    void set_udp_base_for_test(int base);
+
+    /**
+     * @brief Test-only: return to the state of a freshly constructed object (mode `disabled`, default settings,
+     * generation 0, no UDP base override, main process, not frozen, no handoff in progress, no shutdown latched, no
+     * inherited fds, host sink, instance writer, channel or peer). The instance file is not removed. The eventfd is
+     * drained so a later `shutdown_wake_fd()` poll is not readable. Not thread-safe: call it when no other thread uses
+     * the object. Resets everything `hooks::` reports, since the hooks read `runtime()`.
+     */
+    void reset_for_test();
+#endif
+
   private:
-    std::atomic<mode_e> _mode {mode_e::normal};  ///< Mode.
+    std::atomic<mode_e> _mode {mode_e::disabled};  ///< Mode.
     std::atomic<bool> _started_by_handoff {false};  ///< Set by `early_init`.
     std::atomic<unsigned> _generation {0};  ///< Generation.
     std::atomic<int> _udp_base {0};  ///< UDP base override; 0 means none.
     std::atomic<bool> _is_main {true};  ///< Main-process flag.
     std::atomic<bool> _frozen {false};  ///< Frozen flag.
+    std::atomic<bool> _handoff_in_progress {false};  ///< A handoff started by this process is running.
     std::atomic<bool> _sigterm {false};  ///< `SIGTERM` seen.
     std::atomic<int> _latched_reason {-1};  ///< Latched `shutdown_reason_e`, or -1.
     int _wake_fd {-1};  ///< Eventfd written by `note_sigterm`; fixed after construction.
