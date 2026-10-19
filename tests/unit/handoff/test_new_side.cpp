@@ -26,6 +26,7 @@
 
   // platform includes
   #include <fcntl.h>
+  #include <poll.h>
   #include <sys/socket.h>
   #include <unistd.h>
 
@@ -844,6 +845,37 @@ TEST_F(HandoffNewSideTest, CommitSendsNothingMoreOnTheChannel) {
   ASSERT_TRUE(finish().has_value());
   const auto names = peer->collect(60ms);
   EXPECT_TRUE(names.empty()) << "the new side sends no message after GO_ACK on its own (got " << (names.empty() ? "" : names[0]) << ")";
+}
+
+TEST_F(HandoffNewSideTest, GoReadAfterItsBoundIsExitFailure) {
+  timeouts.go = 80ms;
+  start();
+  const auto ready = to_ready();
+  ASSERT_TRUE(ready.has_value());
+  std::this_thread::sleep_for(250ms);
+  peer->send(make_go());
+  const auto outcome = finish(1000ms);
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(new_outcome_e::exit_failure, *outcome) << "a GO read after the go bound must give exit_failure";
+  expect_no_commit_effects("for a GO that arrives after the bound");
+  EXPECT_EQ(0, count_of(log.all(), "reload_all")) << "a GO after the bound must not be acted on";
+}
+
+TEST_F(HandoffNewSideTest, DuplicateHelloWithFdDoesNotLeakTheFd) {
+  start();
+  const auto ready = to_ready();
+  ASSERT_TRUE(ready.has_value());
+  int fds[2];
+  ASSERT_EQ(0, ::pipe2(fds, O_CLOEXEC));
+  protocol::hello_t again;
+  ASSERT_TRUE(peer->send(again, fds[1]));
+  ::close(fds[1]);
+  pollfd pfd {fds[0], POLLIN, 0};
+  EXPECT_EQ(1, ::poll(&pfd, 1, 500)) << "an fd that arrives with a duplicate HELLO must be closed by the new side";
+  ::close(fds[0]);
+  EXPECT_EQ(1, count_of(log.all(), "accept_old_hello")) << "only the first HELLO is accepted";
+  peer->channel.close();
+  finish();
 }
 
 #endif  // __linux__
