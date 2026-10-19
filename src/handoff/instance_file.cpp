@@ -46,9 +46,17 @@ namespace handoff {
     read_status_e read_whole_file(const fs::path &path, std::string &content) {
       constexpr std::size_t max_bytes = 64 * 1024;  // A larger file is treated as unreadable.
       content.clear();
-      const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      // O_NOFOLLOW makes a symlink (dangling or not) fail with ELOOP, which counts as failed, never missing. O_NONBLOCK
+      // keeps a FIFO from blocking the scan; the fstat below rejects it anyway.
+      const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
       if (fd < 0) {
         return errno == ENOENT ? read_status_e::missing : read_status_e::failed;
+      }
+
+      struct stat st {};
+      if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        ::close(fd);
+        return read_status_e::failed;
       }
 
       char buffer[4096];
@@ -517,45 +525,50 @@ namespace handoff {
   scan_result_t scan_instances(const fs::path &dir, const std::function<std::optional<std::uint64_t>(pid_t)> &start_time_of) {
     scan_result_t result;
 
-    std::error_code ec;
-    // Only a directory that does not exist is "missing". Any other failure to inspect it, or a path that is not a
-    // directory, means the instances cannot be listed, so the scan fails closed.
-    const auto status = fs::status(dir, ec);
-    if (ec) {
-      if (ec == std::errc::no_such_file_or_directory) {
-        result.dir_missing = true;
-      } else {
-        result.any_unreadable = true;
+    try {
+      std::error_code ec;
+      // Only a directory that does not exist is "missing". Any other failure to inspect it, or a path that is not a
+      // directory, means the instances cannot be listed, so the scan fails closed.
+      const auto status = fs::status(dir, ec);
+      if (ec) {
+        if (ec == std::errc::no_such_file_or_directory) {
+          result.dir_missing = true;
+        } else {
+          result.any_unreadable = true;
+        }
+        return result;
       }
-      return result;
-    }
-    if (status.type() == fs::file_type::not_found) {
-      result.dir_missing = true;
-      return result;
-    }
-    if (!fs::is_directory(status)) {
-      result.any_unreadable = true;
-      return result;
-    }
+      if (status.type() == fs::file_type::not_found) {
+        result.dir_missing = true;
+        return result;
+      }
+      if (!fs::is_directory(status)) {
+        result.any_unreadable = true;
+        return result;
+      }
 
-    fs::directory_iterator it(dir, ec);
-    if (ec) {
-      result.any_unreadable = true;
-      return result;
-    }
-
-    // Explicit increment, then check its error: a range-for or a for loop with `increment(ec)` in the step would
-    // silently end the scan (libstdc++ sets the iterator to end on error), so the error must be read after each step.
-    const fs::directory_iterator end;
-    while (it != end) {
-      const fs::path path = it->path();
-      scan_entry(path, result, start_time_of);
-
-      it.increment(ec);
+      fs::directory_iterator it(dir, ec);
       if (ec) {
         result.any_unreadable = true;
-        break;
+        return result;
       }
+
+      // Explicit increment, then check its error: a range-for or a for loop with `increment(ec)` in the step would
+      // silently end the scan (libstdc++ sets the iterator to end on error), so the error must be read after each step.
+      const fs::directory_iterator end;
+      while (it != end) {
+        const fs::path path = it->path();
+        scan_entry(path, result, start_time_of);
+
+        it.increment(ec);
+        if (ec) {
+          result.any_unreadable = true;
+          break;
+        }
+      }
+    } catch (...) {
+      // Anything that throws (for example bad_alloc) leaves the listing incomplete: fail closed.
+      result.any_unreadable = true;
     }
     return result;
   }
