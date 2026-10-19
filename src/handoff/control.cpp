@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
-#include <fstream>
 #include <mutex>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -587,13 +586,34 @@ namespace handoff {
     // (the process closed it between the stat() and the connect()).
     const auto socket_path = control_socket_path(env.runtime_dir, *pid);
     const auto explain_missing_socket = [&]() {
-      std::ifstream in(env.runtime_dir / "instances" / (std::to_string(*pid) + ".json"), std::ios::binary);
-      if (in) {
+      // Open without following a symlink and without blocking on a FIFO; only a regular file is read.
+      const auto file_path = env.runtime_dir / "instances" / (std::to_string(*pid) + ".json");
+      fd_guard_t file(::open(file_path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
+      struct stat file_st {};
+      if (file.get() >= 0 && ::fstat(file.get(), &file_st) == 0 && S_ISREG(file_st.st_mode) && static_cast<std::size_t>(file_st.st_size) <= max_instance_file_bytes) {
         // A file larger than the cap counts as unreadable.
-        std::string content(max_instance_file_bytes + 1, '\0');
-        in.read(content.data(), static_cast<std::streamsize>(content.size()));
-        content.resize(static_cast<std::size_t>(in.gcount()));
-        const auto instance = content.size() <= max_instance_file_bytes ? parse_instance(content) : std::nullopt;
+        std::string content;
+        char buffer[4096];
+        bool ok = true;
+        while (true) {
+          const auto n = ::read(file.get(), buffer, sizeof(buffer));
+          if (n < 0) {
+            if (errno == EINTR) {
+              continue;
+            }
+            ok = false;
+            break;
+          }
+          if (n == 0) {
+            break;
+          }
+          content.append(buffer, static_cast<std::size_t>(n));
+          if (content.size() > max_instance_file_bytes) {
+            ok = false;
+            break;
+          }
+        }
+        const auto instance = ok ? parse_instance(content) : std::nullopt;
         // A process in handover_failed or kill_pending keeps role draining, so the state is checked first.
         if (instance && instance->handoff == state_e::kill_pending) {
           err = "kill pending";
