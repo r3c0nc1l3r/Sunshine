@@ -624,4 +624,19 @@ TEST(HandoffListenerTest, UnadoptedServerCloseListener) {
   EXPECT_EQ(r.server->listener_fd(), -1);
   EXPECT_FALSE(r.server->resume(300ms));
 }
+
+TEST(HandoffListenerTest, UnadoptedCloseListenerKeepsLoopAliveUntilStop) {
+  server_runner_t r;
+  ASSERT_TRUE(r.run_plain());
+  ASSERT_TRUE(r.server->close_listener(2000ms)) << "close_listener with no earlier pause must return true";
+  std::this_thread::sleep_for(200ms);
+  EXPECT_FALSE(r.finished(10ms)) << "after close_listener the loop must idle on the work guard, start() must not return";
+  r.server->stop();
+  EXPECT_TRUE(r.finished(3s)) << "stop() must end the loop that idles after close_listener";
+  EXPECT_FALSE(r.error) << "start() must not throw";
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_FALSE(r.server->pause(300ms)) << "pause after stop must return false";
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, 1500ms) << "pause after stop must return within about its timeout";
+  r.stop();
+}
 #endif
