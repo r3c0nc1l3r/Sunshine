@@ -637,7 +637,7 @@ namespace rtsp_stream {
     void begin_listening(bool paused) {
       _work_guard.emplace(boost::asio::make_work_guard(io_context));
       _paused.store(paused);
-      _listener_fd.store(acceptor.native_handle());
+      _listener_fd.store(static_cast<int>(acceptor.native_handle()));
       _listener_state.store(listener_open);
 
       std::function<void(unsigned short)> callback;
@@ -760,7 +760,7 @@ namespace rtsp_stream {
      */
     bool close_listener(std::chrono::milliseconds timeout) {
       const auto state = _listener_state.load();
-      if (state == listener_none || _stopped.load()) {
+      if (state == listener_none || _stopped.load() || on_loop_thread()) {
         return false;
       }
       if (state == listener_closed) {
@@ -914,12 +914,13 @@ namespace rtsp_stream {
 
       // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
-      raised_timer.async_wait([this, armed = std::move(launch_session)](const boost::system::error_code &ec) {
+      const auto serial = ++_launch_serial;
+      raised_timer.async_wait([this, serial](const boost::system::error_code &ec) {
         if (!ec) {
           // Compare and pop in one step, so a drop or a newer raise cannot be undone by this late expiry.
           std::lock_guard lg {_launch_mutex};
           auto current = launch_event.view(0s);
-          if (current && current == armed) {
+          if (current && serial == _launch_serial) {
             auto discarded = launch_event.pop(0s);
             if (discarded) {
               BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
@@ -1107,6 +1108,8 @@ namespace rtsp_stream {
      * @brief Stop the RTSP server.
      */
     void stop() {
+      // `_listener_state` stays `listener_open` here; `_stopped` gates every command instead. `close_listener` and
+      // `stop()` must not overlap on the acceptor (only reachable during shutdown).
       _stopped.store(true);
       acceptor.close();
       _listener_fd.store(-1);
@@ -1419,6 +1422,7 @@ namespace rtsp_stream {
       _accept_errors.store(0);
     }
 
+    std::uint64_t _launch_serial = 0;  ///< Arming serial, incremented under `_launch_mutex` at each raise.
     std::mutex _launch_mutex;  ///< Serialises the launch event and `raised_timer` (never held across a wait or a callback).
     std::mutex _state_lock;  ///< Guards the adoption record, the listening callback and the injected error.
     int _adopt_fd = -1;  ///< Descriptor recorded by `record_adoption`, or -1.
