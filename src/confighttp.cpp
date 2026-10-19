@@ -1452,9 +1452,6 @@ namespace confighttp {
    * Requires admin authentication, like the other API calls. Returns only `id`, `started`, `transport` and
    * `client_category` for each session.
    *
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
    * @api_examples{/api/sessions| GET| null}
    */
   void getSessions(const resp_https_t &response, const req_https_t &request) {
@@ -1481,9 +1478,6 @@ namespace confighttp {
    * Requires admin authentication and, for cross-origin requests, a valid CSRF token. Every request that passes
    * authentication is logged at Info with the admin user, the client address and the result (`closed`,
    * `not-found`, `csrf-rejected` or `bad-id`). The log line never contains credentials or the CSRF token.
-   *
-   * @param response The HTTP response object.
-   * @param request The HTTP request object; `path_match[1]` is the session id.
    *
    * @api_examples{/api/sessions/1/close| POST| null}
    */
@@ -1528,8 +1522,6 @@ namespace confighttp {
    *
    * Registers exactly `GET /api/sessions` (getSessions) and `POST /api/sessions/<id>/close` (closeSession).
    * `start()` calls this, so tests can exercise the production route table.
-   *
-   * @param server Admin web UI HTTPS server.
    */
   void register_session_routes(https_server_t &server) {
     server.resource["^/api/sessions$"]["GET"] = getSessions;
