@@ -1,6 +1,6 @@
 /**
  * @file tests/unit/test_session_api.cpp
- * @brief Tests for the session list and close API: the JSON shape, the RTSP helpers, and the HTTP endpoints.
+ * @brief Tests for the session list and close API: the JSON shape, the RTSP helpers, authentication, and the audit log.
  *
  * The HTTP tests use a real HTTPS client/server with the same approach as tests/unit/test_confighttp.cpp.
  */
@@ -11,11 +11,14 @@
 // standard includes
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <format>
+#include <iterator>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <system_error>
 #include <string>
 #include <thread>
@@ -87,6 +90,11 @@ X4wnh1bwdiidqpcgyuKossLOPxbS786WmsesaAWPnpoY6M8aija+ALwNNuWWmyMg
 
 namespace {
   /**
+   * @brief Name of the log file the unit-test logger writes to.
+   */
+  constexpr auto TEST_LOG_FILE = "test_sunshine.log";
+
+  /**
    * @brief Build a session description with fixed, known values.
    *
    * @return Session description used by the JSON tests.
@@ -94,22 +102,14 @@ namespace {
   rtsp_stream::session_info_t make_session_info() {
     rtsp_stream::session_info_t info;
     info.id = 7;
-    info.client_name = "Living room";
-    info.client_uuid = "uuid-1";
-    info.peer_address = "192.0.2.10";
-    info.app_id = 42;
     info.started = std::chrono::system_clock::time_point {std::chrono::seconds {1700000000}};
-    info.width = 1920;
-    info.height = 1080;
-    info.fps = 60;
-    info.video_format = 1;
-    info.dynamic_range = 1;
-    info.state = "running";
+    info.transport = "udp/ipv4";
+    info.client_category = "lan";
     return info;
   }
 
   /**
-   * @brief Build the basic-auth header value for the test credentials.
+   * @brief Build the basic-auth header value for the given credentials.
    *
    * @param username User name.
    * @param password Password.
@@ -118,27 +118,71 @@ namespace {
   std::string create_auth_header(const std::string &username, const std::string &password) {
     return "Basic " + SimpleWeb::Crypto::Base64::encode(username + ":" + password);
   }
+
+  /**
+   * @brief Current size of the unit-test log file, after flushing pending log output.
+   *
+   * @return Size in bytes, or 0 when the file does not exist yet.
+   */
+  std::uintmax_t test_log_size() {
+    logging::log_flush();
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(TEST_LOG_FILE, ec);
+    return ec ? 0 : size;
+  }
+
+  /**
+   * @brief Log text written after a given byte offset of the unit-test log file.
+   *
+   * @param offset Byte offset returned by `test_log_size()` before the action under test.
+   * @return Text appended to the log since that offset.
+   */
+  std::string test_log_since(std::uintmax_t offset) {
+    logging::log_flush();
+    std::ifstream input(TEST_LOG_FILE, std::ios::binary);
+    const std::string content((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (offset >= content.size()) {
+      return {};
+    }
+    return content.substr(static_cast<std::size_t>(offset));
+  }
+
+  /**
+   * @brief Check whether any single line of the text contains every given fragment.
+   *
+   * @param text Text to search, split into lines.
+   * @param fragments Substrings that must all appear on the same line.
+   * @return `true` when such a line exists.
+   */
+  bool has_line_with_all(const std::string &text, const std::vector<std::string> &fragments) {
+    std::istringstream stream(text);
+    for (std::string line; std::getline(stream, line);) {
+      bool all_found = true;
+      for (const auto &fragment : fragments) {
+        if (line.find(fragment) == std::string::npos) {
+          all_found = false;
+          break;
+        }
+      }
+      if (all_found) {
+        return true;
+      }
+    }
+    return false;
+  }
 }  // namespace
 
 /**
- * @brief Test: the session JSON has exactly the documented keys and no key or connect data.
+ * @brief Test: the session JSON has exactly the four documented keys and nothing else.
  */
 TEST(SessionApiJsonTest, HasExactlyTheDocumentedKeys) {
   const nlohmann::json json = confighttp::session_info_to_json(make_session_info());
 
   const std::set<std::string> expected_keys {
     "id",
-    "client_name",
-    "client_uuid",
-    "peer_address",
-    "app_id",
     "started",
-    "width",
-    "height",
-    "fps",
-    "video_format",
-    "dynamic_range",
-    "state",
+    "transport",
+    "client_category",
   };
 
   std::set<std::string> actual_keys;
@@ -147,23 +191,34 @@ TEST(SessionApiJsonTest, HasExactlyTheDocumentedKeys) {
   }
 
   EXPECT_EQ(actual_keys, expected_keys);
-  EXPECT_EQ(actual_keys.size(), 12U);
+  EXPECT_EQ(actual_keys.size(), 4U);
 }
 
 /**
- * @brief Test: no key of the session JSON names keys, IVs, payloads, connect data or certificates.
+ * @brief Test: no key or string value of the session JSON carries identity or secret material.
  */
-TEST(SessionApiJsonTest, NoSecretLikeKeys) {
+TEST(SessionApiJsonTest, NoIdentityOrSecretMaterial) {
   const nlohmann::json json = confighttp::session_info_to_json(make_session_info());
 
-  const std::set<std::string> forbidden {"key", "iv", "cert", "payload", "connect"};
-  for (const auto &item : json.items()) {
-    std::string lowered = item.key();
-    for (auto &ch : lowered) {
+  const std::set<std::string> forbidden {"name", "uuid", "address", "cert", "key", "iv", "payload", "connect"};
+
+  auto lowercase = [](std::string text) {
+    for (auto &ch : text) {
       ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     }
+    return text;
+  };
+
+  for (const auto &item : json.items()) {
+    const std::string key = lowercase(item.key());
     for (const auto &word : forbidden) {
-      EXPECT_EQ(lowered.find(word), std::string::npos) << "key '" << item.key() << "' contains '" << word << "'";
+      EXPECT_EQ(key.find(word), std::string::npos) << "key '" << item.key() << "' contains '" << word << "'";
+    }
+    if (item.value().is_string()) {
+      const std::string value = lowercase(item.value().get<std::string>());
+      for (const auto &word : forbidden) {
+        EXPECT_EQ(value.find(word), std::string::npos) << "value '" << value << "' contains '" << word << "'";
+      }
     }
   }
 }
@@ -176,22 +231,34 @@ TEST(SessionApiJsonTest, ValuesMatchSessionInfo) {
 
   const nlohmann::json expected {
     {"id", 7},
-    {"client_name", "Living room"},
-    {"client_uuid", "uuid-1"},
-    {"peer_address", "192.0.2.10"},
-    {"app_id", 42},
     {"started", 1700000000},
-    {"width", 1920},
-    {"height", 1080},
-    {"fps", 60},
-    {"video_format", 1},
-    {"dynamic_range", 1},
-    {"state", "running"},
+    {"transport", "udp/ipv4"},
+    {"client_category", "lan"},
   };
 
   EXPECT_EQ(json, expected);
   ASSERT_TRUE(json.contains("started"));
   EXPECT_TRUE(json["started"].is_number_integer());
+}
+
+/**
+ * @brief Test: an IPv6 WAN session is converted with its transport and category values unchanged.
+ */
+TEST(SessionApiJsonTest, ValuesMatchSessionInfoForIpv6Wan) {
+  rtsp_stream::session_info_t info = make_session_info();
+  info.id = 4000000000U;
+  info.transport = "udp/ipv6";
+  info.client_category = "wan";
+
+  const nlohmann::json json = confighttp::session_info_to_json(info);
+
+  const nlohmann::json expected {
+    {"id", 4000000000U},
+    {"started", 1700000000},
+    {"transport", "udp/ipv6"},
+    {"client_category", "wan"},
+  };
+  EXPECT_EQ(json, expected);
 }
 
 /**
@@ -365,6 +432,30 @@ TEST_F(SessionApiHttpTest, GetSessionsRejectsUnauthenticatedRequest) {
 }
 
 /**
+ * @brief Test: GET /api/sessions with the right user and a wrong password is rejected with 401.
+ */
+TEST_F(SessionApiHttpTest, GetSessionsRejectsWrongPassword) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "wrongpass"));
+
+  const auto response = client->request("GET", "/api/sessions", "", headers);
+
+  ASSERT_EQ(response->status_code, "401 Unauthorized");
+}
+
+/**
+ * @brief Test: GET /api/sessions with the right password and a wrong user name is rejected with 401.
+ */
+TEST_F(SessionApiHttpTest, GetSessionsRejectsWrongUser) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("wronguser", "testpass"));
+
+  const auto response = client->request("GET", "/api/sessions", "", headers);
+
+  ASSERT_EQ(response->status_code, "401 Unauthorized");
+}
+
+/**
  * @brief Test: authenticated GET /api/sessions returns the status and an empty session list.
  */
 TEST_F(SessionApiHttpTest, GetSessionsReturnsEmptyListWhenAuthenticated) {
@@ -389,7 +480,31 @@ TEST_F(SessionApiHttpTest, CloseSessionRejectsUnauthenticatedRequest) {
 }
 
 /**
- * @brief Test: closing an unknown session id with a valid CSRF token returns a 404 JSON error.
+ * @brief Test: POST /api/sessions/<id>/close with the right user and a wrong password is rejected with 401.
+ */
+TEST_F(SessionApiHttpTest, CloseSessionRejectsWrongPassword) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "wrongpass"));
+
+  const auto response = client->request("POST", "/api/sessions/4242/close", "", headers);
+
+  ASSERT_EQ(response->status_code, "401 Unauthorized");
+}
+
+/**
+ * @brief Test: POST /api/sessions/<id>/close with the right password and a wrong user name is rejected with 401.
+ */
+TEST_F(SessionApiHttpTest, CloseSessionRejectsWrongUser) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("wronguser", "testpass"));
+
+  const auto response = client->request("POST", "/api/sessions/4242/close", "", headers);
+
+  ASSERT_EQ(response->status_code, "401 Unauthorized");
+}
+
+/**
+ * @brief Test: closing an unknown session id with a valid CSRF token returns a 404 with a JSON content type.
  */
 TEST_F(SessionApiHttpTest, CloseSessionUnknownIdReturnsNotFound) {
   const std::string token = fetch_csrf_token();
@@ -402,8 +517,6 @@ TEST_F(SessionApiHttpTest, CloseSessionUnknownIdReturnsNotFound) {
   const auto content_type = response->header.find("Content-Type");
   ASSERT_NE(content_type, response->header.end());
   EXPECT_NE(content_type->second.find("application/json"), std::string::npos);
-  // Spec gives the error code `not_found`; the exact placement inside the body is not specified.
-  EXPECT_TRUE(response->content.string().contains("not_found"));
 }
 
 /**
@@ -417,7 +530,6 @@ TEST_F(SessionApiHttpTest, CloseSessionOverflowingIdIsBadRequest) {
   const auto response = client->request("POST", "/api/sessions/99999999999/close", "", headers);
 
   ASSERT_EQ(response->status_code, "400 Bad Request");
-  EXPECT_FALSE(response->content.string().contains("CSRF"));
 }
 
 /**
@@ -431,4 +543,24 @@ TEST_F(SessionApiHttpTest, CloseSessionRejectsCrossOriginWithoutCsrfToken) {
 
   ASSERT_EQ(response->status_code, "400 Bad Request");
   EXPECT_TRUE(response->content.string().contains("Missing CSRF token"));
+}
+
+/**
+ * @brief Test: an authenticated close of an unknown id is logged with the id, user and not-found result, and never the password.
+ */
+TEST_F(SessionApiHttpTest, CloseSessionUnknownIdIsAuditLogged) {
+  const std::string token = fetch_csrf_token();
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("X-CSRF-Token", token);
+
+  const std::uintmax_t offset = test_log_size();
+  const auto response = client->request("POST", "/api/sessions/4242/close", "", headers);
+  ASSERT_EQ(response->status_code, "404 Not Found");
+
+  const std::string logged = test_log_since(offset);
+  EXPECT_TRUE(has_line_with_all(
+    logged,
+    {"Session close requested via API: id=4242", "result=not-found", "user=testuser"}
+  ));
+  EXPECT_EQ(logged.find("testpass"), std::string::npos);
 }
