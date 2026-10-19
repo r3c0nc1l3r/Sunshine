@@ -11,8 +11,6 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
-#include <fstream>
-#include <sstream>
 #include <sys/stat.h>
 #include <system_error>
 #include <thread>
@@ -30,53 +28,146 @@ namespace handoff {
 
   namespace {
     /**
+     * @brief Outcome of reading a file.
+     */
+    enum class read_status_e {
+      ok,  ///< The content was read.
+      missing,  ///< The file does not exist (`ENOENT`).
+      failed,  ///< Any other error.
+    };
+
+    /**
+     * @brief Read a whole file with POSIX calls, so the errno of a failed open is known.
+     *
+     * @param path File to read.
+     * @param content Receives the content; cleared first.
+     * @return Outcome.
+     */
+    read_status_e read_whole_file(const fs::path &path, std::string &content) {
+      content.clear();
+      const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd < 0) {
+        return errno == ENOENT ? read_status_e::missing : read_status_e::failed;
+      }
+
+      char buffer[4096];
+      while (true) {
+        const auto n = ::read(fd, buffer, sizeof(buffer));
+        if (n < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          ::close(fd);
+          return read_status_e::failed;
+        }
+        if (n == 0) {
+          break;
+        }
+        content.append(buffer, static_cast<std::size_t>(n));
+      }
+      ::close(fd);
+      return read_status_e::ok;
+    }
+
+    /**
      * @brief Read a whole file into a string.
      *
      * @param path File to read.
      * @return The content, or `std::nullopt` when the file cannot be opened or read.
      */
     std::optional<std::string> read_file(const fs::path &path) {
-      std::ifstream in(path, std::ios::binary);
-      if (!in) {
+      std::string content;
+      if (read_whole_file(path, content) != read_status_e::ok) {
         return std::nullopt;
+      }
+      return content;
+    }
+
+    /**
+     * @brief Make sure the instances directory exists and is safe to write into.
+     *
+     * Missing directories, including missing parents, are created with mode 0700. An existing directory must be a real
+     * directory (not a symlink), owned by the effective uid, and not writable by group or others.
+     *
+     * @param dir Instances directory.
+     * @return `true` when the directory is usable; otherwise an Error is logged and `false` returned.
+     */
+    bool prepare_directory(const fs::path &dir) {
+      // Collect the missing directories from the leaf upwards; they are created from the top down.
+      std::vector<fs::path> missing;
+      for (fs::path current = dir; !current.empty(); current = current.parent_path()) {
+        struct stat st {};
+        if (::lstat(current.c_str(), &st) == 0) {
+          break;
+        }
+        if (errno != ENOENT) {
+          BOOST_LOG(error) << "Drain handoff: cannot inspect instances directory: " << std::strerror(errno);
+          return false;
+        }
+        missing.push_back(current);
+        if (current == current.parent_path()) {
+          break;
+        }
       }
 
-      std::ostringstream content;
-      content << in.rdbuf();
-      if (in.bad()) {
-        return std::nullopt;
+      for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+        if (::mkdir(it->c_str(), 0700) == 0) {
+          // mkdir applies the umask, which can only remove bits; chmod makes the mode exactly 0700.
+          if (::chmod(it->c_str(), 0700) != 0) {
+            BOOST_LOG(error) << "Drain handoff: cannot set mode of instances directory: " << std::strerror(errno);
+            return false;
+          }
+        } else if (errno != EEXIST) {
+          BOOST_LOG(error) << "Drain handoff: cannot create instances directory: " << std::strerror(errno);
+          return false;
+        }
       }
-      return content.str();
+
+      struct stat st {};
+      if (::lstat(dir.c_str(), &st) != 0) {
+        BOOST_LOG(error) << "Drain handoff: cannot inspect instances directory: " << std::strerror(errno);
+        return false;
+      }
+      if (!S_ISDIR(st.st_mode)) {
+        BOOST_LOG(error) << "Drain handoff: instances path is not a real directory";
+        return false;
+      }
+      if (st.st_uid != ::geteuid()) {
+        BOOST_LOG(error) << "Drain handoff: instances directory is not owned by this user";
+        return false;
+      }
+      if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        BOOST_LOG(error) << "Drain handoff: instances directory is writable by group or others";
+        return false;
+      }
+      return true;
     }
 
     /**
      * @brief Write a file as the atomic replacement for an instance file: temporary file, fsync, rename.
      *
-     * The caller holds the writer's mutex. The directory is created with mode 0700 when missing.
+     * The caller holds the writer's mutex.
      *
      * @param dir Instances directory.
      * @param instance Content to write; its `pid` names the file.
      * @return `true` on success.
      */
     bool write_locked(const fs::path &dir, const instance_t &instance) {
-      std::error_code ec;
-      if (!fs::is_directory(dir, ec)) {
-        fs::create_directories(dir, ec);
-        if (ec) {
-          BOOST_LOG(error) << "Drain handoff: cannot create instances directory: " << ec.message();
-          return false;
-        }
-        if (::chmod(dir.c_str(), 0700) != 0) {
-          BOOST_LOG(error) << "Drain handoff: cannot set mode of instances directory: " << std::strerror(errno);
-          return false;
-        }
+      if (!prepare_directory(dir)) {
+        return false;
       }
 
       const auto name = std::to_string(instance.pid) + ".json";
       const auto final_path = dir / name;
       const auto tmp_path = dir / (name + ".tmp");
 
-      const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+      // A temporary file left by an earlier crash is removed, so the exclusive create below cannot fail on it.
+      if (::unlink(tmp_path.c_str()) != 0 && errno != ENOENT) {
+        BOOST_LOG(error) << "Drain handoff: cannot remove old temporary instance file: " << std::strerror(errno);
+        return false;
+      }
+
+      const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
       if (fd < 0) {
         BOOST_LOG(error) << "Drain handoff: cannot open instance file for writing: " << std::strerror(errno);
         return false;
@@ -307,13 +398,15 @@ namespace handoff {
   }
 
   std::optional<fs::path> runtime_dir(std::string_view runtime_directory, std::string_view xdg_runtime_dir) {
-    // systemd may list several directories separated by ':'; only the first one is used.
-    const auto first = runtime_directory.substr(0, runtime_directory.find(':'));
-    if (!first.empty()) {
-      return fs::path(std::string(first));
+    // systemd may list several directories separated by ':'; only the first one is used. A value that is not an
+    // absolute path counts as unset.
+    const auto first = fs::path(std::string(runtime_directory.substr(0, runtime_directory.find(':'))));
+    if (!first.empty() && first.is_absolute()) {
+      return first;
     }
-    if (!xdg_runtime_dir.empty()) {
-      return fs::path(std::string(xdg_runtime_dir)) / "sunshine";
+    const auto xdg = fs::path(std::string(xdg_runtime_dir));
+    if (!xdg.empty() && xdg.is_absolute()) {
+      return xdg / "sunshine";
     }
     return std::nullopt;
   }
@@ -324,23 +417,35 @@ namespace handoff {
 
   bool instance_writer_t::write() {
     std::lock_guard lock(_mutex);
+    if (_removed) {
+      return false;
+    }
     return write_locked(_dir, _instance);
   }
 
   bool instance_writer_t::set_role(role_e role) {
     std::lock_guard lock(_mutex);
+    if (_removed) {
+      return false;
+    }
     _instance.role = role;
     return write_locked(_dir, _instance);
   }
 
   bool instance_writer_t::set_state(state_e state) {
     std::lock_guard lock(_mutex);
+    if (_removed) {
+      return false;
+    }
     _instance.handoff = state;
     return write_locked(_dir, _instance);
   }
 
   bool instance_writer_t::set_sessions(int sessions) {
     std::lock_guard lock(_mutex);
+    if (_removed) {
+      return false;
+    }
     _instance.sessions = sessions;
     return write_locked(_dir, _instance);
   }
@@ -352,6 +457,7 @@ namespace handoff {
 
   void instance_writer_t::remove() {
     std::lock_guard lock(_mutex);
+    _removed = true;
     remove_instance_file(_dir, _instance.pid);
   }
 
@@ -393,9 +499,20 @@ namespace handoff {
         continue;
       }
 
-      const auto content = read_file(path);
-      const auto instance = content ? parse_instance(*content) : std::nullopt;
-      if (!instance) {
+      std::string content;
+      const auto status = read_whole_file(path, content);
+      if (status == read_status_e::missing) {
+        // Removed by its process during the scan.
+        continue;
+      }
+      if (status == read_status_e::failed) {
+        result.any_unreadable = true;
+        continue;
+      }
+
+      // The file name must name the pid inside the file.
+      const auto instance = parse_instance(content);
+      if (!instance || path.filename() != fs::path(std::to_string(instance->pid) + ".json")) {
         result.any_unreadable = true;
         continue;
       }
