@@ -41,8 +41,8 @@
  *
  * Error rate: a throwing callback logs an Error the first time it throws for a certificate, and at most one further
  * Error per 60 s (by the injected clock) for that certificate while it keeps throwing. The limit is per certificate: a
- * throw for another certificate logs its own Error. It resets when the callback succeeds for the certificate or the
- * certificate leaves the disabled set.
+ * throw for another certificate logs its own Error. The limit is forgotten when the callback succeeds for the
+ * certificate or the certificate leaves the disabled set; its next throw then logs an Error at once.
  *
  * Directory: the watched directory is the state file's parent path; a relative path with no parent directory (a bare
  * file name) watches `"."`. If the directory does not exist (or the watch cannot be added), the poller logs one Warning
