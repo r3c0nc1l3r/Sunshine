@@ -197,6 +197,8 @@ namespace nvhttp {
 
   client_t client_root;  ///< In-memory representation of the paired-client database.
   std::atomic<uint32_t> session_id_counter;  ///< Monotonic counter used to allocate GameStream session IDs.
+  std::atomic<bool> host_audio_flag {false};  ///< Last `localAudioPlayMode` carried by `/launch` or `/resume`.
+  std::atomic<bool> state_frozen_flag {false};  ///< While set, every state-file save is a no-op.
 
   // Set by TLS verify callback, read by launch/resume handler (single-threaded HTTPS server)
   std::string last_verified_client_cert;  ///< Last client certificate accepted by the TLS verify callback.  // NOSONAR(cpp:S5421): intentionally mutable global
@@ -252,9 +254,18 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Persist the current state to its backing store.
+   * @brief Persist the current state to its backing store. The caller must hold `client_auth_mutex()`.
+   *
+   * Merges the host unique id and the paired clients into the existing file (other keys are kept) and writes the
+   * result atomically. Writes nothing while frozen.
+   *
+   * @return `true` when the file holds the current state or saves are frozen; `false` on failure.
    */
-  void save_state() {
+  bool save_state_unlocked() {
+    if (state_frozen_flag.load()) {
+      return true;
+    }
+
     pt::ptree root;
 
     if (fs::exists(config::nvhttp.file_state)) {
@@ -262,7 +273,7 @@ namespace nvhttp {
         pt::read_json(config::nvhttp.file_state, root);
       } catch (std::exception &e) {
         BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
-        return;
+        return false;
       }
     }
 
@@ -283,12 +294,29 @@ namespace nvhttp {
     }
     root.add_child("root.named_devices"s, named_cert_nodes);
 
+    std::ostringstream data;
     try {
-      pt::write_json(config::nvhttp.file_state, root);
+      pt::write_json(data, root);
     } catch (std::exception &e) {
-      BOOST_LOG(error) << "Couldn't write "sv << config::nvhttp.file_state << ": "sv << e.what();
-      return;
+      BOOST_LOG(error) << "Couldn't serialize "sv << config::nvhttp.file_state << ": "sv << e.what();
+      return false;
     }
+
+    if (auto ec = file_handler::write_file_atomic(config::nvhttp.file_state.c_str(), data.str()); ec) {
+      BOOST_LOG(error) << "Couldn't write "sv << config::nvhttp.file_state << ": "sv << ec.message();
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * @brief Persist the current state, taking `client_auth_mutex()`.
+   *
+   * @return See @ref save_state_checked.
+   */
+  bool save_state_checked() {
+    std::lock_guard lock {client_auth_mutex()};
+    return save_state_unlocked();
   }
 
   /**
@@ -361,33 +389,15 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Load state from its backing store.
+   * @brief Parse the paired-client records of the `root` node of the state file.
+   *
+   * Imports the old `devices` format, reads `named_devices`, and canonicalizes the certificates. Throws on a malformed
+   * record (`boost::property_tree` exceptions).
+   *
+   * @param root The `root` node of the state file.
+   * @return The parsed clients.
    */
-  void load_state() {
-    if (!fs::exists(config::nvhttp.file_state)) {
-      BOOST_LOG(info) << "File "sv << config::nvhttp.file_state << " doesn't exist"sv;
-      http::unique_id = uuid_util::uuid_t::generate().string();
-      return;
-    }
-
-    pt::ptree tree;
-    try {
-      pt::read_json(config::nvhttp.file_state, tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
-
-      return;
-    }
-
-    auto unique_id_p = tree.get_optional<std::string>("root.uniqueid");
-    if (!unique_id_p) {
-      // This file doesn't contain moonlight credentials
-      http::unique_id = uuid_util::uuid_t::generate().string();
-      return;
-    }
-    http::unique_id = std::move(*unique_id_p);
-
-    auto root = tree.get_child("root");
+  client_t parse_client_tree(const pt::ptree &root) {
     client_t client;
 
     // Import from old format
@@ -426,9 +436,82 @@ namespace nvhttp {
       }
     }
 
+    return client;
+  }
+
+  /**
+   * @brief Load state from its backing store.
+   */
+  void load_state() {
+    if (!fs::exists(config::nvhttp.file_state)) {
+      BOOST_LOG(info) << "File "sv << config::nvhttp.file_state << " doesn't exist"sv;
+      http::unique_id = uuid_util::uuid_t::generate().string();
+      return;
+    }
+
+    pt::ptree tree;
+    try {
+      pt::read_json(config::nvhttp.file_state, tree);
+    } catch (std::exception &e) {
+      BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
+
+      return;
+    }
+
+    auto unique_id_p = tree.get_optional<std::string>("root.uniqueid");
+    if (!unique_id_p) {
+      // This file doesn't contain moonlight credentials
+      http::unique_id = uuid_util::uuid_t::generate().string();
+      return;
+    }
+    http::unique_id = std::move(*unique_id_p);
+
+    client_t client = parse_client_tree(tree.get_child("root"));
+
     std::lock_guard lock {client_auth_mutex()};
     client_root = std::move(client);
     rebuild_client_cert_chain();
+  }
+
+  load_status_e reload_state() {
+    std::error_code exists_ec;
+    if (!fs::exists(config::nvhttp.file_state, exists_ec) && !exists_ec) {
+      BOOST_LOG(info) << "File "sv << config::nvhttp.file_state << " doesn't exist; nothing reloaded"sv;
+      return load_status_e::no_file;
+    }
+    if (exists_ec) {
+      BOOST_LOG(error) << "Couldn't check "sv << config::nvhttp.file_state << ": "sv << exists_ec.message();
+      return load_status_e::unreadable;
+    }
+
+    // Parse the whole file before touching any in-memory state.
+    pt::ptree tree;
+    try {
+      pt::read_json(config::nvhttp.file_state, tree);
+    } catch (std::exception &e) {
+      BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
+      return load_status_e::unreadable;
+    }
+
+    auto unique_id_p = tree.get_optional<std::string>("root.uniqueid");
+    if (!unique_id_p) {
+      BOOST_LOG(info) << "File "sv << config::nvhttp.file_state << " has no root.uniqueid; nothing reloaded"sv;
+      return load_status_e::no_uniqueid;
+    }
+
+    client_t client;
+    try {
+      client = parse_client_tree(tree.get_child("root"));
+    } catch (std::exception &e) {
+      BOOST_LOG(error) << "Couldn't parse the paired clients in "sv << config::nvhttp.file_state << ": "sv << e.what();
+      return load_status_e::unreadable;
+    }
+
+    std::lock_guard lock {client_auth_mutex()};
+    http::unique_id = std::move(*unique_id_p);
+    client_root = std::move(client);
+    rebuild_client_cert_chain();
+    return load_status_e::loaded;
   }
 
   /**
@@ -454,7 +537,7 @@ namespace nvhttp {
     rebuild_client_cert_chain();
 
     if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
-      save_state();
+      save_state_unlocked();
     }
     return client_root.named_devices.back().uuid;
   }
@@ -1324,11 +1407,10 @@ namespace nvhttp {
   /**
    * @brief Launch the requested application for a GameStream session.
    *
-   * @param host_audio Host audio.
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client.
    */
-  void launch(bool &host_audio, resp_https_t response, req_https_t request) {
+  void launch(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1374,8 +1456,9 @@ namespace nvhttp {
       return;
     }
 
-    host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    auto launch_session = make_launch_session(host_audio, args);
+    const bool host_audio_value = util::from_view(get_arg(args, "localAudioPlayMode"));
+    set_host_audio(host_audio_value);
+    auto launch_session = make_launch_session(host_audio_value, args);
 
     if (rtsp_stream::session_count() == 0) {
       // The display should be restored in case something fails as there are no other sessions.
@@ -1442,11 +1525,10 @@ namespace nvhttp {
   /**
    * @brief Resume an existing GameStream session.
    *
-   * @param host_audio Host audio.
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client.
    */
-  void resume(bool &host_audio, resp_https_t response, req_https_t request) {
+  void resume(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1487,10 +1569,12 @@ namespace nvhttp {
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
     const bool no_active_sessions {rtsp_stream::session_count() == 0};
+    bool host_audio_value = host_audio();
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
-      host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
+      host_audio_value = util::from_view(get_arg(args, "localAudioPlayMode"));
+      set_host_audio(host_audio_value);
     }
-    const auto launch_session = make_launch_session(host_audio, args);
+    const auto launch_session = make_launch_session(host_audio_value, args);
 
     if (no_active_sessions) {
       // We want to prepare display only if there are no active sessions at
@@ -1619,10 +1703,6 @@ namespace nvhttp {
     auto cert = file_handler::read_file(config::nvhttp.cert.c_str());
     setup(pkey, cert);
 
-    // resume doesn't always get the parameter "localAudioPlayMode"
-    // launch will store it in host_audio
-    bool host_audio {};
-
     https_server_t https_server {config::nvhttp.cert, config::nvhttp.pkey};
     http_server_t http_server;
 
@@ -1695,11 +1775,12 @@ namespace nvhttp {
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/appasset$"]["GET"] = appasset;
-    https_server.resource["^/launch$"]["GET"] = [&host_audio](auto resp, auto req) {
-      launch(host_audio, resp, req);
+    // launch and resume store the host audio value through set_host_audio()
+    https_server.resource["^/launch$"]["GET"] = [](auto resp, auto req) {
+      launch(resp, req);
     };
-    https_server.resource["^/resume$"]["GET"] = [&host_audio](auto resp, auto req) {
-      resume(host_audio, resp, req);
+    https_server.resource["^/resume$"]["GET"] = [](auto resp, auto req) {
+      resume(resp, req);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
 
@@ -1750,7 +1831,7 @@ namespace nvhttp {
     std::lock_guard lock {client_auth_mutex()};
     client_root = {};
     cert_chain.clear();
-    save_state();
+    save_state_unlocked();
   }
 
   bool unpair_client(const std::string_view uuid) {
@@ -1766,7 +1847,7 @@ namespace nvhttp {
     }
 
     rebuild_client_cert_chain();
-    save_state();
+    save_state_unlocked();
     return removed;
   }
 
@@ -1776,7 +1857,7 @@ namespace nvhttp {
       if (named_cert.uuid == uuid) {
         named_cert.enabled = enabled;
         rebuild_client_cert_chain();
-        save_state();
+        save_state_unlocked();
         return true;
       }
     }
@@ -1807,6 +1888,40 @@ namespace nvhttp {
       }
     }
     return {true, {}};
+  }
+
+  void set_state_frozen(bool frozen) {
+    state_frozen_flag.store(frozen);
+    if (frozen) {
+      // A save in flight holds client_auth_mutex() while it writes; waiting for the mutex lets it finish.
+      std::lock_guard lock {client_auth_mutex()};
+    }
+  }
+
+  bool state_frozen() {
+    return state_frozen_flag.load();
+  }
+
+  std::size_t pairing_session_count() {
+    expire_pair_sessions(std::chrono::steady_clock::now());
+    std::scoped_lock lock {map_id_sess_mutex()};
+    return map_id_sess.size();
+  }
+
+  bool host_audio() {
+    return host_audio_flag.load();
+  }
+
+  void set_host_audio(bool value) {
+    host_audio_flag.store(value);
+  }
+
+  std::uint32_t next_launch_session_id() {
+    return session_id_counter.load() + 1u;
+  }
+
+  void set_next_launch_session_id(std::uint32_t next_id) {
+    session_id_counter.store(next_id - 1u);
   }
 
 #ifdef SUNSHINE_TESTS
