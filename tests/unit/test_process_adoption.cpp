@@ -1101,6 +1101,38 @@ TEST_F(ProcessAdoptionTest, ReleasedAppAfterAdoptionRunsNoUndo) {
   EXPECT_TRUE(md.lines().empty()) << "a re-released adopted app runs no undo at terminate";
 }
 
+TEST_F(ProcessAdoptionTest, AfterDropRunningIsZeroAndLaterTerminateRunsNoUndo) {
+  marker_dir_t md;
+  proc::proc_t proc;
+  proc.set_running_for_test(make_prep_app(md), 1, true, 0, 3);
+  proc.set_released(true);
+  ASSERT_TRUE(proc.drop_released_app());
+  EXPECT_EQ(proc.running(), 0) << "after drop_released_app() running() must return 0, never -1";
+  EXPECT_EQ(proc.running(), 0) << "a second running() must still return 0";
+  EXPECT_FALSE(proc.released()) << "drop_released_app() must clear the released flag";
+  EXPECT_FALSE(proc.snapshot().has_value()) << "no app may be recorded after the drop (app id is -1)";
+  proc.terminate();
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_TRUE(md.lines().empty()) << "a terminate() after drop_released_app() must run no undo command";
+  EXPECT_EQ(proc.running(), 0);
+}
+
+TEST_F(ProcessAdoptionTest, AfterReleasedTerminateRunningIsZeroAndNothingRunsAgain) {
+  marker_dir_t md;
+  proc::proc_t proc;
+  proc.set_running_for_test(make_prep_app(md), 1, true, 0, 3);
+  proc.set_released(true);
+  proc.terminate();
+  EXPECT_FALSE(proc.released()) << "released terminate() must clear the released flag";
+  EXPECT_FALSE(proc.snapshot().has_value()) << "no app may be recorded after the released terminate";
+  EXPECT_EQ(proc.running(), 0) << "after the released terminate() running() must return 0, never -1";
+  EXPECT_EQ(proc.running(), 0) << "a second running() must still return 0";
+  proc.terminate();
+  EXPECT_EQ(proc.running(), 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_TRUE(md.lines().empty()) << "no undo command may run for the released terminate, running() or a second terminate()";
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Concurrency
 // ---------------------------------------------------------------------------------------------------------------
@@ -1153,8 +1185,7 @@ TEST_F(ProcessAdoptionTest, MoveConstructedObjectKeepsAtomics) {
   EXPECT_TRUE(b.adoptable(nullptr));
 }
 
-// SPEC-QUESTION: after the drop `placebo` is false, so running() takes the pre-existing branch; the spec says the
-// reader sees "the old id or 0, never -1", which this test asserts.
+// Contract: running() during the drop returns the old id or 0, never -1 (the app id itself is not observable).
 TEST_F(ProcessAdoptionTest, RunningDuringDropSeesOldIdOrZero) {
   std::atomic<bool> bad {false};
   for (int i = 0; i < 300; ++i) {
