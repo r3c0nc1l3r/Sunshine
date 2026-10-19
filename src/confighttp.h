@@ -99,6 +99,15 @@ namespace confighttp {
   void closeSession(const resp_https_t &response, const req_https_t &request);
 
   /**
+   * @brief Register the session API routes (`GET /api/sessions`, `POST /api/sessions/<id>/close`) on the admin server.
+   *
+   * `start()` uses this; tests use it to exercise the production route table.
+   *
+   * @param server Admin web UI HTTPS server.
+   */
+  void register_session_routes(https_server_t &server);
+
+  /**
    * @brief Convert a session description to the JSON object returned by `GET /api/sessions`.
    *
    * @param info Session description.
