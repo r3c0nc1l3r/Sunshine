@@ -100,6 +100,7 @@ namespace stream {
       bool _armed {false};  ///< Whether a ping was recorded.
       std::chrono::steady_clock::time_point _last_ping {};  ///< Time of the last recorded ping.
     };
+
     /**
      * @brief Thread-safe wrapper around `media_liveness_t`, shared by the receive and broadcast threads.
      */

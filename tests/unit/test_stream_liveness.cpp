@@ -145,7 +145,7 @@ TEST(MediaLivenessTest, NewPingResetsClock) {
   media.on_ping(base_time());
   media.on_ping(base_time() + 4s);
   EXPECT_FALSE(media.expired(base_time() + 8s, 5s));  // 4 s since the second ping
-  EXPECT_TRUE(media.expired(base_time() + 9s, 5s));   // 5 s since the second ping
+  EXPECT_TRUE(media.expired(base_time() + 9s, 5s));  // 5 s since the second ping
 }
 
 /**

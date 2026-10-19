@@ -11,17 +11,17 @@
 // standard includes
 #include <cctype>
 #include <chrono>
-#include <exception>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
-#include <fstream>
 #include <format>
+#include <fstream>
 #include <iterator>
 #include <memory>
 #include <set>
 #include <sstream>
-#include <system_error>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
