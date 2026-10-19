@@ -130,7 +130,8 @@ namespace handoff {
    *
    * @param hello Old process's `HELLO`.
    * @param own Identity of this host, from `gather_probe(env).identity`.
-   * @return The results to publish with `video::set_handoff_probe_override` (converted with the mapping above), or
+   * @return The accepted `probe_results_t` (the caller converts it with the mapping in `video.h` and publishes it with
+   *         `video::set_handoff_probe_override`), or
    *         `std::nullopt`. The startup probe skip is not decided here. `main.cpp` gates its startup
    *         `video::probe_encoders` on `handoff::hooks::startup_probe_skipped()` (added to `hooks.h` on the other
    *         contract branch): true only when the process was started by a handoff AND

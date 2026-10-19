@@ -695,9 +695,12 @@ namespace video {
    * Mapping from `handoff::protocol::probe_results_t`: `hevc_mode` to `hevc_mode`, `av1_mode` to `av1_mode`,
    * `yuv444_h264`, `yuv444_hevc` and `yuv444_av1` to `yuv444[0]`, `yuv444[1]` and `yuv444[2]`.
    *
-   * Read sites (the only ones): `nvhttp.cpp` `get_codec_mode_flags()` (about lines 1264-1286), which builds
-   * `ServerCodecModeSupport`, and the `serverinfo` call to it (about line 1324). Nothing else reads the override: the
-   * `rtsp.cpp` uses of `active_hevc_mode`/`active_av1_mode` (about lines 1101, 1105, 1425, 1432) keep the globals.
+   * Read sites (the only ones; each reads the override once per request and falls back to the globals when it holds
+   * no value): `nvhttp.cpp` `get_codec_mode_flags()` (about line 1259, called by `serverinfo` at about line 1349),
+   * which builds `ServerCodecModeSupport`; `serverinfo`'s `MaxLumaPixelsHEVC` (about line 1324, `hevc_mode > 1`); and
+   * the app list's `IsHdrSupported` (about line 1408, `hevc_mode >= 3`), so a client sees the same capabilities from
+   * both processes. Nothing else reads the override: the `rtsp.cpp` uses of `active_hevc_mode`/`active_av1_mode`
+   * (about lines 1101, 1105, 1425, 1432) keep the globals, because the launch path probes again before them.
    */
   struct handoff_probe_override_t {
     int hevc_mode {0};  ///< HEVC mode (0 to 5) that `/serverinfo` reports in place of `active_hevc_mode`.
