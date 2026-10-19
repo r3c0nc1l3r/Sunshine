@@ -1257,33 +1257,39 @@ namespace nvhttp {
    * @return Moonlight codec capability bitmask for the currently probed encoders.
    */
   uint32_t get_codec_mode_flags() {
+    // A handoff probe override, when installed, replaces the probe globals for this request only.
+    const auto probe_override = video::handoff_probe_override();
+    const int hevc_mode = probe_override ? probe_override->hevc_mode : video::active_hevc_mode;
+    const int av1_mode = probe_override ? probe_override->av1_mode : video::active_av1_mode;
+    const std::array<bool, 3> yuv444 = probe_override ? probe_override->yuv444 : video::last_encoder_probe_supported_yuv444_for_codec;
+
     uint32_t codec_mode_flags = SCM_H264;
-    if (video::last_encoder_probe_supported_yuv444_for_codec[0]) {
+    if (yuv444[0]) {
       codec_mode_flags |= SCM_H264_HIGH8_444;
     }
-    if (video::active_hevc_mode >= 2) {
+    if (hevc_mode >= 2) {
       codec_mode_flags |= SCM_HEVC;
-      if (video::last_encoder_probe_supported_yuv444_for_codec[1]) {
+      if (yuv444[1]) {
         codec_mode_flags |= SCM_HEVC_REXT8_444;
       }
     }
-    if (video::active_hevc_mode == 3 || video::active_hevc_mode == 5) {
+    if (hevc_mode == 3 || hevc_mode == 5) {
       codec_mode_flags |= SCM_HEVC_MAIN10;
     }
-    if ((video::active_hevc_mode == 4 || video::active_hevc_mode == 5) && video::last_encoder_probe_supported_yuv444_for_codec[1]) {
+    if ((hevc_mode == 4 || hevc_mode == 5) && yuv444[1]) {
       codec_mode_flags |= SCM_HEVC_REXT10_444;
     }
 
-    if (video::active_av1_mode >= 2) {
+    if (av1_mode >= 2) {
       codec_mode_flags |= SCM_AV1_MAIN8;
-      if (video::last_encoder_probe_supported_yuv444_for_codec[2]) {
+      if (yuv444[2]) {
         codec_mode_flags |= SCM_AV1_HIGH8_444;
       }
     }
-    if (video::active_av1_mode == 3 || video::active_av1_mode == 5) {
+    if (av1_mode == 3 || av1_mode == 5) {
       codec_mode_flags |= SCM_AV1_MAIN10;
     }
-    if ((video::active_av1_mode == 4 || video::active_av1_mode == 5) && video::last_encoder_probe_supported_yuv444_for_codec[2]) {
+    if ((av1_mode == 4 || av1_mode == 5) && yuv444[2]) {
       codec_mode_flags |= SCM_AV1_HIGH10_444;
     }
     return codec_mode_flags;
@@ -1321,7 +1327,10 @@ namespace nvhttp {
     tree.put("root.uniqueid", http::unique_id);
     tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
     tree.put("root.ExternalPort", net::map_port(PORT_HTTP));
-    tree.put("root.MaxLumaPixelsHEVC", video::active_hevc_mode > 1 ? "1869449984" : "0");
+    // Read the handoff probe override once for this request; fall back to the probe globals when it is not set.
+    const auto probe_override = video::handoff_probe_override();
+    const int hevc_mode = probe_override ? probe_override->hevc_mode : video::active_hevc_mode;
+    tree.put("root.MaxLumaPixelsHEVC", hevc_mode > 1 ? "1869449984" : "0");
 
     // Only include the MAC address for requests sent from paired clients over HTTPS.
     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
@@ -1402,10 +1411,14 @@ namespace nvhttp {
 
     apps.put("<xmlattr>.status_code", 200);
 
+    // Read the handoff probe override once for this request; fall back to the probe globals when it is not set.
+    const auto probe_override = video::handoff_probe_override();
+    const int hevc_mode = probe_override ? probe_override->hevc_mode : video::active_hevc_mode;
+
     for (auto &proc : proc::proc.get_apps()) {
       pt::ptree app;
 
-      app.put("IsHdrSupported"s, video::active_hevc_mode >= 3 ? 1 : 0);
+      app.put("IsHdrSupported"s, hevc_mode >= 3 ? 1 : 0);
       app.put("AppTitle"s, proc.name);
       app.put("ID", proc.id);
 

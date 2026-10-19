@@ -8,6 +8,7 @@
 #include <atomic>
 #include <bitset>
 #include <list>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -1473,6 +1474,29 @@ namespace video {
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
+
+  static std::mutex handoff_probe_override_mutex;  ///< Guards `handoff_probe_override_value`.
+  static std::optional<handoff_probe_override_t> handoff_probe_override_value;  ///< `/serverinfo` override from `HELLO`, if any.
+
+  /**
+   * @brief Set or clear the `/serverinfo` probe override.
+   *
+   * @param value Override to install, or `std::nullopt` to clear it.
+   */
+  void set_handoff_probe_override(std::optional<handoff_probe_override_t> value) {
+    std::lock_guard lock {handoff_probe_override_mutex};
+    handoff_probe_override_value = std::move(value);
+  }
+
+  /**
+   * @brief The current `/serverinfo` probe override.
+   *
+   * @return A copy of the override, or `std::nullopt` when none is installed.
+   */
+  std::optional<handoff_probe_override_t> handoff_probe_override() {
+    std::lock_guard lock {handoff_probe_override_mutex};
+    return handoff_probe_override_value;
+  }
 
   /**
    * @brief Recreate a display capture object after a capture failure.
@@ -3298,6 +3322,8 @@ namespace video {
 
     // If we already have a good encoder, check to see if another probe is required
     if (chosen_encoder && !(chosen_encoder->flags & ALWAYS_REPROBE) && !platf::needs_encoder_reenumeration()) {
+      // A successful probe ends the `/serverinfo` override; this process now reports its own probe state.
+      set_handoff_probe_override(std::nullopt);
       return 0;
     }
 
@@ -3527,6 +3553,8 @@ namespace video {
       BOOST_LOG(debug) << "ENCODER STATUS ACTIVE_AV1_MODE: "sv << active_av1_mode;
     }
 
+    // A successful probe ends the `/serverinfo` override; this process now reports its own probe state.
+    set_handoff_probe_override(std::nullopt);
     return 0;
   }
 
