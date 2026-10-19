@@ -69,7 +69,7 @@ namespace proc {
       // Drain handoff: with an app running, ask the draining process (if any) first. A refusal skips the terminate
       // only for an adopted app; an app this process launched is terminated as upstream does.
       if (proc.running() > 0) {
-        handoff::terminate_app(handoff::shutdown_terminate_budget, "terminate the app at shutdown"sv);
+        handoff::terminate_app(handoff::shutdown_terminate_budget, "terminate the app at shutdown"sv, true);
         return;
       }
 #endif

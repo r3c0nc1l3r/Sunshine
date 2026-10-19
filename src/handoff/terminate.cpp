@@ -63,17 +63,19 @@ namespace handoff {
     }
   }
 
-  terminate_permission_e terminate_app(std::chrono::milliseconds budget, std::string_view action) {
+  terminate_permission_e terminate_app(std::chrono::milliseconds budget, std::string_view action, bool at_shutdown) {
     const auto permission = terminate_gate(budget);
     if (allows_terminate(permission)) {
       terminate_app_permitted();
       return permission;
     }
 
-    BOOST_LOG(warning) << "Not doing "sv << action << ": the previous process did not release the app"sv;
     // A shutdown never leaves behind an app this process started; an adopted app stays with the other process.
-    if (budget == shutdown_terminate_budget && !proc::proc.adopted()) {
+    if (at_shutdown && !proc::proc.adopted()) {
+      BOOST_LOG(warning) << "The previous process did not release the app; terminating it anyway because this process launched it"sv;
       terminate_app_permitted();
+    } else {
+      BOOST_LOG(warning) << "Not doing "sv << action << ": the previous process did not release the app"sv;
     }
     return permission;
   }
