@@ -370,7 +370,9 @@ namespace handoff {
 
         // Switch (step 5), substeps 1 to 9.
         _paused = true;
-        _ops.pause_accept();
+        if (auto reason = _ops.pause_accept(); !reason.empty()) {
+          return fail(reason);
+        }
         _gate = true;
         _ops.raise_gate();
         if (!_ops.wait_in_flight(_t.in_flight)) {

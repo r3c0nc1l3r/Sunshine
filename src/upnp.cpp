@@ -57,6 +57,60 @@ namespace upnp {
     }
 
     std::atomic<unmap_scope_e> g_unmap_scope {unmap_scope_e::all};  ///< Scope the guard applies when it is destroyed.
+
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief The fake gateway of the test seam: an in-memory mapping store.
+     */
+    struct fake_igd_t {
+      std::mutex mutex;  ///< Guards the fields below.
+      bool installed = false;  ///< A fake gateway is installed.
+      std::set<testing::fake_mapping_t> store;  ///< The mappings on the fake gateway.
+    };
+
+    /**
+     * @brief Access the fake gateway.
+     * @return Reference to the process-wide fake (never destroyed, like `state()`).
+     */
+    fake_igd_t &fake_igd() {
+      static auto *instance = new fake_igd_t;
+      return *instance;
+    }
+
+    /**
+     * @brief Whether a fake gateway is installed.
+     * @return `true` when installed.
+     */
+    bool fake_igd_installed() {
+      auto &fake = fake_igd();
+      std::lock_guard lock {fake.mutex};
+      return fake.installed;
+    }
+
+    /**
+     * @brief Add or refresh an entry on the fake gateway.
+     * @param port Port.
+     * @param udp `true` for UDP, `false` for TCP.
+     */
+    void fake_igd_map(std::uint16_t port, bool udp) {
+      auto &fake = fake_igd();
+      std::lock_guard lock {fake.mutex};
+      if (fake.installed) {
+        fake.store.insert({port, !udp});
+      }
+    }
+
+    /**
+     * @brief Delete an entry from the fake gateway; a missing entry counts as removed.
+     * @param port Port.
+     * @param udp `true` for UDP, `false` for TCP.
+     */
+    void fake_igd_unmap(std::uint16_t port, bool udp) {
+      auto &fake = fake_igd();
+      std::lock_guard lock {fake.mutex};
+      fake.store.erase({port, !udp});
+    }
+#endif
   }  // namespace
 
   std::vector<planned_mapping_t> plan_mappings(int port, int udp_base, bool web_ui_on_wan) {
@@ -419,6 +473,16 @@ namespace upnp {
       // Refresh UPnP rules every few minutes. They can be lost if the router reboots,
       // WAN IP address changes, or various other conditions.
       do {
+#ifdef SUNSHINE_TESTS
+        if (fake_igd_installed()) {
+          // Test seam: the fake gateway is found at once and holds the mappings in memory.
+          for (auto it = std::begin(plan); it != std::end(plan) && !shutdown_event->peek(); ++it) {
+            fake_igd_map(it->port, it->udp);
+          }
+          mapped = true;
+          continue;
+        }
+#endif
         int err = 0;
         device_t device {upnpDiscover(2000, nullptr, nullptr, 0, IPv4, 2, &err)};
         if (!device || err) {
@@ -477,6 +541,16 @@ namespace upnp {
           }
         }
 
+#ifdef SUNSHINE_TESTS
+        if (fake_igd_installed()) {
+          // Test seam: remove what the current scope selects from the fake gateway.
+          for (const auto &entry : select_for_scope(plan, unmap_scope())) {
+            fake_igd_unmap(entry.port, entry.udp);
+          }
+          return;
+        }
+#endif
+
         // Unmap ports upon termination
         BOOST_LOG(info) << "Unmapping UPNP ports..."sv;
         unmap_all_upnp_ports(mapped_urls, data);
@@ -496,6 +570,15 @@ namespace upnp {
      * @param entries The UDP mappings to delete, from `removal_plan`.
      */
     void remove_entries(const std::vector<planned_mapping_t> &entries) {
+#ifdef SUNSHINE_TESTS
+      if (fake_igd_installed()) {
+        // Test seam: the fake gateway has no other LAN host, so every planned UDP entry is deleted.
+        for (const auto &entry : entries) {
+          fake_igd_unmap(entry.port, entry.udp);
+        }
+        return;
+      }
+#endif
       int err = 0;
       device_t device {upnpDiscover(2000, nullptr, nullptr, 0, IPv4, 2, &err)};
       if (!device || err) {
@@ -656,4 +739,57 @@ namespace upnp {
       }
     }
   }
+
+#ifdef SUNSHINE_TESTS
+  namespace testing {
+    void install_fake_igd(const std::set<fake_mapping_t> &initial) {
+      auto &fake = fake_igd();
+      std::lock_guard lock {fake.mutex};
+      fake.installed = true;
+      fake.store = initial;
+    }
+
+    void remove_fake_igd() {
+      auto &fake = fake_igd();
+      std::lock_guard lock {fake.mutex};
+      fake.installed = false;
+      fake.store.clear();
+    }
+
+    void fake_igd_add(const std::set<fake_mapping_t> &entries) {
+      auto &fake = fake_igd();
+      std::lock_guard lock {fake.mutex};
+      if (fake.installed) {
+        fake.store.insert(entries.begin(), entries.end());
+      }
+    }
+
+    std::set<fake_mapping_t> fake_igd_mappings() {
+      auto &fake = fake_igd();
+      std::lock_guard lock {fake.mutex};
+      return fake.installed ? fake.store : std::set<fake_mapping_t> {};
+    }
+
+    bool wait_idle_for_test(std::chrono::milliseconds timeout) {
+      auto &shared = state();
+      std::unique_lock lock {shared.mutex};
+      return shared.idle.wait_for(lock, timeout, [&shared] {
+        return !shared.worker_running;
+      });
+    }
+
+    void reset_upnp_for_test() {
+      wait_idle_for_test(5s);
+      auto &shared = state();
+      {
+        std::lock_guard lock {shared.mutex};
+        shared.started = false;
+        shared.planned = false;
+        shared.own_plan.clear();
+        shared.jobs.clear();
+      }
+      set_unmap_scope(unmap_scope_e::all);
+    }
+  }  // namespace testing
+#endif
 }  // namespace upnp
