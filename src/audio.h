@@ -95,6 +95,8 @@ namespace audio {
     platf::sink_t sink;  ///< Original sink captured before Sunshine switched devices.
 
     std::mutex sink_mutex;  ///< Guards `virtual_sink` and the default-sink switch that `reassert_virtual_sink` makes.
+    // Written only by the first-session sink switch in audio.cpp capture() (the sink_flag exchange), under sink_mutex,
+    // and only when that switch selects a virtual (null) sink.
     std::string virtual_sink;  ///< Virtual sink the first session switched to; empty until then and when none was used.
   };
 

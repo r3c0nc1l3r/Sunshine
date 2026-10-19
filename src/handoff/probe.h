@@ -1,7 +1,6 @@
 /**
  * @file src/handoff/probe.h
- * @brief Encoder probe data exchanged in `HELLO`: what the draining process reports, how the new process accepts it,
- * and when the new process skips its own startup probe.
+ * @brief Encoder probe data exchanged in `HELLO`: what the draining process reports and how the new process accepts it.
  *
  * See `docs/drain-handoff.md`, "3. New process start" (the `HELLO` identity rule) and "GPU" (the probe results feed
  * `/serverinfo` only). `protocol.h` owns the wire structs (`probe_results_t`, `probe_identity_t`); this header owns
@@ -115,25 +114,30 @@ namespace handoff {
    * - `hello.probe` and `hello.identity` are both present;
    * - `*hello.identity == own` (every identity field equal, including the driver version);
    * - `hevc_mode` and `av1_mode` are both within 0 to 5 (a value outside that range is rejected, as a defensive
-   *   check; the decoder already rejects it).
+   *   check).
+   *
+   * The accepted range is 0 to 5, not the 0 to 3 that the config options allow (`config.cpp`, `hevc_mode` and
+   * `av1_mode` use `int_between_f` with `{0, 3}`). The encoder probe can raise the active mode to 4 or 5 (the 4:4:4
+   * variants), so a probe result can be higher than the configured value.
+   *
+   * Mapping onto the override (`video.h`, `handoff_probe_override_t`), field for field:
+   * - `results.hevc_mode` to `hevc_mode`;
+   * - `results.av1_mode` to `av1_mode`;
+   * - `results.yuv444_h264` to `yuv444[0]`, `results.yuv444_hevc` to `yuv444[1]`, `results.yuv444_av1` to `yuv444[2]`.
    *
    * A mismatch, a missing field or an out-of-range mode leaves `/serverinfo` on this process's own probe state; the
    * function does not log. The caller is the new side's `accept_old_hello`.
    *
    * @param hello Old process's `HELLO`.
    * @param own Identity of this host, from `gather_probe(env).identity`.
-   * @return The results to publish with `video::set_handoff_probe_override`, or `std::nullopt`.
+   * @return The results to publish with `video::set_handoff_probe_override` (converted with the mapping above), or
+   *         `std::nullopt`. The startup probe skip is not decided here. `main.cpp` gates its startup
+   *         `video::probe_encoders` on `handoff::hooks::startup_probe_skipped()` (added to `hooks.h` on the other
+   *         contract branch): true only when the process was started by a handoff AND
+   *         `video::handoff_probe_override()` holds a value, so a child whose `HELLO` was rejected still probes.
    */
-  std::optional<protocol::probe_results_t> accepted_probe(const protocol::hello_t &hello, const protocol::probe_identity_t &own);
-
-  /**
-   * @brief Whether the startup encoder probe (`video::probe_encoders` at `main()`) is skipped.
-   *
-   * Skipped exactly when this process was started by a handoff: a handoff child opens no capture or encoder before its
-   * first session, and its `/serverinfo` answers from `video::handoff_probe_override` until its first successful
-   * `probe_encoders` (the `/launch` or `/resume` probe). A normal start always probes.
-   *
-   * @return `hooks::started_by_handoff()`. The probe runs when this returns `false`.
-   */
-  bool startup_probe_skipped();
+  std::optional<protocol::probe_results_t> accepted_probe(
+    const protocol::hello_t &hello,
+    const protocol::probe_identity_t &own
+  );
 }  // namespace handoff
