@@ -105,7 +105,7 @@ namespace proc {
    * data race. `execute()` sets `app_id` after the app is chosen, `applied` each time a prep command has run, `pgid`
    * after the launch and `placebo` when the command is empty; `running()` sets `placebo` on the auto-detach flip;
    * `terminate()` and `drop_released_app()` clear everything (`app_id` becomes -1 as before, and `placebo`, `pgid`,
-   * `applied` and `released` are cleared). Non-atomic members (`_app`, `_env`, `_apps`, the prep iterators, `_pipe`,
+   * `applied`, `released` and `adopted` are cleared). Non-atomic members (`_app`, `_env`, `_apps`, the prep iterators, `_pipe`,
    * `_process`, `_process_group`) are still owned by the thread that runs `execute()`, `terminate()` or the documented
    * handoff calls. All accesses are sequentially consistent. Atomics are not movable, and `proc::refresh` replaces the
    * whole `proc_t` by move assignment, so this wrapper has a move constructor and a move assignment that copy the
@@ -120,6 +120,7 @@ namespace proc {
     std::atomic<long> pgid {0};  ///< Process group id of the app, or 0 when it has none.
     std::atomic<std::uint32_t> applied {0};  ///< Number of applied prep commands (`_app_prep_it - _app_prep_begin`).
     std::atomic<bool> released {false};  ///< The app was released to another process (`set_released`).
+    std::atomic<bool> adopted {false};  ///< The running app was adopted from another process (`install_adoption`).
 
     /**
      * @brief Create cleared state.
@@ -127,14 +128,16 @@ namespace proc {
     app_atomics_t() = default;
 
     /**
-     * @brief Copy the current values of another instance.
+     * @brief Copy the current values of another instance, one by one: `app_id`, `placebo`, `pgid`, `applied`,
+     * `released` and `adopted`.
      *
      * @param other Source.
      */
     app_atomics_t(app_atomics_t &&other) noexcept;
 
     /**
-     * @brief Copy the current values of another instance.
+     * @brief Copy the current values of another instance, one by one: `app_id`, `placebo`, `pgid`, `applied`,
+     * `released` and `adopted`.
      *
      * @param other Source.
      * @return This object.
@@ -229,6 +232,9 @@ namespace proc {
 
     /**
      * @brief Launch the configured application process.
+     *
+     * Clears the `adopted` flag (an app started here is never adopted), together with the other per-app atomics it
+     * resets at its start.
      *
      * @param app_id App ID.
      * @param launch_session Launch session.
@@ -334,6 +340,17 @@ namespace proc {
     bool released() const;
 
     /**
+     * @brief Whether the running app was adopted from another process rather than launched by this one.
+     *
+     * Set by `install_adoption` (with the other atomics) and cleared by `terminate()`, `drop_released_app()` and
+     * `execute()` (a new launch). An app this process launched, including a placebo app with no process group, returns
+     * `false`; with no app running it returns `false`. Lock-free; callable from any thread.
+     *
+     * @return The flag.
+     */
+    bool adopted() const;
+
+    /**
      * @brief Drop a released app's state without running anything (a rollback after `ENDED`, and the exit of a
      * draining process).
      *
@@ -412,7 +429,7 @@ namespace proc {
      * `get_last_run_app_name()`), `_app_prep_begin` (the begin of `_app.prep_cmds`), `_app_prep_it` (begin plus
      * `applied_prep`), placebo mode, and the environment: each launch entry is stored in `_env`; then reopens the app's
      * `output` file for appending when it is neither empty nor `null` (a failure logs a Warning and continues without
-     * a pipe). Sets the atomics (app id, placebo true, process group 0, applied count, released false). Starts no
+     * a pipe). Sets the atomics (app id, placebo true, process group 0, applied count, released false, adopted true). Starts no
      * process, runs no command and sends no tray notification. Precondition: it runs before the process accepts any
      * request, on the plan from `prepare_adoption()` of this same object with no `refresh` or `swap_app_list` in
      * between; no lock is taken.
