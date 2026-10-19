@@ -114,6 +114,9 @@ environment adds:
 - `SUNSHINE_HANDOFF_UDP_BASE` (the base the old process does not use) and `SUNSHINE_HANDOFF_GENERATION` (keeps
   virtual device ids unique). The next launch session id is sent in `GO` (step 5), because the old process keeps
   allocating ids until the switch [C28].
+- `SUNSHINE_HANDOFF_HOST_SINK`: the host's own default sink as the old process recorded it. While the old process
+  streams, the current default sink is one of Sunshine's virtual sinks, so the new process takes the host sink from this
+  variable instead of reading the default, and never records a Sunshine virtual sink as the host sink.
 
 The systemd `LISTEN_FDS`/`LISTEN_PID` convention is not used: the child's pid is not known before the spawn.
 
@@ -132,14 +135,14 @@ the death is still seen through the pidfd (it becomes readable), and the exit st
   family match its own config (`port`, `address_family`, `bind_address`). A mismatch (config or version drift) is
   reported as a failed `READY` with the reason.
 - It exchanges `HELLO` with the old process: protocol version and capabilities. An unknown major version is a failed
-  `READY`. The old process's `HELLO` carries its encoder probe results (the HEVC, AV1 and 4:4:4 capability flags that
-  `/serverinfo` reports) with a probe identity (build id, GPU render node and vendor/device id, driver version). The new
-  process uses them only when the identity matches its own, and only for `/serverinfo` (see "GPU"). The old process's
-  `HELLO` also carries its cooldown deadline, which the new process inherits, and a pidfd of the old process itself
-  (`pidfd_open(getpid())`, sent with `SCM_RIGHTS` and received with `MSG_CMSG_CLOEXEC`, so no app inherits it), so the
-  new process holds the right process without any pid lookup (a pid number can be reused later; the pidfd still refers
-  to the old process). A `HELLO` without it is a failed `READY`. The app state is not sent here: the old process keeps
-  serving until the switch, so it is sent in `GO`.
+  `READY`. The old process's `HELLO` carries its encoder probe results (the active HEVC and AV1 modes, 0 to 5, and the
+  per-codec 4:4:4 flags that `/serverinfo` reports) with a probe identity (build id, GPU render node and vendor/device
+  id, driver version). The new process uses them only when the identity matches its own, and only for `/serverinfo` (see
+  "GPU"). The old process's `HELLO` also carries its cooldown deadline, which the new process inherits, and a pidfd of
+  the old process itself (`pidfd_open(getpid())`, sent with `SCM_RIGHTS` and received with `MSG_CMSG_CLOEXEC`, so no app
+  inherits it), so the new process holds the right process without any pid lookup (a pid number can be reused later; the
+  pidfd still refers to the old process). A `HELLO` without it is a failed `READY`. The app state is not sent here: the
+  old process keeps serving until the switch, so it is sent in `GO`.
 - It adopts the sockets instead of binding them (this needs small patches: Simple-Web-Server `start()` must accept an
   existing listening socket, and the RTSP acceptor in `rtsp.cpp` must adopt one instead of `bind`/`listen`), starts its
   servers with accepting paused (see "Pausing accept"), and sends `READY` (or a failed `READY` with a reason).
@@ -409,7 +412,9 @@ get reason `drain-deadline`.
 
 ## The control socket
 - Path: `$RUNTIME_DIRECTORY/control/<pid>.sock` when `RUNTIME_DIRECTORY` is set (`RuntimeDirectory=sunshine`), else
-  `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock`. Without either, the feature is refused at startup with an Error.
+  `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock`. Without either, the feature is refused at startup with an Error. It is
+  also refused at startup, with an Error, when Sunshine runs with privileged execution, whose environment sanitising
+  would drop the `SUNSHINE_HANDOFF_*` variables.
 - Mode 0600; the active process checks the connecting peer with `SO_PEERCRED` (same uid) and logs the peer pid.
 - The trust boundary is the uid: any process of the same user is trusted, as it could already reload or signal the
   service. Apps launched through Sunshine cannot trigger a handoff while they run (the refusal rule above).
@@ -631,7 +636,9 @@ adopted), for a normal start and whether or not the feature is enabled. A proces
 until it is the main process. The encoder probe at a normal start runs before `READY=1`, so the default
 `TimeoutStartSec` (90 s) is enough; units that lower it must allow for the probe.
 
-With the feature enabled, the unit needs:
+With the feature enabled, the unit needs the lines below. The packaged unit is not changed; the packages ship them as an
+optional drop-in (`drain-handoff.conf`, installed next to the unit's documentation) to copy into `<unit>.d/` when the
+feature is enabled:
 ```ini
 [Service]
 Type=notify
@@ -651,7 +658,10 @@ RuntimeDirectory=sunshine
   defaults of 30 s and 10 s). When the kill is still pending at the end of that wait, the helper exits non-zero with
   `kill_pending`. systemd applies `TimeoutStartSec` to `ExecReload`; the default 90 s is enough for the default timeouts
   (verify on the target version). With larger `drain_handoff_ready_timeout` or `ping_timeout` values, set
-  `TimeoutStartSec` to at least the bound plus 10 s.
+  `TimeoutStartSec` to at least the bound plus 10 s. The helper does not read Sunshine's settings (it runs before the
+  configuration is loaded, so it never touches the service's log file), so it assumes the defaults; with larger values
+  also set `Environment=SUNSHINE_DRAIN_HANDOFF_REPLY_TIMEOUT=<ready_timeout + ping_timeout + 25>` (seconds) in the unit,
+  which raises the helper's wait for the reply.
 - Minimum systemd: 254 (tracking a main PID that is not the manager's child through a pidfd). The active process checks
   the version before a handoff (step 1), and the read-back in step 7 guards against a refused `MAINPID`.
 - The default `KillMode=control-group` stays.
