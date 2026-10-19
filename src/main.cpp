@@ -559,9 +559,14 @@ int main(int argc, char *argv[]) {
 
   reed_solomon_init();
 #ifdef __linux__
-  input_release_t input_deinit_guard {input::init()};
-  handoff::register_device_release([&input_deinit_guard]() {
-    input_deinit_guard.release();
+  // The drain exit may release the devices earlier from another thread, so the closure owns a share of the guard.
+  auto input_deinit_guard = std::make_shared<input_release_t>(input::init());
+  handoff::register_device_release([input_deinit_guard]() {
+    input_deinit_guard->release();
+  });
+  // Releases the devices at upstream's position in the destruction order; a later call from the drain thread is a no-op.
+  auto input_release_guard = util::fail_guard([input_deinit_guard]() {
+    input_deinit_guard->release();
   });
 #else
   auto input_deinit_guard = input::init();
@@ -631,6 +636,15 @@ int main(int argc, char *argv[]) {
 
   // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
   if (shutdown_event->peek()) {
+    // Released here as at the end of main, before the guards.
+    if (sync_upnp.valid()) {
+      sync_upnp.wait();
+    }
+    if (sync_mDNS.valid()) {
+      sync_mDNS.wait();
+    }
+    upnp_unmap.reset();
+    mDNS.reset();
     return lifetime::desired_exit_code;
   }
 
@@ -661,14 +675,18 @@ int main(int argc, char *argv[]) {
   std::jthread httpThread;
   std::jthread configThread;
   std::jthread rtspThread;
-  if (start_servers) {
 #ifdef __linux__
-    if (handoff::hooks::started_by_handoff()) {
-      if (const auto inherited = handoff::runtime().inherited()) {
-        rtsp_stream::adopt_listener(inherited->rtsp, true);
+  if (start_servers && handoff::hooks::started_by_handoff()) {
+    const auto inherited = handoff::runtime().inherited();
+    if (!inherited || !rtsp_stream::adopt_listener(inherited->rtsp, true)) {
+      if (auto *new_ops = handoff_process.new_ops()) {
+        new_ops->servers_failed("rtsp adopt");
       }
+      start_servers = false;
     }
+  }
 #endif
+  if (start_servers) {
     httpThread = std::jthread {nvhttp::start};
     configThread = std::jthread {confighttp::start};
     rtspThread = std::jthread {rtsp_stream::start};
