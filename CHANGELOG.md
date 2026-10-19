@@ -8,6 +8,8 @@ https://github.com/LizardByte/Sunshine/releases.
 ### Fixed
 - Portal capture: a portal helper that never opened a PipeWire remote no longer closes fd 0 when it is destroyed (for
   example at startup when the portal is unavailable). Its fd and D-Bus pointers now start unset (#39).
+- The default gamepad setting is copied from one gamepad list call; it was read from a list buffer freed during static
+  initialization (#42).
 
 ## v2026.914.233613-lb.2
 Upstream base: `63d35f702ee9` (nightly `2026.914.233613`). Arch package `sunshine 2026.914.233613.2-1` (CUDA off).

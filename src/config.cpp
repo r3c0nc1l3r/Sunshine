@@ -852,10 +852,8 @@ namespace config {
     500ms,  // key_repeat_delay
     std::chrono::duration<double> {1 / 24.9},  // key_repeat_period
 
-    {
-      platf::supported_gamepads(nullptr).front().name.data(),
-      platf::supported_gamepads(nullptr).front().name.size(),
-    },  // Default gamepad
+    // One call: each call reassigns the static list, so a second call frees the first call's buffer.
+    std::string(platf::supported_gamepads(nullptr).front().name),  // Default gamepad
     {},  // gamepad_driver remains unset until the user chooses a Windows driver policy
     true,  // back as touchpad click enabled for PlayStation-style gamepads
     true,  // client gamepads with motion events use PlayStation-style emulation
