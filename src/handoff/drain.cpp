@@ -383,7 +383,11 @@ namespace handoff {
         const bool zero_stable = zero_since && now - *zero_since >= _timing.zero_grace;
 
         if (handed_over && (deadline_passed || zero_stable)) {
-          // The signal path owns the exit when a shutdown was requested.
+          // The unmap scope is set on every exit path (idempotent).
+          _ops.ensure_unmap_scope();
+
+          // The signal path owns the exit when a shutdown was requested, so the phase stays `draining` and `begin()`
+          // stays refused; only `cancel()` joins this thread.
           if (_ops.shutdown_requested()) {
             return;
           }
@@ -397,7 +401,6 @@ namespace handoff {
           }
 
           // The exit sequence: sessions and devices first, the limit only now, then the servers.
-          _ops.ensure_unmap_scope();
           _ops.end_sessions(deadline_passed ? stream::stop_reason_e::drain_deadline : stream::stop_reason_e::stop);
           _ops.release_devices();
           {
