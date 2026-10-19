@@ -10,6 +10,7 @@ extern "C" {
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cmath>
@@ -240,6 +241,19 @@ namespace input {
   std::function<platf::input_t()> &platform_input_factory() {
     static std::function<platf::input_t()> factory;
     return factory;
+  }
+
+  /**
+   * @brief Whether the once-created backend exists, even when the factory returned an empty backend.
+   *
+   * Set by `ensure_platform_input()` after the factory runs and by `set_platform_input()`; cleared when the once-flag is
+   * rearmed. Not reset by the deinit guard.
+   *
+   * @return Mutable reference to the creation flag.
+   */
+  std::atomic_bool &platform_input_created() {
+    static std::atomic_bool created {false};
+    return created;
   }
 #ifdef SUNSHINE_TESTS
   /**
@@ -2348,6 +2362,7 @@ namespace input {
     std::call_once(*platform_input_once(), []() {
       auto &factory = platform_input_factory();
       platf_input = factory ? factory() : platf::input();
+      platform_input_created() = true;
     });
   }
 
@@ -2438,6 +2453,7 @@ namespace input {
       // Counts as the once-created backend: ensure_platform_input() must not call the factory afterwards.
       std::call_once(*platform_input_once(), []() {
       });
+      platform_input_created() = true;
     }
 
     void set_platform_input_factory_for_test(std::function<platf::input_t()> factory) {
@@ -2446,10 +2462,11 @@ namespace input {
       gamepadMask.reset();
       platform_input_factory() = std::move(factory);
       platform_input_once() = std::make_unique<std::once_flag>();
+      platform_input_created() = false;
     }
 
     bool platform_input_created_for_test() {
-      return static_cast<bool>(platf_input);
+      return platform_input_created().load();
     }
 
     int alloc_gamepad(std::shared_ptr<input_t> &input, std::uint8_t client_index, const platf::gamepad_arrival_t &metadata) {
