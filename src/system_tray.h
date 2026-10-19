@@ -386,6 +386,10 @@ namespace system_tray {
    * @brief Make the lifecycle treat the tray as enabled although `config::sunshine.system_tray` is not set, so a unit
    * test can run `request_start` and `resume` with a fake backend.
    *
+   * The override works in both directions and replaces `config::sunshine.system_tray` until
+   * `reset_lifecycle_for_testing()` clears it: `true` counts as enabled, `false` counts as not enabled (so
+   * `request_start` and `resume` return `false`).
+   *
    * @param enabled Whether the tray counts as enabled.
    */
   void set_enabled_for_testing(bool enabled);

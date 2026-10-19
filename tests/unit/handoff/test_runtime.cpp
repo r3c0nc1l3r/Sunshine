@@ -628,19 +628,28 @@ TEST_F(HandoffRuntimeTest, EarlyInitNormalStartAcceptsBoundaryValues) {
     env.vars["SUNSHINE_UDP_BASE"] = "1";
     auto callbacks = env.make();
     rt.early_init(callbacks);
-    ASSERT_TRUE(rt.udp_base().has_value()) << "SUNSHINE_UDP_BASE=1 is in range (1 to 65535) and must be accepted.";
+    ASSERT_TRUE(rt.udp_base().has_value()) << "SUNSHINE_UDP_BASE=1 is in range (1 to 65524) and must be accepted.";
     EXPECT_EQ(*rt.udp_base(), 1) << "SUNSHINE_UDP_BASE=1 must become UDP base 1.";
   }
   {
     handoff::runtime_t rt;
     fake_env_t env;
-    env.vars["SUNSHINE_UDP_BASE"] = "65535";
+    env.vars["SUNSHINE_UDP_BASE"] = "65524";
     env.vars["SUNSHINE_GENERATION"] = "65535";
     auto callbacks = env.make();
     rt.early_init(callbacks);
-    ASSERT_TRUE(rt.udp_base().has_value()) << "SUNSHINE_UDP_BASE=65535 is in range and must be accepted.";
-    EXPECT_EQ(*rt.udp_base(), 65535) << "SUNSHINE_UDP_BASE=65535 must become UDP base 65535.";
+    ASSERT_TRUE(rt.udp_base().has_value()) << "SUNSHINE_UDP_BASE=65524 is the upper boundary (1 to 65524) and must be accepted.";
+    EXPECT_EQ(*rt.udp_base(), 65524) << "SUNSHINE_UDP_BASE=65524 must become UDP base 65524.";
     EXPECT_EQ(rt.generation(), 65535u) << "SUNSHINE_GENERATION=65535 must become generation 65535.";
+  }
+  for (const char *value : {"65525", "65535"}) {
+    handoff::runtime_t rt;
+    fake_env_t env;
+    env.vars["SUNSHINE_UDP_BASE"] = value;
+    auto callbacks = env.make();
+    EXPECT_EQ(rt.early_init(callbacks), "") << "SUNSHINE_UDP_BASE=" << value << " is out of range on a normal start and must be ignored, not an error.";
+    EXPECT_FALSE(rt.udp_base().has_value()) << "SUNSHINE_UDP_BASE=" << value << " is out of range (1 to 65524) and must not become an override.";
+    EXPECT_FALSE(env.vars.contains("SUNSHINE_UDP_BASE")) << "SUNSHINE_UDP_BASE=" << value << " must still be removed.";
   }
 }
 
