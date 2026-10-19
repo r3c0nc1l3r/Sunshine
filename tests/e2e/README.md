@@ -71,6 +71,67 @@ and 2 on configuration or setup errors.
 Hooks are run with `bash -c`. The script refuses to start when a hook needed by
 the selected scenarios is unset.
 
+## Client hooks with mlw_driver.py
+
+`mlw_driver.py` is a ready-made client for the `CLIENT_*` hooks. It drives the
+moonlight-web `streamer` binary directly over its stdio IPC (no web server, no
+browser), with the same JSON lines as the streamer's own process tests. It needs
+Python 3 and only the standard library. It reads the pair info of one host from
+moonlight-web's `data.json` (read only) and never prints or logs it.
+
+Inputs: the `streamer` binary (`$STREAMER`), the moonlight-web `data.json`
+(`$MLW_DATA`) of a client that is already paired with the test Sunshine, and the
+Sunshine app id (`$APP_ID`). The driver does not look the app id up. It must be
+given with `--app-id`. If `data.json` has several hosts or users, add `--host-id`
+and `--user-id`. State (pid files, a control socket, `streamer.log`) lives in
+`--state-dir` (default `$XDG_RUNTIME_DIR/mlw-driver`), created `0700`.
+
+Clean, kill and drop scenarios (release-equivalent behaviour, stop watchdog on):
+
+```sh
+D='python3 -I tests/e2e/mlw_driver.py --streamer "$STREAMER" --data-json "$MLW_DATA" --app-id "$APP_ID"'
+CLIENT_START="$D start" \
+CLIENT_STOP="$D stop || true" \
+CLIENT_KILL="$D kill" \
+CLIENT_DROP="$D freeze" \
+CLIENT_RECONNECT="$D cleanup && $D start" \
+CLIENT_CLEANUP="$D cleanup" \
+SCENARIOS="clean kill drop" \
+tests/e2e/leak_cycles.sh
+```
+
+Wedge scenario. This needs a streamer built with the `test-faults` feature.
+`leak_cycles.sh` runs the same `CLIENT_START` for every scenario and has no
+per-scenario override, so run wedge in its own invocation with `SCENARIOS=wedge`
+and its own `CLIENT_START`:
+
+```sh
+# incident state, MODE=sunshine-only: the watchdog is off, the streamer stays wedged
+D='python3 -I tests/e2e/mlw_driver.py --streamer "$STREAMER" --data-json "$MLW_DATA" --app-id "$APP_ID" --fault wedge-audio-stop --no-watchdog'
+# full-stack, MODE=full-stack: the watchdog ends the streamer with exit code 2 after 8 s
+# D='... --fault wedge-audio-stop'
+CLIENT_START="$D start" CLIENT_WEDGE="$D stop || true" CLIENT_CLEANUP="$D cleanup" \
+SCENARIOS=wedge MODE=sunshine-only \
+tests/e2e/leak_cycles.sh
+```
+
+What each command does:
+
+| Command | Effect |
+| --- | --- |
+| `start` | Starts a detached holder that runs the streamer, sends Init, SetTransport (WebSocket) and StartStream (H.264 only), waits for ConnectionComplete, then discards media and echoes RTT packets. Returns 0 when streaming. Refuses to start while a stream is active in the state dir |
+| `stop` | Sends `Stop` to the streamer and waits `--stop-timeout` (15 s) for it to exit. Prints `exit_code=N` and returns 0, or returns 3 while it is still running (expected for a wedged streamer with `--no-watchdog`) |
+| `kill` | SIGKILL the streamer, then the holder if it lingers |
+| `freeze` | SIGSTOP the streamer: no ACKs and no pings, like a dead network path |
+| `cleanup` | SIGCONT and SIGKILL leftovers, remove state files (`--purge` also removes the log and directory) |
+| `status` | JSON with pids, alive flags and the exit code |
+
+Other options: `--width 1280 --height 720 --fps 30 --bitrate 5000` (kbps),
+`--ready-timeout 30`, `--watchdog-ms 8000`. Only processes whose recorded start
+time and `/proc/<pid>/exe` match the streamer the driver started are signalled.
+`tests/e2e/test_mlw_driver.sh` checks the driver against `fake_streamer.py`
+without Sunshine or a real streamer.
+
 ## Measurements
 
 Taken at baseline (before the first cycle of each scenario, with no session) and
