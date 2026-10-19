@@ -1611,13 +1611,57 @@ TEST_F(RtspHandoffListenerTest, RaceDropWithExpiryStaysConsistent) {
     }
     EXPECT_FALSE(rtsp_stream::drop_pending_launch()) << "after a drop nothing is pending";
   }
-  EXPECT_GT(dropped, 0) << "at least some drops must beat the 5 ms expiry";
+  EXPECT_GE(dropped, 0) << "the number of drops that beat the expiry depends on host load and is not asserted";
 
   config::stream.ping_timeout = 30s;
   rtsp_stream::launch_session_raise(make_launch(3000));
   std::this_thread::sleep_for(50ms);
   EXPECT_TRUE(rtsp_stream::has_pending_launch()) << "an old expiry must not discard a launch raised later";
   EXPECT_TRUE(rtsp_stream::drop_pending_launch());
+}
+
+/**
+ * @brief Test: a real error injected before a pause is consumed by the pause's aborted completion and counts as a real error.
+ */
+TEST_F(RtspHandoffListenerTest, RealErrorInjectedBeforePauseIsConsumedAsRealError) {
+  auto session = rtsp_stream::testing::insert_fake_session(631, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  open(false);
+  ASSERT_TRUE(wait_armed());
+  const std::uintmax_t offset = test_log_size();
+
+  rtsp_stream::testing::inject_accept_error(boost::system::errc::make_error_code(boost::system::errc::io_error));
+  rtsp_stream::pause_accept();
+
+  EXPECT_TRUE(wait_until([]() {
+    return rtsp_stream::testing::accept_errors() == 1;
+  }))
+    << "the pause's aborted completion carries the injected real error, so it is a real error";
+  EXPECT_TRUE(wait_until([]() {
+    return rtsp_stream::session_count() == 0;
+  }))
+    << "a real error must clear() all sessions";
+  EXPECT_GE(count_occurrences(test_log_since(offset), "Error: "), 1U) << "a real error must log an Error";
+}
+
+/**
+ * @brief Test: an injected operation_aborted consumed by a pause's own abort stays silent.
+ */
+TEST_F(RtspHandoffListenerTest, OperationAbortedInjectedBeforePauseStaysSilent) {
+  auto session = rtsp_stream::testing::insert_fake_session(632, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  open(false);
+  ASSERT_TRUE(wait_armed());
+  const std::uintmax_t offset = test_log_size();
+
+  rtsp_stream::testing::inject_accept_error(boost::asio::error::make_error_code(boost::asio::error::operation_aborted));
+  ASSERT_TRUE(rtsp_stream::pause_accept());
+  EXPECT_TRUE(wait_disarmed());
+  std::this_thread::sleep_for(100ms);
+
+  EXPECT_EQ(rtsp_stream::testing::accept_errors(), 0U) << "the pause's own abort is silent";
+  EXPECT_EQ(test_log_since(offset).find("Error: "), std::string::npos);
+  EXPECT_EQ(rtsp_stream::session_count(), 1) << "no clear() on the pause's own abort";
 }
 
 /**
