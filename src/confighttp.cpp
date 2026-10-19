@@ -59,6 +59,10 @@
 #include "utility.h"
 #include "uuid.h"
 
+#ifdef __linux__
+  #include "handoff/terminate.h"
+#endif
+
 using namespace std::literals;
 
 namespace confighttp {
@@ -1279,7 +1283,26 @@ namespace confighttp {
 
     print_req(request);
 
+#ifdef __linux__
+    if (!handoff::allows_terminate(handoff::terminate_app(handoff::request_terminate_budget, "close app"))) {
+      constexpr auto code = SimpleWeb::StatusCode::server_error_service_unavailable;
+
+      nlohmann::json refused_tree;
+      refused_tree["status_code"] = code;
+      refused_tree["status"] = false;
+      refused_tree["error"] = "The previous process still holds the app";
+
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/json");
+      headers.emplace("X-Frame-Options", "DENY");
+      headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+
+      response->write(code, refused_tree.dump(), headers);
+      return;
+    }
+#else
     proc::proc.terminate();
+#endif
 
     nlohmann::json output_tree;
     output_tree["status"] = true;
@@ -1400,10 +1423,22 @@ namespace confighttp {
         auto cert = nvhttp::get_cert_by_uuid(uuid);
         if (!cert.empty()) {
           rtsp_stream::terminate_sessions_by_cert(cert);
+#ifdef __linux__
+          // Tell the draining process (best effort); its answer is not needed for the reply.
+          if (const auto peer = std::dynamic_pointer_cast<handoff::session_peer_t>(handoff::runtime().peer())) {
+            if (!peer->close_cert(handoff::cert_sha256_hex(cert), handoff::peer_request_timeout)) {
+              BOOST_LOG(warning) << "Update Client: the previous process did not answer the session close request"sv;
+            }
+          }
+#endif
         }
 
-        if (rtsp_stream::session_count() == 0 && proc::proc.running() > 0) {
+        if (rtsp_stream::total_session_count() == 0 && proc::proc.running() > 0) {
+#ifdef __linux__
+          handoff::terminate_app(handoff::request_terminate_budget, "update client");
+#else
           proc::proc.terminate();
+#endif
         }
       }
 
@@ -1454,7 +1489,11 @@ namespace confighttp {
       output_tree["status"] = removed;
 
       if (removed && nvhttp::get_all_clients().empty()) {
+#ifdef __linux__
+        handoff::terminate_app(handoff::request_terminate_budget, "unpair");
+#else
         proc::proc.terminate();
+#endif
       }
 
       send_response(response, output_tree);
@@ -1484,7 +1523,11 @@ namespace confighttp {
     print_req(request);
 
     nvhttp::erase_all_clients();
+#ifdef __linux__
+    handoff::terminate_app(handoff::request_terminate_budget, "unpair all");
+#else
     proc::proc.terminate();
+#endif
 
     nlohmann::json output_tree;
     output_tree["status"] = true;

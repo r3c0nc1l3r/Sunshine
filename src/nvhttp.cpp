@@ -40,6 +40,10 @@
 #include "uuid.h"
 #include "video.h"
 
+#ifdef __linux__
+  #include "handoff/terminate.h"
+#endif
+
 using namespace std::literals;
 
 namespace nvhttp {
@@ -1480,6 +1484,17 @@ namespace nvhttp {
       return;
     }
 
+#ifdef __linux__
+    // Refuse while a draining process still reports sessions (or cannot be asked), before anything is changed.
+    if (const auto refusal = handoff::launch_refusal(); !refusal.empty()) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", refusal);
+
+      return;
+    }
+#endif
+
     const bool host_audio_value = util::from_view(get_arg(args, "localAudioPlayMode"));
     set_host_audio(host_audio_value);
     auto launch_session = make_launch_session(host_audio_value, args);
@@ -1666,11 +1681,30 @@ namespace nvhttp {
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
 
+#ifdef __linux__
+    // Ask the draining process first, before anything is ended (even with no app running, the answer to END_ALL also
+    // ends the draining process's sessions). A refusal ends nothing, this process's own sessions included.
+    if (!handoff::allows_terminate(handoff::terminate_gate(handoff::request_terminate_budget))) {
+      BOOST_LOG(warning) << "Cancel refused: the previous process did not release the app"sv;
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "The previous process still holds the app");
+
+      return;
+    }
+
+    rtsp_stream::terminate_sessions();
+
+    if (proc::proc.running() > 0) {
+      handoff::terminate_app_permitted();
+    }
+#else
     rtsp_stream::terminate_sessions();
 
     if (proc::proc.running() > 0) {
       proc::proc.terminate();
     }
+#endif
 
     // The config needs to be reverted regardless of whether "proc::proc.terminate()" was called or not.
     display_device::revert_configuration();
