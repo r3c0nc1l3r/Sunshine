@@ -101,7 +101,7 @@ namespace {
   public:
     log_capture_t():
         _store(std::make_shared<log_store_t>()),
-        _sink(boost::make_shared<sink_t>(_store)) {
+        _sink(boost::make_shared<sink_t>(boost::make_shared<capture_backend_t>(_store))) {
       bl::core::get()->add_sink(_sink);
     }
 
