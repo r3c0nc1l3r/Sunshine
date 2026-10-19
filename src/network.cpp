@@ -243,23 +243,25 @@ namespace net {
     enet_host_destroy(host);
   }
 
-  /**
-   * @brief Add an offset to a base port, with the range warning shared by `map_port` and `map_udp_port`.
-   * @param base The base port the offset is added to.
-   * @param offset The offset from the base.
-   * @return The mapped port number.
-   */
-  std::uint16_t map_from_base(int base, int offset) {
-    // calculate the port from the base
-    auto mapped_port = (std::uint16_t) (base + offset);
+  namespace {
+    /**
+     * @brief Add an offset to a base port, with the range warning shared by `map_port` and `map_udp_port`.
+     * @param base The base port the offset is added to.
+     * @param offset The offset from the base.
+     * @return The mapped port number.
+     */
+    std::uint16_t map_from_base(int base, int offset) {
+      // calculate the port from the base
+      auto mapped_port = (std::uint16_t) (base + offset);
 
-    // Ensure port is in the range of 1024-65535
-    if (mapped_port < 1024 || mapped_port > 65535) {
-      BOOST_LOG(warning) << "Port out of range: "sv << mapped_port;
+      // Ensure port is in the range of 1024-65535
+      if (mapped_port < 1024 || mapped_port > 65535) {
+        BOOST_LOG(warning) << "Port out of range: "sv << mapped_port;
+      }
+
+      return mapped_port;
     }
-
-    return mapped_port;
-  }
+  }  // namespace
 
   std::uint16_t map_port(int port) {
     // calculate the port from the config port
