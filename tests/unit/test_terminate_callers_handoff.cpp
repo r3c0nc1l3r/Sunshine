@@ -59,6 +59,7 @@
   #include <src/nvhttp.h>
   #include <src/process.h>
   #include <src/rtsp.h>
+  #include <src/stream.h>
   #include <src/utility.h>
 
 namespace {
@@ -242,6 +243,66 @@ namespace {
     app.exit_timeout = std::chrono::seconds {5};
     return app;
   }
+
+  /**
+   * @brief Minimal HTTPS server over `nvhttp::SunshineHTTPS` (no `SimpleWeb::Server` specialization exists for it),
+   * with no client-certificate check. Mirrors `SimpleWeb::Server<HTTPS>`.
+   */
+  class nvhttp_test_server_t: public SimpleWeb::ServerBase<nvhttp::SunshineHTTPS> {
+  public:
+    /**
+     * @brief Create the server.
+     *
+     * @param certification_file Server certificate chain file.
+     * @param private_key_file Private key file.
+     */
+    nvhttp_test_server_t(const std::string &certification_file, const std::string &private_key_file):
+        SimpleWeb::ServerBase<nvhttp::SunshineHTTPS>(443),
+        context(boost::asio::ssl::context::tls_server) {
+      context.set_options(boost::asio::ssl::context::no_tlsv1);
+      context.set_options(boost::asio::ssl::context::no_tlsv1_1);
+      context.use_certificate_chain_file(certification_file);
+      context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
+    }
+
+  protected:
+    boost::asio::ssl::context context;  ///< TLS context.
+
+    /**
+     * @brief Accept one connection, perform the TLS handshake and read requests.
+     */
+    void accept() override {
+      auto connection = create_connection(*io_service, context);
+
+      acceptor->async_accept(connection->socket->lowest_layer(), [this, connection](const SimpleWeb::error_code &ec) {
+        auto lock = connection->handler_runner->continue_lock();
+        if (!lock) {
+          return;
+        }
+        if (ec != boost::asio::error::operation_aborted) {
+          this->accept();
+        }
+        auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection);
+        if (!ec) {
+          session->connection->set_timeout(config.timeout_request);
+          session->connection->socket->async_handshake(boost::asio::ssl::stream_base::server, [this, session](const SimpleWeb::error_code &handshake_ec) {
+            session->connection->cancel_timeout();
+            auto handshake_lock = session->connection->handler_runner->continue_lock();
+            if (!handshake_lock) {
+              return;
+            }
+            if (!handshake_ec) {
+              this->read(session);
+            } else if (this->on_error) {
+              this->on_error(session->request, handshake_ec);
+            }
+          });
+        } else if (this->on_error) {
+          this->on_error(session->request, ec);
+        }
+      });
+    }
+  };
 }  // namespace
 
 /**
@@ -624,7 +685,7 @@ X4wnh1bwdiidqpcgyuKossLOPxbS786WmsesaAWPnpoY6M8aija+ALwNNuWWmyMg
  */
 class HandoffCallersConfigHttpTest: public HandoffCallerBase {
 protected:
-  std::unique_ptr<SimpleWeb::Server<SimpleWeb::HTTPS>> server;  ///< Test server.
+  std::unique_ptr<confighttp::https_server_t> server;  ///< Test server (the production server type).
   std::unique_ptr<SimpleWeb::Client<SimpleWeb::HTTPS>> client;  ///< Test client.
   std::jthread server_thread;  ///< Runs the server.
   unsigned short port {0};  ///< Assigned port.
@@ -670,7 +731,7 @@ protected:
     std::ofstream(cert_file) << TEST_PUBLIC_CERT;
     std::ofstream(key_file) << TEST_PRIVATE_KEY;
 
-    server = std::make_unique<SimpleWeb::Server<SimpleWeb::HTTPS>>(cert_file.string(), key_file.string());
+    server = std::make_unique<confighttp::https_server_t>(cert_file.string(), key_file.string());
     server->config.port = 0;
     server->config.reuse_address = true;
     server->config.timeout_request = 5;
@@ -1051,7 +1112,7 @@ TEST_F(HandoffCallersConfigHttpTest, UnpairAllWithoutPeerBehavesAsUpstream) {
  */
 class HandoffCallersNvhttpTest: public HandoffCallerBase {
 protected:
-  using server_t = SimpleWeb::Server<nvhttp::SunshineHTTPS>;  ///< Server type of the client routes.
+  using server_t = nvhttp_test_server_t;  ///< Server type of the client routes.
   std::unique_ptr<server_t> server;  ///< Test server.
   std::unique_ptr<SimpleWeb::Client<SimpleWeb::HTTPS>> client;  ///< Test client.
   std::jthread server_thread;  ///< Runs the server.
@@ -1194,7 +1255,7 @@ TEST_F(HandoffCallersNvhttpTest, CancelRefusedAnswers503AndEndsNothing) {
   EXPECT_EQ(terminate_calls.load(), 0) << "a refusal must not terminate the app";
   EXPECT_TRUE(app_running()) << "a refusal must leave the app running";
   EXPECT_EQ(rtsp_stream::session_count(), 1) << "a refusal must not end the process's own sessions";
-  EXPECT_NE(stream::session::state(*session), stream::session::state_e::STOPPING) << "the own session must not even be asked to stop";
+  EXPECT_EQ(stream::session::stop_reason(*session), stream::stop_reason_e::unknown) << "the own session must not even be asked to stop";
 }
 
 TEST_F(HandoffCallersNvhttpTest, CancelGrantedEndsSessionsAndTerminates) {
