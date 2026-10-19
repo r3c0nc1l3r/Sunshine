@@ -120,18 +120,25 @@ namespace handoff {
       this->io_service = std::make_shared<boost::asio::io_context>();
       this->internal_io_service = true;
     }
-    if (!this->acceptor) {
+    const bool created_acceptor = !this->acceptor;
+    if (created_acceptor) {
       this->acceptor = std::make_unique<boost::asio::ip::tcp::acceptor>(*this->io_service);
     }
 
     const int dup_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (dup_fd < 0) {
+      if (created_acceptor) {
+        this->acceptor.reset();  // never opened: close_listener() must see "not started"
+      }
       detail::throw_errno(errno, "start_adopted: dup");
     }
     boost::system::error_code ec;
     this->acceptor->assign(protocol, dup_fd, ec);
     if (ec) {
       ::close(dup_fd);
+      if (created_acceptor) {
+        this->acceptor.reset();
+      }
       throw boost::system::system_error(ec, "start_adopted: assign");
     }
 
@@ -162,6 +169,10 @@ namespace handoff {
     } catch (...) {
       boost::system::error_code close_ec;
       this->acceptor->close(close_ec);
+      work_guard_.reset();
+      if (created_acceptor) {
+        this->acceptor.reset();
+      }
       throw;
     }
 
@@ -186,9 +197,9 @@ namespace handoff {
       return false;
     }
 
-    return detail::run_on_io_thread(ios, timeout, [this, ios]() {
+    return detail::run_on_io_thread(ios, timeout, [this]() {
       if (!work_guard_) {
-        work_guard_.emplace(boost::asio::make_work_guard(*ios));
+        work_guard_.emplace(boost::asio::make_work_guard(*this->io_service));
       }
       paused_.store(true);
       std::lock_guard<std::mutex> lock(this->start_stop_mutex);
@@ -250,6 +261,10 @@ namespace handoff {
     }
 
     return detail::run_on_io_thread(ios, timeout, [this]() {
+      // Keep the loop alive after the acceptor is gone, until stop().
+      if (!work_guard_) {
+        work_guard_.emplace(boost::asio::make_work_guard(*this->io_service));
+      }
       std::lock_guard<std::mutex> lock(this->start_stop_mutex);
       paused_.store(true);
       if (this->acceptor && this->acceptor->is_open()) {
@@ -277,6 +292,8 @@ namespace handoff {
 
   template<class Base>
   void adoptable_server_t<Base>::accept() {
+    // Note: `paused_` is not cleared by an unadopted `start()`. A restart after `pause()` or `close_listener()` and
+    // `stop()` needs the flag cleared first (`start_adopted` sets it from its `paused` argument).
     if (paused_.load()) {
       return;
     }
