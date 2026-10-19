@@ -38,6 +38,10 @@
 #include "system_tray.h"
 #include "utility.h"
 
+#ifdef __linux__
+  #include "handoff/terminate.h"
+#endif
+
 #ifdef _WIN32
   // from_utf8() string conversion function
   #include "platform/windows/utf_utils.h"
@@ -61,6 +65,14 @@ namespace proc {
      * @brief Destroy the process subsystem deinitializer.
      */
     ~deinit_t() {
+#ifdef __linux__
+      // Drain handoff: with an app running, ask the draining process (if any) first. A refusal skips the terminate
+      // only for an adopted app; an app this process launched is terminated as upstream does.
+      if (proc.running() > 0) {
+        handoff::terminate_app(handoff::shutdown_terminate_budget, "terminate the app at shutdown"sv);
+        return;
+      }
+#endif
       proc.terminate();
     }
   };
@@ -158,6 +170,7 @@ namespace proc {
   int proc_t::execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
     // Ensure starting from a clean slate
     terminate();
+    _live.adopted.store(false);  // an app started here is never adopted
 
     auto iter = std::find_if(_apps.begin(), _apps.end(), [&app_id](const auto app) {
       return app.id == std::to_string(app_id);
@@ -356,6 +369,7 @@ namespace proc {
       _live.pgid.store(0);
       _live.placebo.store(false);
       _live.released.store(false);
+      _live.adopted.store(false);
       return;
     }
 
@@ -409,6 +423,7 @@ namespace proc {
     _live.pgid.store(0);
     _live.applied.store(0);
     _live.released.store(false);
+    _live.adopted.store(false);
   }
 
   const std::vector<ctx_t> &proc_t::get_apps() const {
@@ -441,7 +456,8 @@ namespace proc {
       placebo(other.placebo.load()),
       pgid(other.pgid.load()),
       applied(other.applied.load()),
-      released(other.released.load()) {
+      released(other.released.load()),
+      adopted(other.adopted.load()) {
   }
 
   app_atomics_t &app_atomics_t::operator=(app_atomics_t &&other) noexcept {
@@ -451,6 +467,7 @@ namespace proc {
       pgid.store(other.pgid.load());
       applied.store(other.applied.load());
       released.store(other.released.load());
+      adopted.store(other.adopted.load());
     }
     return *this;
   }
@@ -523,6 +540,10 @@ namespace proc {
     return _live.released.load();
   }
 
+  bool proc_t::adopted() const {
+    return _live.adopted.load();
+  }
+
   bool proc_t::drop_released_app() {
     if (!_live.released.load()) {
       return false;
@@ -539,6 +560,7 @@ namespace proc {
     _live.pgid.store(0);
     _live.placebo.store(false);
     _live.released.store(false);
+    _live.adopted.store(false);
     return true;
   }
 
@@ -658,6 +680,7 @@ namespace proc {
     _live.pgid.store(0);
     _live.applied.store(static_cast<std::uint32_t>(applied));
     _live.released.store(false);
+    _live.adopted.store(true);
   }
 #endif
 
