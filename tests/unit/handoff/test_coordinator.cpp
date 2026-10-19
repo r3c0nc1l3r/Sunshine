@@ -1218,19 +1218,23 @@ namespace {
     }
 
     /**
-     * @brief Assert that a reply is a refusal with the exact reason and that nothing was started.
+     * @brief Send a request and assert that it is a refusal with the exact reason, that nothing was started, and that
+     * `handoff_in_progress` and the cooldown are the same as before the request.
      *
-     * @param reply Reply.
+     * @param peer_pid Peer pid given to `handle()`.
      * @param reason Expected reason.
      */
-    void expect_refused(const hf::control_reply_t &reply, std::string_view reason) {
+    void expect_refused(pid_t peer_pid, std::string_view reason) {
+      const bool in_progress_before = hf::runtime().handoff_in_progress();
+      const auto cooldown_before = C().cooldown_until();
+      const auto reply = C().handle(peer_pid);
       EXPECT_EQ(hf::reply_kind_e::refused, reply.kind) << "expected a refusal ('" << reason << "') but got " << kind_name(reply.kind) << " '" << reply.reason << "'";
       EXPECT_EQ(std::string {reason}, reply.reason) << "the refusal must carry its own reason";
       EXPECT_EQ(0, spawn_calls.load()) << "a refusal must not spawn the new process";
       EXPECT_EQ(0, channel_calls.load()) << "a refusal must not create the channel";
       EXPECT_EQ(0, make_ops_calls.load()) << "a refusal must not start the old side";
-      EXPECT_FALSE(hf::runtime().handoff_in_progress()) << "a refusal must not mark a handoff in progress";
-      EXPECT_EQ(tp_t::min(), C().cooldown_until()) << "a refusal must not arm the cooldown";
+      EXPECT_EQ(in_progress_before, hf::runtime().handoff_in_progress()) << "a refusal must not change handoff_in_progress";
+      EXPECT_EQ(cooldown_before, C().cooldown_until()) << "a refusal must not arm or extend the cooldown";
     }
 
     /**
@@ -1988,32 +1992,32 @@ TEST_F(HandoffCoordinatorTest, NothingRefusesAHealthyRequestAndItSpawns) {
 
 TEST_F(HandoffCoordinatorTest, ShutdownRequestedRefusesWithTheShuttingDownReason) {
   hf::runtime().request_shutdown();
-  expect_refused(C().handle(5), hf::coordinator_reason::shutting_down);
+  expect_refused(5, hf::coordinator_reason::shutting_down);
 }
 
 TEST_F(HandoffCoordinatorTest, SigtermRefusesWithTheShuttingDownReason) {
   hf::runtime().note_sigterm();
-  expect_refused(C().handle(5), hf::coordinator_reason::shutting_down);
+  expect_refused(5, hf::coordinator_reason::shutting_down);
 }
 
 TEST_F(HandoffCoordinatorTest, RequestShutdownOfTheCoordinatorRefusesNewRequests) {
   C().request_shutdown();
-  expect_refused(C().handle(5), hf::coordinator_reason::shutting_down);
+  expect_refused(5, hf::coordinator_reason::shutting_down);
 }
 
 TEST_F(HandoffCoordinatorTest, StopRefusesNewRequests) {
   C().stop();
-  expect_refused(C().handle(5), hf::coordinator_reason::shutting_down);
+  expect_refused(5, hf::coordinator_reason::shutting_down);
 }
 
 TEST_F(HandoffCoordinatorTest, DrainingModeRefusesWithTheDrainingReason) {
   ASSERT_TRUE(hf::runtime().transition(hf::mode_e::normal, hf::mode_e::draining));
-  expect_refused(C().handle(5), hf::coordinator_reason::draining);
+  expect_refused(5, hf::coordinator_reason::draining);
 }
 
 TEST_F(HandoffCoordinatorTest, DisabledModeRefusesWithTheNotActiveReason) {
   hf::runtime().reset_for_test();
-  expect_refused(C().handle(5), hf::coordinator_reason::not_active);
+  expect_refused(5, hf::coordinator_reason::not_active);
 }
 
 TEST_F(HandoffCoordinatorTest, NewPendingAndNewActiveModesRefuseWithInProgress) {
@@ -2030,9 +2034,9 @@ TEST_F(HandoffCoordinatorTest, NewPendingAndNewActiveModesRefuseWithInProgress) 
   };
   ASSERT_EQ("", hf::runtime().early_init(env));
   ASSERT_EQ(hf::mode_e::new_pending, hf::runtime().mode());
-  expect_refused(C().handle(5), hf::refusal_reason::in_progress);
+  expect_refused(5, hf::refusal_reason::in_progress);
   ASSERT_TRUE(hf::runtime().transition(hf::mode_e::new_pending, hf::mode_e::new_active));
-  expect_refused(C().handle(5), hf::refusal_reason::in_progress);
+  expect_refused(5, hf::refusal_reason::in_progress);
 }
 
 TEST_F(HandoffCoordinatorTest, EachRefusalInputGivesItsOwnReason) {
@@ -2101,7 +2105,7 @@ TEST_F(HandoffCoordinatorTest, EachRefusalInputGivesItsOwnReason) {
     pending_value = false;
     spawn_calls = 0;
     row.apply();
-    expect_refused(C().handle(5), row.reason);
+    expect_refused(5, row.reason);
   }
 }
 
@@ -2111,14 +2115,14 @@ TEST_F(HandoffCoordinatorTest, AnotherLiveInstanceWithRolePendingOrDrainingRefus
   pending.start_time = 1;
   pending.role = hf::role_e::pending;
   scan_value.live = {pending};
-  expect_refused(C().handle(5), hf::refusal_reason::in_progress);
+  expect_refused(5, hf::refusal_reason::in_progress);
   coord.reset();
   hf::instance_t draining;
   draining.pid = 9101;
   draining.start_time = 1;
   draining.role = hf::role_e::draining;
   scan_value.live = {draining};
-  expect_refused(C().handle(5), hf::refusal_reason::drain_exists);
+  expect_refused(5, hf::refusal_reason::drain_exists);
 }
 
 TEST_F(HandoffCoordinatorTest, RefusalOrderFollowsTheDocumentedRanking) {
@@ -2166,6 +2170,7 @@ TEST_F(HandoffCoordinatorTest, RefusalOrderFollowsTheDocumentedRanking) {
       pairing_value = 0;
     },
     [&]() {
+      pending_value = false;
     },
   };
   for (std::size_t i = 0; i < expected.size(); ++i) {
@@ -2205,7 +2210,7 @@ TEST_F(HandoffCoordinatorTest, EverySourceIsReadExactlyOnceBeforeTheDecision) {
 
 TEST_F(HandoffCoordinatorTest, ARefusalDoesNotArmTheCooldownAndALaterRequestIsNotRefusedForIt) {
   app_adoptable_value = false;
-  expect_refused(C().handle(5), hf::refusal_reason::app_generic);
+  expect_refused(5, hf::refusal_reason::app_generic);
   app_adoptable_value = true;
   start_handle();
   ASSERT_TRUE(attach_peer()) << "the earlier refusal must not have started a cooldown: the next request spawns";
@@ -2215,7 +2220,7 @@ TEST_F(HandoffCoordinatorTest, ARefusalDoesNotArmTheCooldownAndALaterRequestIsNo
 TEST_F(HandoffCoordinatorTest, ARefusalForTheCooldownDoesNotExtendIt) {
   C().set_cooldown_until(clk.at(30s));
   clk.advance(10s);
-  expect_refused(C().handle(5), hf::refusal_reason::cooldown);
+  expect_refused(5, hf::refusal_reason::cooldown);
   EXPECT_EQ(clk.at(30s), C().cooldown_until()) << "a refusal never arms or extends the cooldown";
 }
 
@@ -2234,13 +2239,13 @@ TEST_F(HandoffCoordinatorTest, AMissingListenerRefusesBeforeAnythingStartsAndNam
       l.fd = 40;
     }
     lf[i].fd = -1;
-    expect_refused(C().handle(5), std::string {hf::coordinator_reason::listener_missing_prefix} + std::string {hf::to_string(kinds[i])});
+    expect_refused(5, std::string {hf::coordinator_reason::listener_missing_prefix} + std::string {hf::to_string(kinds[i])});
   }
 }
 
 TEST_F(HandoffCoordinatorTest, AnUnregisteredListenerAlsoRefuses) {
   hf::listeners().clear(hf::listener_e::rtsp);
-  expect_refused(C().handle(5), std::string {hf::coordinator_reason::listener_missing_prefix} + "rtsp");
+  expect_refused(5, std::string {hf::coordinator_reason::listener_missing_prefix} + "rtsp");
 }
 
 TEST_F(HandoffCoordinatorTest, KillPendingStateOfThisProcessRefusesWithTheKillPendingReason) {
@@ -2698,7 +2703,7 @@ TEST_F(HandoffCoordinatorTest, KillPendingInOtherInstanceFilesRefusesAndSpawnsNo
   other.role = hf::role_e::draining;
   other.handoff = hf::state_e::kill_pending;
   scan_value.live = {other};
-  expect_refused(C().handle(5), hf::refusal_reason::kill_pending);
+  expect_refused(5, hf::refusal_reason::kill_pending);
 }
 
 // =====================================================================================================================
@@ -2789,7 +2794,7 @@ TEST_F(HandoffCoordinatorTest, SetCooldownRaisesAndNeverLowers) {
 
 TEST_F(HandoffCoordinatorTest, AnInheritedCooldownRefusesUntilItPasses) {
   C().set_cooldown_until(clk.at(20s));
-  expect_refused(C().handle(5), hf::refusal_reason::cooldown);
+  expect_refused(5, hf::refusal_reason::cooldown);
 }
 
 // =====================================================================================================================
