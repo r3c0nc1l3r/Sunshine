@@ -8,7 +8,8 @@
  *
  * One pass:
  * 1. Open and read the whole state file by path (never a cached fd, so a file that was replaced by a rename is read
- *    whole; at most 4 MiB, a longer file counts as unreadable).
+ *    whole; at most 4 MiB, a longer file counts as unreadable). It is opened non-blocking and must be a regular file;
+ *    anything else (a FIFO, device or directory) counts as unreadable, so a bad path never blocks the poller or `stop()`.
  * 2. `disabled_client_certs(content)`. `std::nullopt`, an unreadable or missing file, or an empty read ends no
  *    session: log a Warning (never the content or any certificate) and retry at the next wake. A client missing from
  *    the file ends nothing.
@@ -29,7 +30,8 @@
  * state file (events `IN_CLOSE_WRITE`, `IN_MOVED_TO`, `IN_MOVED_FROM`, `IN_CREATE`, `IN_DELETE`, `IN_MODIFY`; the
  * directory is watched, not the file, so a replacement by rename is seen), and, at the latest, when `wake_cap` (2 s)
  * has passed since the previous wake, with or without an event. Events for other files do not start a pass. Events that
- * arrive close together are coalesced into one pass. If `inotify` cannot be used (init or watch failed, queue overflow
+ * arrive close together are coalesced into one pass: after a relevant event the poller waits for further events for at
+ * most 50 ms (stopping early on `stop()`) before it runs the pass, so a file being written is read once complete. If `inotify` cannot be used (init or watch failed, queue overflow
  * `IN_Q_OVERFLOW`), a Warning is logged once and the poller continues with the timer alone; an overflow also forces a
  * pass.
  *
