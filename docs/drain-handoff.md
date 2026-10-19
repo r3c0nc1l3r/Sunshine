@@ -669,6 +669,41 @@ Helper exit codes:
 | 4 | `unconfirmed`: `COMMIT` was sent but the new process's file did not show `active` within 10 s. | Read the instance files; do not retry until they show one `active` instance and no `kill_pending`. |
 | 5 | Usage or internal error of the helper (bad arguments, its own timeout). | Alert. |
 
+## Operator runbook: `kill_pending`
+`kill_pending` is fail-safe: a rollback could not reap the new process, so the old process keeps everything as it was
+when the kill started and accepts nothing new beside a process that might still run. Once the switch has begun, no new
+connection is accepted until it is resolved; the old process's existing sessions keep streaming.
+
+**Recognise it.**
+
+- `systemctl reload` (the helper) exits 3 with `kill_pending` on stderr; a later reload exits 1 ("kill pending").
+- The old process's instance file `<runtime dir>/instances/<pid>.json` shows `"handoff": "kill_pending"`; the new
+  process's file still exists (role `pending` or `active`). `/api/sessions` does not answer once the switch has begun.
+- The journal shows an Error about every 5 s naming the new process's pid and `kill_pending`.
+
+**Check.**
+
+- The new process's state: `ps -o pid,stat,wchan:32,cmd -p <new pid>` and `grep State /proc/<new pid>/status`. `D`
+  (uninterruptible sleep) is the expected cause; note the wait channel (`/proc/<new pid>/wchan`; as root,
+  `/proc/<new pid>/stack` shows the kernel stack).
+- The kernel log (`journalctl -k`) around the time: GPU driver errors, hung-task warnings, or a stalled filesystem
+  (network or FUSE mounts) usually explain a `D` state.
+- Whether the old process still has sessions (its instance file's `sessions`), to choose the recovery window.
+
+**Recover.**
+
+- Do not retry the reload; it is refused while the state lasts, and tooling must not retry it automatically.
+- If the blocking operation completes, the process dies from the pending `SIGKILL`, the old process finishes the
+  rollback by itself and serves again: the instance file returns to `none` and the new process's file disappears.
+  Wait a few minutes for this first if the wait channel points at a slow but healthy operation.
+- Otherwise, in an idle window (or accepting the loss of the old process's sessions): `systemctl stop` the unit, then
+  `systemctl start`. systemd kills the whole control group; a process still in `D` state stays until the kernel
+  releases it, and while it lives it still holds the inherited listening sockets, so a fresh start fails to bind its
+  TCP ports. If the process does not go away, the underlying kernel or driver condition has to be cleared, which can
+  need a host reboot.
+- Afterwards, check that exactly one instance file shows role `active` and no file shows `kill_pending` before
+  allowing reloads again.
+
 ## Tests
 - **Unit (blind):**
   - config validation of the options;
