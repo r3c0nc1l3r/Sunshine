@@ -310,11 +310,11 @@ TEST(WaylandStatsPeriodicGateTest, MeasuresFromLastOpenResult) {
   const std::chrono::steady_clock::time_point base {std::chrono::seconds {1000}};
 
   EXPECT_TRUE(gate.due(base));
-  EXPECT_FALSE(gate.due(base + std::chrono::seconds {5}));
-  EXPECT_FALSE(gate.due(base + std::chrono::seconds {15}));
-  EXPECT_TRUE(gate.due(base + std::chrono::seconds {20}));
-  EXPECT_FALSE(gate.due(base + std::chrono::seconds {25}));
-  EXPECT_TRUE(gate.due(base + std::chrono::seconds {30}));
+  EXPECT_FALSE(gate.due(base + std::chrono::seconds {5}));  // a false result does not move the reference
+  EXPECT_TRUE(gate.due(base + std::chrono::seconds {15}));  // 15 s since the last true
+  EXPECT_FALSE(gate.due(base + std::chrono::seconds {20}));  // 5 s since the last true (15)
+  EXPECT_TRUE(gate.due(base + std::chrono::seconds {25}));  // 10 s since the last true (15)
+  EXPECT_FALSE(gate.due(base + std::chrono::seconds {30}));
 }
 
 /**

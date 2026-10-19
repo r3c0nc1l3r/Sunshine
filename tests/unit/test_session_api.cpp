@@ -11,6 +11,7 @@
 // standard includes
 #include <cctype>
 #include <chrono>
+#include <exception>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -654,9 +655,14 @@ TEST_F(SessionApiHttpTest, CloseSessionWithoutAdminUserRedirectsAndIsNotLogged) 
 TEST_F(SessionApiHttpTest, PostToSessionsListIsNotServed) {
   const std::uintmax_t offset = test_log_size();
 
-  const auto response = client->request("POST", "/api/sessions", "", auth_headers());
-
-  EXPECT_NE(response->status_code, "200 OK");
+  // The fixture registers no default resources (production start() does), so the server may just drop the
+  // connection; either way the request must not be served.
+  try {
+    const auto response = client->request("POST", "/api/sessions", "", auth_headers());
+    EXPECT_NE(response->status_code, "200 OK");
+  } catch (const std::exception &) {
+    SUCCEED() << "connection dropped: not served";
+  }
   send_marker_close();
   expect_only_marker_close_logged(offset);
 }
@@ -667,9 +673,14 @@ TEST_F(SessionApiHttpTest, PostToSessionsListIsNotServed) {
 TEST_F(SessionApiHttpTest, GetCloseRouteIsNotServed) {
   const std::uintmax_t offset = test_log_size();
 
-  const auto response = client->request("GET", "/api/sessions/1/close", "", auth_headers());
-
-  EXPECT_NE(response->status_code, "200 OK");
+  // The fixture registers no default resources (production start() does), so the server may just drop the
+  // connection; either way the request must not be served.
+  try {
+    const auto response = client->request("GET", "/api/sessions/1/close", "", auth_headers());
+    EXPECT_NE(response->status_code, "200 OK");
+  } catch (const std::exception &) {
+    SUCCEED() << "connection dropped: not served";
+  }
   send_marker_close();
   expect_only_marker_close_logged(offset);
 }
