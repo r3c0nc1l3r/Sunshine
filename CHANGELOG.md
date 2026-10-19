@@ -10,7 +10,8 @@ https://github.com/LizardByte/Sunshine/releases.
   audited as `result=already-stopping` instead of `closed` (#17).
 - Web UI API: the CSRF token is accepted only from the `X-CSRF-Token` header (#19).
 - Sessions are joined outside the RTSP slots lock, so the session list and close API never wait behind a session
-  teardown (#13).
+  teardown (#13). While a teardown is being joined, the session count used by `/launch` and `/resume` still includes
+  the session being ended, instead of waiting for the join.
 
 ### Fixed
 - `authenticate()` no longer throws on a short or malformed `Authorization` header, and compares the password hash in
@@ -18,7 +19,8 @@ https://github.com/LizardByte/Sunshine/releases.
 
 ### Added
 - Failed-login limit on the web UI: 10 failures from one address within 5 minutes lock that address out (429) until
-  the window ends (#19).
+  the window ends, with a `Retry-After` header. The address table is bounded; when it is full, expired and then
+  unlocked entries are evicted before any locked-out address (#19).
 - Tests for the session close API and the login limit, with a test-only seam for fake sessions (#18).
 
 ## v2026.914.233613-lb.1
