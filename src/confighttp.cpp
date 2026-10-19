@@ -664,10 +664,7 @@ namespace confighttp {
   }
 
   /**
-   * @brief Authenticate the user.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @return True if the user is authenticated, false otherwise.
+   * @brief Authenticate the user. Documented in `confighttp.h`.
    */
   bool authenticate(const resp_https_t &response, const req_https_t &request) {
     auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
