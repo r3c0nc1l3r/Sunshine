@@ -22,14 +22,15 @@
  * | `confighttp::updateClient` (disable) | 15 s | Only after the client's own sessions were ended and the peer was told (below), only when `rtsp_stream::total_session_count() == 0` and `proc::proc.running() > 0`. | The app keeps running; the reply is unchanged (`status` as before, 200). |
  * | `confighttp::unpair` | 15 s | Only when the client was removed and no client remains. | The client stays removed, the app keeps running, reply unchanged. |
  * | `confighttp::unpairAll` | 15 s | After all clients were erased. | Clients stay removed, the app keeps running, reply unchanged. |
- * | `proc` deinit guard (`process.cpp`, shutdown) | 5 s | Only when `proc::proc.running() > 0`; with no running app the guard calls `proc::proc.terminate()` as before, without asking. | Depends on who started the app (see "Shutdown and adopted apps" below): an ADOPTED app is not terminated and no `undo` runs (logged as a Warning); an app this process launched itself is terminated exactly as upstream does, whatever the gate said. |
+ * | `proc` deinit guard (`process.cpp`, shutdown) | 5 s | Only when `proc::proc.running() > 0`, through `terminate_app(shutdown_terminate_budget, ..., true)`; with no running app the guard calls `proc::proc.terminate()` as before, without asking. | Depends on who started the app (see "Shutdown and adopted apps" below): an ADOPTED app is not terminated and no `undo` runs (logged as a Warning); an app this process launched itself is terminated exactly as upstream does, whatever the gate said. |
  *
  * `updateClient` order when a client is disabled: (1) `rtsp_stream::terminate_sessions_by_cert(cert)` for the own
  * sessions; (2) when `cert` is not empty, `session_peer_t::close_cert(cert_sha256_hex(cert), ...)` on the peer
  * (best effort, timeout exactly `peer_request_timeout`, 500 ms: a `std::nullopt` is only logged as a Warning and ends
  * nothing else); (3) the terminate decision above. Step (3) does not depend on step (2)'s reply: `total_session_count()`
  * is read afterwards, so a peer that answered too slowly still shows its sessions and the app is kept. The response
- * never depends on the peer.
+ * never depends on the peer. Step (2) runs in every runtime mode whenever a `session_peer_t` exists (intended: it
+ * only ends the sessions of the cert the operator just disabled, never others, and costs at most 500 ms).
  *
  * ## Shutdown and adopted apps
  *
@@ -78,6 +79,16 @@ namespace handoff {
   constexpr std::chrono::milliseconds shutdown_terminate_budget {5000};  ///< Budget of the shutdown path (inside the 10 s forced-shutdown limit).
 
   /**
+   * @brief Budget the request-path callers pass to the gate (`/cancel`, close app, update client, unpair, unpair-all).
+   *
+   * Returns `request_terminate_budget` (15 s), or in test builds the value set with `set_request_budget_for_test`. The
+   * callers in `nvhttp.cpp` and `confighttp.cpp` pass `request_budget()`, never the constant directly.
+   *
+   * @return The budget.
+   */
+  std::chrono::milliseconds request_budget();
+
+  /**
    * @brief Ask for permission to terminate the app.
    *
    * Wraps `await_terminate_permission(*runtime().peer(), budget)`:
@@ -95,7 +106,7 @@ namespace handoff {
    * A counted request keeps its in-flight guard while it waits; that is safe because a draining process exists only when
    * this process is not starting a handoff.
    *
-   * @param budget `request_terminate_budget` or `shutdown_terminate_budget`.
+   * @param budget `request_terminate_budget` or `shutdown_terminate_budget` (tests may pass a short one).
    * @return Permission; see `terminate_permission_e` and `allows_terminate`.
    */
   terminate_permission_e terminate_gate(std::chrono::milliseconds budget);
@@ -119,16 +130,18 @@ namespace handoff {
   /**
    * @brief Ask for permission and, if granted, terminate the app.
    *
-   * `terminate_gate(budget)`, then `terminate_app_permitted()` when `allows_terminate`. On a refusal it logs one Warning
-   * naming `action` and does not terminate, except when `budget` is `shutdown_terminate_budget` and the app is not
-   * adopted (`!proc::proc.adopted()`): then, after the same Warning, it terminates anyway, so a shutdown never leaves an
-   * app this process started. The return value is still the gate's permission.
+   * `terminate_gate(budget)`, then `terminate_app_permitted()` when `allows_terminate`. On a refusal it does not
+   * terminate and logs one Warning naming `action` ("not doing <action>: ..."), except when `at_shutdown` is true and
+   * the app is not adopted (`!proc::proc.adopted()`): then it logs one Warning that says the app is terminated anyway
+   * because this process launched it, and terminates, so a shutdown never leaves an app this process started. Only
+   * `at_shutdown` selects that rule; the budget value never does. The return value is still the gate's permission.
    *
-   * @param budget Budget for the gate.
+   * @param budget Budget for the gate (`shutdown_terminate_budget` on the shutdown path; tests may pass a short one).
    * @param action Short generic name of the caller for the Warning, for example `"close app"`.
+   * @param at_shutdown `true` only for the shutdown deinit guard in `process.cpp`.
    * @return The permission, so the caller can tell a refusal.
    */
-  terminate_permission_e terminate_app(std::chrono::milliseconds budget, std::string_view action);
+  terminate_permission_e terminate_app(std::chrono::milliseconds budget, std::string_view action, bool at_shutdown = false);
 
   /**
    * @brief Number of sessions the draining process reports.
@@ -160,5 +173,12 @@ namespace handoff {
    * @param terminate The function to call; an empty function restores the real call.
    */
   void set_terminate_for_test(std::function<void()> terminate);
+
+  /**
+   * @brief Test-only: override the budget `request_budget()` returns, so a refusal test needs no 15 s wait.
+   *
+   * @param budget New budget; zero or negative restores `request_terminate_budget`.
+   */
+  void set_request_budget_for_test(std::chrono::milliseconds budget);
 #endif
 }  // namespace handoff

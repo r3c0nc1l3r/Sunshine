@@ -563,6 +563,30 @@ namespace nvhttp {
      * @brief Reload paired-client authorization state from the configured state file.
      */
     void reload_client_state();
+
+    /**
+     * @brief Dispatch an HTTPS `/cancel` request through the production handler (no client certificate check).
+     *
+     * @param response HTTP response object to populate.
+     * @param request HTTP request data from the test client.
+     */
+    void cancel_https(std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request);
+
+    /**
+     * @brief Dispatch an HTTPS `/launch` request through the production handler (no client certificate check).
+     *
+     * @param response HTTP response object to populate.
+     * @param request HTTP request data from the test client.
+     */
+    void launch_https(std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request);
+
+    /**
+     * @brief Dispatch an HTTPS `/resume` request through the production handler (no client certificate check).
+     *
+     * @param response HTTP response object to populate.
+     * @param request HTTP request data from the test client.
+     */
+    void resume_https(std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request);
   }  // namespace test_support
 #endif
 }  // namespace nvhttp
