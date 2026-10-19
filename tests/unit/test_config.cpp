@@ -7,6 +7,7 @@
 #include "../tests_common.h"
 
 // standard includes
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <string>
@@ -147,15 +148,6 @@ namespace {
   }
 
   /**
-   * @brief Apply a single `gamepad` configuration line through the public test entry point.
-   *
-   * @param value Gamepad name written after `gamepad =`.
-   */
-  void apply_gamepad_line(std::string_view value) {
-    config::apply_config_for_test(std::string("gamepad = ") + std::string(value) + "\n");
-  }
-
-  /**
    * @brief Fixture that saves and restores the input and modified-setting state around each test.
    */
   class ConfigGamepadOptionsTest: public testing::Test {
@@ -172,6 +164,20 @@ namespace {
       original_sunshine_ = config::sunshine;
       original_modified_config_settings_ = config::modified_config_settings;
       config::input.gamepad_driver.clear();
+
+      apps_file_ = std::filesystem::temp_directory_path() /
+                   ("sunshine_test_gamepad_options_apps_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");  // NOSONAR(cpp:S5443): safe for tests
+      ASSERT_EQ(file_handler::write_file(apps_file_.string().c_str(), "{\"apps\": []}\n"), 0);
+      config::stream.file_apps = apps_file_.string();
+    }
+
+    /**
+     * @brief Apply a single `gamepad` configuration line, keeping the temporary apps file configured.
+     *
+     * @param value Gamepad name written after `gamepad =`.
+     */
+    void apply_gamepad_line(std::string_view value) {
+      config::apply_config_for_test(std::string("file_apps = ") + apps_file_.string() + "\ngamepad = " + std::string(value) + "\n");
     }
 
     /**
@@ -185,9 +191,12 @@ namespace {
       config::input = std::move(original_input_);
       config::sunshine = std::move(original_sunshine_);
       config::modified_config_settings = std::move(original_modified_config_settings_);
+      std::error_code ec;
+      std::filesystem::remove(apps_file_, ec);
     }
 
   private:
+    std::filesystem::path apps_file_;  ///< Temporary apps file that `file_apps` points at during each test.
     config::video_t original_video_;  ///< Video configuration restored after each test.
     config::audio_t original_audio_;  ///< Audio configuration restored after each test.
     config::stream_t original_stream_;  ///< Stream configuration restored after each test.
