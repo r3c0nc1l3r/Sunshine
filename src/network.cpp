@@ -8,6 +8,7 @@
 
 // local includes
 #include "config.h"
+#include "handoff/hooks.h"
 #include "logging.h"
 #include "network.h"
 #include "utility.h"
@@ -242,9 +243,15 @@ namespace net {
     enet_host_destroy(host);
   }
 
-  std::uint16_t map_port(int port) {
-    // calculate the port from the config port
-    auto mapped_port = (std::uint16_t) ((int) config::sunshine.port + port);
+  /**
+   * @brief Add an offset to a base port, with the range warning shared by `map_port` and `map_udp_port`.
+   * @param base The base port the offset is added to.
+   * @param offset The offset from the base.
+   * @return The mapped port number.
+   */
+  std::uint16_t map_from_base(int base, int offset) {
+    // calculate the port from the base
+    auto mapped_port = (std::uint16_t) (base + offset);
 
     // Ensure port is in the range of 1024-65535
     if (mapped_port < 1024 || mapped_port > 65535) {
@@ -252,6 +259,16 @@ namespace net {
     }
 
     return mapped_port;
+  }
+
+  std::uint16_t map_port(int port) {
+    // calculate the port from the config port
+    return map_from_base((int) config::sunshine.port, port);
+  }
+
+  std::uint16_t map_udp_port(int offset) {
+    // the UDP base is the configured port unless the drain handoff gave this process another one
+    return map_from_base(handoff::hooks::udp_base(), offset);
   }
 
   /**
