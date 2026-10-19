@@ -1684,7 +1684,7 @@ namespace nvhttp {
 #ifdef __linux__
     // Ask the draining process first, before anything is ended (even with no app running, the answer to END_ALL also
     // ends the draining process's sessions). A refusal ends nothing, this process's own sessions included.
-    if (!handoff::allows_terminate(handoff::terminate_gate(handoff::request_terminate_budget))) {
+    if (!handoff::allows_terminate(handoff::terminate_gate(handoff::request_budget()))) {
       BOOST_LOG(warning) << "Cancel refused: the previous process did not release the app"sv;
       tree.put("root.cancel", 0);
       tree.put("root.<xmlattr>.status_code", 503);
@@ -2035,6 +2035,18 @@ namespace nvhttp {
 
     void reload_client_state() {
       load_state();
+    }
+
+    void cancel_https(std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request) {
+      cancel(std::move(response), std::move(request));
+    }
+
+    void launch_https(std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request) {
+      launch(std::move(response), std::move(request));
+    }
+
+    void resume_https(std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request) {
+      resume(std::move(response), std::move(request));
     }
   }  // namespace test_support
 #endif
