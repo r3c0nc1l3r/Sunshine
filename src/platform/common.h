@@ -1287,8 +1287,36 @@ namespace platf {
   constexpr auto SERVICE_TYPE = "_nvstream._tcp";  ///< mDNS service type advertised for GameStream discovery.
 
   namespace publish {
+    /**
+     * @brief Start publishing Sunshine's mDNS service.
+     *
+     * At most one publisher may be alive in a process: the returned object's destruction withdraws the service and
+     * joins the publisher thread, and a second `start()` is allowed only after the previous object was destroyed
+     * (the Linux implementation keeps the Avahi client, entry group and poll in statics that its thread and
+     * destructor clear). So a withdraw followed by a republish is `reset()` of the returned pointer and then
+     * `start()` again; `handoff::mdns_holder_t` (`src/handoff/mdns_holder.h`) owns that sequence. Unchanged for a
+     * normal start.
+     *
+     * @return The publisher, or `nullptr` when publishing is unavailable (no Avahi, no daemon, or a client could not
+     *         be created); that is not an error for the caller.
+     */
     [[nodiscard]] std::unique_ptr<deinit_t> start();
-  }
+
+#ifdef __linux__
+    /**
+     * @brief Whether Avahi renamed the published service because of a name collision.
+     *
+     * True when the name currently published differs from the configured instance name (the one `start()` computed
+     * with `net::mdns_instance_name`), for example "name #2" while another entry of the same name still exists. Set on
+     * the Avahi poll thread by the collision paths of `create_services` and `entry_group_callback`; cleared by every
+     * `start()`. The handoff's new process uses it to rebuild the entry once the old entry is gone (spec "mDNS").
+     *
+     * @return `true` after a collision rename of the live publisher; `false` otherwise, also when no publisher is
+     *         alive. Thread-safety: any thread (an atomic flag); never blocks and never calls Avahi.
+     */
+    [[nodiscard]] bool renamed();
+#endif
+  }  // namespace publish
 
   /**
    * @brief Initialize the platform-specific high precision timer.
