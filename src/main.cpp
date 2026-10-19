@@ -9,7 +9,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <optional>
 
 // platform includes
 #ifdef __APPLE__
@@ -46,6 +48,12 @@
 #include "video.h"
 
 #ifdef __linux__
+  #include "handoff/control.h"
+  #include "handoff/coordinator.h"
+  #include "handoff/drain.h"
+  #include "handoff/entry.h"
+  #include "handoff/instance_file.h"
+  #include "handoff/new_ops.h"
   #include "platform/common.h"
   #include "platform/linux/misc.h"
 #endif
@@ -170,7 +178,14 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
   // Main thread event loop
   BOOST_LOG(info) << "Starting main loop"sv;
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+  #ifdef __linux__
+  // The loop also idles without an icon (a handoff-started process) until the tray is started or shutdown is requested.
+  system_tray::run_main_loop([&shutdown_event]() {
+    return shutdown_event->peek();
+  });
+  #else
   while (system_tray::process_tray_events() == 0);
+  #endif
 #endif
   BOOST_LOG(info) << "Main loop has exited"sv;
 }
@@ -184,7 +199,16 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
  */
 int main(int argc, char *argv[]) {
 #ifdef __linux__
+  // The `--drain-handoff` helper runs before anything else: no log file, no thread, no configuration.
+  if (const auto code = handoff::entry::maybe_run_helper(argc, argv)) {
+    return *code;
+  }
+
   const bool privileged_execution = getauxval(AT_SECURE) != 0 || platf::has_elevated_privileges(true);
+  if (const auto reason = handoff::entry::early_start(privileged_execution); !reason.empty()) {
+    std::cerr << reason << '\n';
+    return 1;
+  }
   if (privileged_execution && !platf::sanitize_process_environment()) {
     std::cerr << "Failed to sanitize the environment for privileged execution: " << std::strerror(errno) << '\n';
     return 1;
@@ -300,6 +324,14 @@ int main(int argc, char *argv[]) {
     BOOST_LOG(error) << "Display device session failed to initialize"sv;
   }
 
+#ifdef __linux__
+  const auto handoff_refusal = handoff::entry::apply_startup_policy(privileged_execution);
+  if (handoff::runtime().enabled()) {
+    handoff::entry::open_instance_file();
+    handoff::session_notifier().start();
+  }
+#endif
+
 #ifdef _WIN32
   // Modify relevant NVIDIA control panel settings if the system has corresponding gpu
   if (nvprefs_instance.load()) {
@@ -413,6 +445,8 @@ int main(int argc, char *argv[]) {
   });
 
   on_signal(SIGTERM, [&force_shutdown, &display_device_deinit_guard, shutdown_event]() {
+    handoff::hooks::on_sigterm();
+
     BOOST_LOG(info) << "Terminate handler called"sv;
 
     auto task = []() {
@@ -437,6 +471,42 @@ int main(int argc, char *argv[]) {
   SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 #endif
 
+  // These are declared before the handoff objects so that they are destroyed after them.
+  std::unique_ptr<platf::deinit_t> mDNS;
+  std::unique_ptr<platf::deinit_t> upnp_unmap;
+
+#ifdef __linux__
+  // Declaration order is destruction order in reverse (see `handoff/entry.h`, section 7): the coordinator goes first,
+  // then the control server, then the handoff process.
+  handoff::entry::handoff_process_t handoff_process {
+    [shutdown_event]() {
+      shutdown_event->view();
+    },
+    [shutdown_event]() {
+      shutdown_event->raise(true);
+    }
+  };
+  std::optional<handoff::control_server_t> handoff_control;
+  std::optional<handoff::coordinator_t> coordinator;
+  if (handoff::runtime().enabled()) {
+    handoff_control.emplace();
+    coordinator.emplace(*handoff_control);
+    handoff::set_new_ops_coordinator(&*coordinator);
+
+    // A handoff-started process starts its control socket when it becomes the main process.
+    if (!handoff::hooks::started_by_handoff()) {
+      const char *runtime_directory = std::getenv("RUNTIME_DIRECTORY");
+      const char *xdg_runtime_dir = std::getenv("XDG_RUNTIME_DIR");
+      if (const auto dir = handoff::runtime_dir(runtime_directory ? runtime_directory : "", xdg_runtime_dir ? xdg_runtime_dir : "")) {
+        coordinator->start_control(handoff::control_socket_path(*dir, getpid()).string());
+      }
+    }
+  }
+  auto coordinator_hook_guard = util::fail_guard([]() {
+    handoff::set_new_ops_coordinator(nullptr);
+  });
+#endif
+
   proc::refresh(config::stream.file_apps);
 
   // If any of the following fail, we log an error and continue event though sunshine will not function correctly.
@@ -453,18 +523,51 @@ int main(int argc, char *argv[]) {
   }
 
   reed_solomon_init();
+#ifdef __linux__
+  handoff::entry::device_release_t input_deinit_guard {input::init()};
+#else
   auto input_deinit_guard = input::init();
+#endif
 
   if (config::input.controller && input::probe_gamepads()) {
     BOOST_LOG(warning) << "No gamepad input is available"sv;
   }
 
-  if (video::probe_encoders()) {
-    BOOST_LOG(error) << "Video failed to find working encoder"sv;
+#ifdef __linux__
+  // A handoff-started process now starts the new-side thread, which exchanges HELLO with the old process.
+  handoff::new_side_timeouts_t handoff_timeouts;
+  handoff_timeouts.go = config::stream.ping_timeout + 25s;
+  if (handoff::hooks::started_by_handoff()) {
+    handoff::new_ops_config_t ops_config;
+    ops_config.port = config::sunshine.port;
+    ops_config.ipv6 = net::af_from_enum_string(config::sunshine.address_family) != net::IPV4;
+    ops_config.feature_enabled = config::drain_handoff.enabled;
+    ops_config.startup_refusal = handoff_refusal;
+    ops_config.tray_enabled = tray_is_enabled && config::sunshine.system_tray;
+    ops_config.servers_listening_timeout = std::chrono::seconds {handoff::runtime().settings().ready_timeout_s};
+    handoff_process.start_new_side(ops_config, upnp_unmap, handoff_timeouts);
+
+    // The accepted probe override must be installed before the probe gate below, or the probe runs.
+    if (auto *new_ops = handoff_process.new_ops()) {
+      new_ops->wait_probe_decision(handoff_timeouts.hello + 2s);
+    }
+  }
+#endif
+
+  if (!handoff::hooks::startup_probe_skipped()) {
+    if (video::probe_encoders()) {
+      BOOST_LOG(error) << "Video failed to find working encoder"sv;
+    }
   }
 
   if (http::init()) {
     BOOST_LOG(fatal) << "HTTP interface failed to initialize"sv;
+
+#ifdef __linux__
+    if (auto *new_ops = handoff_process.new_ops()) {
+      new_ops->servers_failed("HTTP interface failed to initialize");
+    }
+#endif
 
 #ifdef _WIN32
     BOOST_LOG(fatal) << "To relaunch Sunshine successfully, use the shortcut in the Start Menu. Do not run Sunshine.exe manually."sv;
@@ -474,12 +577,13 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  std::unique_ptr<platf::deinit_t> mDNS;
   auto sync_mDNS = std::async(std::launch::async, [&mDNS]() {
-    mDNS = platf::publish::start();
+    // A process started by a handoff publishes nothing before COMMIT; the handoff glue publishes there.
+    if (!handoff::hooks::started_by_handoff()) {
+      mDNS = handoff::hooks::mdns_start(false);
+    }
   });
 
-  std::unique_ptr<platf::deinit_t> upnp_unmap;
   auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
     // A process started by a handoff maps nothing before COMMIT; the handoff glue starts UPnP there.
     if (!handoff::hooks::started_by_handoff()) {
@@ -489,12 +593,71 @@ int main(int argc, char *argv[]) {
 
   // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
   if (shutdown_event->peek()) {
+    // Released here as at the end of main, before the guards.
+    if (sync_upnp.valid()) {
+      sync_upnp.wait();
+    }
+    if (sync_mDNS.valid()) {
+      sync_mDNS.wait();
+    }
+    upnp_unmap.reset();
+    mDNS.reset();
     return lifetime::desired_exit_code;
   }
 
-  std::jthread httpThread {nvhttp::start};
-  std::jthread configThread {confighttp::start};
-  std::jthread rtspThread {rtsp_stream::start};
+  bool start_servers = true;
+#ifdef __linux__
+  // The listening callbacks count towards READY=1 (a normal start) or tell the new side (a handoff-started process).
+  handoff::entry::listening_latch_t listening_latch {4, handoff::entry::notify_ready_if_systemd};
+  std::function<void(unsigned short)> arrive = [&listening_latch](unsigned short) {
+    listening_latch.arrive();
+  };
+  if (handoff::hooks::started_by_handoff()) {
+    auto *new_ops = handoff_process.new_ops();
+    if (new_ops) {
+      arrive = [new_ops](unsigned short) {
+        new_ops->server_listening();
+      };
+      // The servers adopt the inherited fds, so they start only when the listeners were validated.
+      start_servers = new_ops->wait_listeners_validated(handoff_timeouts.hello + std::chrono::seconds {handoff::runtime().settings().ready_timeout_s}) == handoff::validation_e::ok;
+    } else {
+      start_servers = false;
+    }
+  }
+  rtsp_stream::set_listening_callback(arrive);
+  nvhttp::set_listening_callback(arrive);
+  confighttp::set_listening_callback(arrive);
+#endif
+
+  std::jthread httpThread;
+  std::jthread configThread;
+  std::jthread rtspThread;
+#ifdef __linux__
+  if (start_servers && handoff::hooks::started_by_handoff()) {
+    const auto inherited = handoff::runtime().inherited();
+    if (!inherited || !rtsp_stream::adopt_listener(inherited->rtsp, true)) {
+      if (auto *new_ops = handoff_process.new_ops()) {
+        new_ops->servers_failed("rtsp adopt");
+      }
+      start_servers = false;
+    }
+  }
+#endif
+  if (start_servers) {
+    httpThread = std::jthread {nvhttp::start};
+    configThread = std::jthread {confighttp::start};
+    rtspThread = std::jthread {rtsp_stream::start};
+
+#ifdef __linux__
+    if (handoff::runtime().enabled()) {
+      // Register once the RTSP listener exists (it is bound or adopted on the RTSP thread).
+      for (int i = 0; i < 500 && rtsp_stream::listener_fd() < 0 && !shutdown_event->peek(); ++i) {
+        std::this_thread::sleep_for(10ms);
+      }
+      handoff::listeners().set(handoff::listener_e::rtsp, handoff::rtsp_listener_ops());
+    }
+#endif
+  }
 
 #ifdef _WIN32
   // If we're using the default port and GameStream is enabled, warn the user
@@ -504,7 +667,8 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
-  if (tray_is_enabled && config::sunshine.system_tray) {
+  // A handoff-started process shows its tray at COMMIT (the main loop starts it on request).
+  if (tray_is_enabled && config::sunshine.system_tray && !handoff::hooks::started_by_handoff()) {
     BOOST_LOG(info) << "Starting system tray"sv;
 #ifdef _WIN32
     system_tray::prepare_tray_virtualhid_license();
@@ -522,10 +686,40 @@ int main(int argc, char *argv[]) {
 
   mainThreadLoop(shutdown_event);
 
-  httpThread.join();
-  configThread.join();
-  rtspThread.join();
+#ifdef __linux__
+  // The new side stops first; then the coordinator's early teardown, before the proc guard runs.
+  handoff_process.finish_new_side();
+  if (coordinator) {
+    coordinator->request_shutdown();
+    handoff::set_new_ops_coordinator(nullptr);
+    coordinator->stop_control();
+    coordinator->join_attempt();
+  }
+  handoff::listeners().clear(handoff::listener_e::rtsp);
+#endif
 
+#ifdef __linux__
+  handoff::note_shutdown_stage("client server thread (nvhttp)");
+#endif
+  if (httpThread.joinable()) {
+    httpThread.join();
+  }
+#ifdef __linux__
+  handoff::note_shutdown_stage("web UI server thread (confighttp)");
+#endif
+  if (configThread.joinable()) {
+    configThread.join();
+  }
+#ifdef __linux__
+  handoff::note_shutdown_stage("RTSP server thread");
+#endif
+  if (rtspThread.joinable()) {
+    rtspThread.join();
+  }
+
+#ifdef __linux__
+  handoff::note_shutdown_stage("task pool");
+#endif
   task_pool.stop();
   task_pool.join();
 
@@ -536,6 +730,17 @@ int main(int argc, char *argv[]) {
     nvprefs_instance.unload();
   }
 #endif
+
+  // Released here, as upstream's scope end did, before the app terminate and the device and platform guards; declared
+  // early only for the new side's UPnP slot.
+  if (sync_upnp.valid()) {
+    sync_upnp.wait();
+  }
+  if (sync_mDNS.valid()) {
+    sync_mDNS.wait();
+  }
+  upnp_unmap.reset();
+  mDNS.reset();
 
   return lifetime::desired_exit_code;
 }

@@ -3,6 +3,7 @@
  * @brief Definitions for audio capture and encoding.
  */
 // standard includes
+#include <mutex>
 #include <thread>
 
 // lib includes
@@ -50,6 +51,30 @@ namespace audio {
   std::function<std::unique_ptr<platf::audio_control_t>()> &audio_control_factory() {
     static std::function<std::unique_ptr<platf::audio_control_t>()> factory;
     return factory;
+  }
+
+  namespace {
+    std::mutex recorded_host_sink_mutex;  ///< Guards `recorded_host_sink_name`.
+    std::string recorded_host_sink_name;  ///< The host sink of the last stream start in this process; may be empty.
+    bool recorded_host_sink_set = false;  ///< Whether a stream start recorded a host sink.
+  }  // namespace
+
+  std::optional<std::string> recorded_host_sink() {
+#ifdef __linux__
+    {
+      // The lock is only held for the copy, never across a capture call.
+      std::lock_guard lock {recorded_host_sink_mutex};
+      if (recorded_host_sink_set && !recorded_host_sink_name.empty()) {
+        return recorded_host_sink_name;
+      }
+    }
+
+    // No stream recorded a host sink in this process: use the sink a handoff start supplied.
+    if (auto inherited = handoff::hooks::host_sink(); inherited && !inherited->empty()) {
+      return inherited;
+    }
+#endif
+    return std::nullopt;
   }
 
   constexpr auto SAMPLE_RATE = 48000;  ///< Audio sample rate in hertz required by Opus.
@@ -351,6 +376,12 @@ namespace audio {
     }
 
     ctx.sink = std::move(*sink);
+
+    {
+      std::lock_guard lock {recorded_host_sink_mutex};
+      recorded_host_sink_name = ctx.sink.host;
+      recorded_host_sink_set = true;
+    }
 
     fg.disable();
     return 0;

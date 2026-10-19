@@ -67,7 +67,17 @@ namespace handoff {
      */
     virtual int self_pidfd() = 0;
 
-    virtual void pause_accept() = 0;  ///< Substep 1: pause accepting on all four sockets (blocks until confirmed).
+    /**
+     * @brief Substep 1: pause accepting on all four sockets; each pause is bounded (at most the 5 s in-flight budget).
+     *
+     * `old_side_t` treats a non-empty result as a failed switch: it takes the rollback and answers the helper
+     * `failed <reason>` (the non-zero exit of the helper) with this reason. `resume_accept()` then runs in the
+     * rollback and must be safe on a socket that was never paused.
+     *
+     * @return An empty string when all four sockets confirmed the pause; otherwise a one-line reason naming the server
+     *         that did not confirm.
+     */
+    virtual std::string pause_accept() = 0;
     virtual void resume_accept() = 0;  ///< Resume accepting on all four sockets.
     virtual void raise_gate() = 0;  ///< Substep 2.
     virtual void lower_gate() = 0;  ///< Lift the 503 gate.
@@ -245,7 +255,7 @@ namespace handoff {
    *
    * 1. Send `HELLO` with `self_pidfd()` attached; wait (`ready` timeout) for the child's `HELLO` and then `READY`.
    *    A failed `READY`, a major-version mismatch, an early close or a timeout is a failed start.
-   * 2. Switch substeps in this order: `pause_accept`, `raise_gate`, `wait_in_flight(in_flight)`,
+   * 2. Switch substeps in this order: `pause_accept` (a non-empty reason fails the switch: rollback, helper `failed <reason>`), `raise_gate`, `wait_in_flight(in_flight)`,
    *    `recheck(pairing)`, `save_state`, `freeze`, `withdraw_mdns(mdns_withdraw)`, `remove_tray`, `take_snapshot`,
    *    `shutdown_requested` (true → rollback), `set_released(true)`, send `GO`.
    * 3. Wait for `GO_ACK` until `go_ack` after the `GO` send (monotonic). On `ok`, re-check that deadline, send
@@ -307,6 +317,8 @@ namespace handoff {
      * no handover (no `close_socket_copies`, no `MAIN`), no rollback and no rollback effects. With `systemctl stop`
      * both processes get `SIGTERM`; a `SIGTERM` to the old process alone inside the window ends the unit, as a crash
      * of the main process would (spec step 6).
+     * A rollback that has already begun is not interrupted: it finishes, kill-first and reap included, and then `run()`
+     * returns (`shutdown` when the request came before the rollback ended).
      */
     void request_shutdown();
 

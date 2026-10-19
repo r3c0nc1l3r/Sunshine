@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -113,7 +114,27 @@ namespace nvhttp {
 #endif
 
   /**
+   * @brief Register a function that `start()` calls once per listener (the https and the http server) when it exists.
+   *
+   * Used for the `READY=1` latch (as `rtsp_stream::set_listening_callback`). Call before `start()`, from any thread; a
+   * second call replaces the first. `start()` calls it on the thread that runs the server, right after the listener was
+   * bound (a normal start) or adopted (a handoff-started child), once for each of the two servers, and before the first
+   * accept is armed. It is not called when binding or adopting fails. The function must not block and must not call a
+   * pause, resume or close function of a server.
+   *
+   * @param callback Called with the local TCP port of the listener. An empty function removes the registration.
+   */
+  void set_listening_callback(std::function<void(unsigned short)> callback);
+
+  /**
    * @brief Start the nvhttp server.
+   *
+   * A normal start is unchanged. In a handoff-started child (Linux, `handoff::hooks::started_by_handoff()`), `start()`
+   * adopts the listener fds of `handoff::runtime().inherited()` paused (`adoptable_server_t::start_adopted`) instead of
+   * binding, registers each server's pause, resume, close and fd operations with `handoff::listeners()`
+   * (`handoff/coordinator.h`) so the old side can pause and hand over the sockets, and clears that registration before it
+   * stops the servers. The adopted servers begin accepting when the new side resumes them at `COMMIT`.
+   *
    * @examples
    * nvhttp::start();
    * @examples_end

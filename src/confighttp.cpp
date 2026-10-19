@@ -14,6 +14,8 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <string_view>
@@ -47,6 +49,7 @@
 #include "display_device.h"
 #include "file_handler.h"
 #include "globals.h"
+#include "handoff/hooks.h"
 #include "httpcommon.h"
 #include "input.h"
 #include "logging.h"
@@ -60,6 +63,8 @@
 #include "uuid.h"
 
 #ifdef __linux__
+  #include "handoff/coordinator.h"
+  #include "handoff/runtime.h"
   #include "handoff/terminate.h"
 #endif
 
@@ -2215,6 +2220,24 @@ namespace confighttp {
 
     print_req(request);
 
+    // An in-place restart is refused while a handoff is in progress or a draining process exists.
+    if (const auto blocked = handoff::hooks::restart_blocked(); !blocked.empty()) {
+      constexpr auto code = SimpleWeb::StatusCode::client_error_conflict;
+
+      nlohmann::json refused_tree;
+      refused_tree["status_code"] = code;
+      refused_tree["status"] = false;
+      refused_tree["error"] = blocked;
+
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/json");
+      headers.emplace("X-Frame-Options", "DENY");
+      headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+
+      response->write(code, refused_tree.dump(), headers);
+      return;
+    }
+
     // We may not return from this call
     platf::restart();
   }
@@ -2574,6 +2597,16 @@ namespace confighttp {
     }
   }
 
+  namespace {
+    std::mutex listening_callback_mutex;  ///< Guards `listening_callback`.
+    std::function<void(unsigned short)> listening_callback;  ///< Called when the web UI listener exists.
+  }  // namespace
+
+  void set_listening_callback(std::function<void(unsigned short)> callback) {
+    std::lock_guard lock {listening_callback_mutex};
+    listening_callback = std::move(callback);
+  }
+
   /**
    * @brief Start the HTTPS configuration server.
    */
@@ -2657,12 +2690,56 @@ namespace confighttp {
 
     const auto display_addr = net::get_bind_address_url_host();
 
+    std::function<void(unsigned short)> on_listening;
+    {
+      std::lock_guard lock {listening_callback_mutex};
+      on_listening = listening_callback;
+    }
+    const auto announce = [&display_addr, on_listening](const unsigned short port) {
+      BOOST_LOG(info) << "Configuration UI available at [https://"sv << display_addr << ":" << port << "]";
+      if (on_listening) {
+        on_listening(port);
+      }
+    };
+
+    // A handoff-started child adopts the inherited listener, paused, instead of binding.
+    [[maybe_unused]] int adopt_fd = -1;
+#ifdef __linux__
+    if (handoff::hooks::started_by_handoff()) {
+      if (const auto inherited = handoff::runtime().inherited()) {
+        adopt_fd = inherited->webui;
+      }
+    }
+
+    // The operations are inert until the listener exists.
+    if (handoff::hooks::enabled()) {
+      handoff::listener_ops_t ops;
+      ops.pause = [&server](std::chrono::milliseconds timeout) {
+        return server.pause(timeout);
+      };
+      ops.resume = [&server](std::chrono::milliseconds timeout) {
+        return server.resume(timeout);
+      };
+      ops.close_listener = [&server](std::chrono::milliseconds timeout) {
+        return server.close_listener(timeout);
+      };
+      ops.fd = [&server]() {
+        return server.listener_fd();
+      };
+      handoff::listeners().set(handoff::listener_e::webui, std::move(ops));
+    }
+#endif
+
     auto accept_and_run = [&](auto *server) {
       try {
         platf::set_thread_name("confighttp::tcp");
-        server->start([&display_addr](const unsigned short port) {
-          BOOST_LOG(info) << "Configuration UI available at [https://"sv << display_addr << ":" << port << "]";
-        });
+#ifdef __linux__
+        if (adopt_fd >= 0) {
+          server->start_adopted(adopt_fd, true, announce);
+          return;
+        }
+#endif
+        server->start(announce);
       } catch (boost::system::system_error &err) {
         // It's possible the exception gets thrown after calling server->stop() from a different thread
         if (shutdown_event->peek()) {
@@ -2672,12 +2749,25 @@ namespace confighttp {
         BOOST_LOG(fatal) << "Couldn't start Configuration HTTPS server on port ["sv << port_https << "]: "sv << err.what();
         shutdown_event->raise(true);
         return;
+      } catch (const std::exception &err) {
+        if (shutdown_event->peek()) {
+          return;
+        }
+
+        BOOST_LOG(fatal) << "Couldn't start Configuration HTTPS server: "sv << err.what();
+        shutdown_event->raise(true);
+        return;
       }
     };
     std::jthread tcp {accept_and_run, &server};
 
     // Wait for any event
     shutdown_event->view();
+
+#ifdef __linux__
+    // The registered operations use the server, so they go before it stops.
+    handoff::listeners().clear(handoff::listener_e::webui);
+#endif
 
     server.stop();
 

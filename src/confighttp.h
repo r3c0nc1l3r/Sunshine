@@ -54,7 +54,31 @@ namespace confighttp {
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
   using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
 
-  // Main server start function
+  /**
+   * @brief Register a function that `start()` calls when the web UI listener exists.
+   *
+   * Used for the `READY=1` latch (as `rtsp_stream::set_listening_callback`). Call before `start()`, from any thread; a
+   * second call replaces the first. `start()` calls it on the thread that runs the server, right after the listener was
+   * bound (a normal start) or adopted (a handoff-started child), and before the first accept is armed. It is not called
+   * when binding or adopting fails. The function must not block and must not call a pause, resume or close function of the
+   * server.
+   *
+   * @param callback Called with the local TCP port of the listener. An empty function removes the registration.
+   */
+  void set_listening_callback(std::function<void(unsigned short)> callback);
+
+  /**
+   * @brief Main server start function.
+   *
+   * A normal start is unchanged. In a handoff-started child (Linux, `handoff::hooks::started_by_handoff()`), `start()`
+   * adopts the web UI listener fd of `handoff::runtime().inherited()` paused (`adoptable_server_t::start_adopted`)
+   * instead of binding, registers the server's pause, resume, close and fd operations with `handoff::listeners()`
+   * (`handoff/coordinator.h`), and clears that registration before it stops the server.
+   *
+   * `POST /api/restart` (`restart`) answers HTTP 409 with the text of `handoff::hooks::restart_blocked()` when that text
+   * is not empty, and does not restart (after authentication and the CSRF check, before `platf::restart()`; see
+   * `handoff/drain.h`, "In-place restart and Quit refusals"). With an empty text it behaves as before.
+   */
   void start();
 
   void print_req(const req_https_t &request);
