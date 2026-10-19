@@ -58,6 +58,7 @@
 #include "new_side.h"
 #include "protocol.h"
 #include "src/platform/common.h"
+#include "src/upnp.h"
 
 namespace handoff {
   /**
@@ -101,6 +102,13 @@ namespace handoff {
    * pass fakes. Every seam is called on the new-side thread unless noted, never under a lock of the class.
    */
   struct new_ops_seams_t {
+    /**
+     * @brief Set the UPnP unmap scope. Default: `upnp::set_unmap_scope`. Called with `upnp::unmap_scope_e::udp_only`
+     * BEFORE `start_upnp` in `map_upnp()` at `COMMIT` (also when UPnP turns out to be off; not at all when `map_upnp()` does nothing after a failed `resume_accept()`), and with `upnp::unmap_scope_e::all` in
+     * `on_main()`. Never called with another value, and never at any other time.
+     */
+    std::function<void(upnp::unmap_scope_e)> set_unmap_scope;
+
     /**
      * @brief Identity of this host for the probe comparison. Default: `gather_probe().identity` (`probe.h`).
      */
@@ -166,9 +174,9 @@ namespace handoff {
     std::function<bool()> publish_mdns;
 
     /**
-     * @brief Start UPnP. Default: `upnp::set_unmap_scope(upnp::unmap_scope_e::udp_only)` and then
-     * `upnp::start(hooks::udp_base())`, in this order, so the guard never exists with scope `all` before `MAIN`: a
-     * graceful exit between `COMMIT` and `MAIN` (the rollback path) never unmaps the TCP ports shared with the old
+     * @brief Start UPnP. Default: `upnp::start(hooks::udp_base())`. The scope `udp_only` was set by the
+     * `set_unmap_scope` seam just before this seam is called (in `map_upnp()`), so the guard never exists with scope `all`
+     * before `MAIN`: a graceful exit between `COMMIT` and `MAIN` (the rollback path) never unmaps the TCP ports shared with the old
      * process. The returned guard (null when UPnP is off) is stored in the slot given to the constructor.
      */
     std::function<std::unique_ptr<platf::deinit_t>()> start_upnp;
@@ -195,7 +203,7 @@ namespace handoff {
 
     /**
      * @brief Start the control socket of this process, which has just become the main process. Default: the
-     * coordinator's start call (`coordinator.h`), with the same handler as a normal start; does nothing when the
+     * `coordinator_t::start_control(control_socket_path(runtime_dir, getpid()).string())` (`coordinator.h`), the same call a normal start makes; does nothing when the
      * feature is disabled. Called by `on_main()`.
      */
     std::function<void()> start_control_server;
@@ -353,7 +361,7 @@ namespace handoff {
 
     /**
      * @brief Fourth `COMMIT` effect: `start_upnp` seam; the guard goes into the slot. A handoff-started process starts
-     * UPnP here and nowhere else, with the unmap scope `udp_only` from this moment until `MAIN` (see `on_main()`). This
+     * UPnP here and nowhere else, with the unmap scope `udp_only` (the `set_unmap_scope` seam, called just before `start_upnp`) from this moment until `MAIN` (see `on_main()`). This
      * process never calls `upnp::remove_ports_async`: the cleanup of a killed new process's mappings is done by the OLD
      * process after the rollback (`coordinator.h`, `start_upnp_cleanup`). Does nothing after a failed `resume_accept()`, and does not touch the slot when the
      * seam returns null (UPnP off).
@@ -378,7 +386,7 @@ namespace handoff {
      * @brief The `MAIN` message was read (called by the post-`COMMIT` reader, never by `run_new_side`).
      *
      * Idempotent (a second call does nothing). In this order: `runtime().transition(new_active, normal)` and
-     * `runtime().set_main(true)`; `upnp::set_unmap_scope(upnp::unmap_scope_e::all)` (the process now owns every mapping;
+     * `runtime().set_main(true)`; the `set_unmap_scope(all)` seam (the process now owns every mapping;
      * the old process is only draining); `enable_tray_entries`; `notify_ready` (the only `READY=1` a handoff-started process
      * ever sends); `start_control_server`; stage `main`. A call before the stage is `committed` is ignored with a
      * Warning (a `MAIN` cannot precede `COMMIT`; a confused peer must not turn the process into the main process).

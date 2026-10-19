@@ -23,6 +23,7 @@
  * | 4 | `config::parse`, `logging::init`, the version banner, `cmd_to_func` | unchanged. `--drain-handoff` never reaches `config::parse` (step 1). The log is opened for appending in every start (`logging.h`). |
  * | 5 | right after `display_device::init` | `const auto refusal = handoff::entry::apply_startup_policy(privileged_execution);` (section 3). Keep `refusal` for step 14 H. |
  * | 6 | right after step 5, when `handoff::runtime().enabled()` | `handoff::entry::open_instance_file()` (role `pending` in H, `active` in N), then `handoff::session_notifier().start()`. |
+ * | 6b | when `runtime().enabled()`, after step 6 and before any `READY=1` can be sent (step 15 on) | N only (an H process starts it in `on_main()`): construct `handoff::coordinator_t coordinator(control)` (with a `control_server_t control`; declared as section 7 says), then `coordinator.start_control(control_socket_path(runtime_dir, getpid()).string())`. The path is `$RUNTIME_DIRECTORY/control/<pid>.sock` when `RUNTIME_DIRECTORY` is set (system unit, `RuntimeDirectory=sunshine`), else `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock` (user unit). In H the same `coordinator_t` is constructed here, but `start_control` is called by `sunshine_new_ops_t`'s `start_control_server` in `on_main()`. |
  * | 7 | `task_pool.start(1)` and the signal handlers | In the SIGTERM lambda the first statement is `handoff::hooks::on_sigterm()` (before `force_shutdown` is armed and before `shutdown_event->raise`). The SIGINT lambda is unchanged. `main` does not scrub or unset `NOTIFY_SOCKET` anywhere (the refusal gatherer reads it at call time). |
  * | 8 | after the signal handlers | `handoff_process` (section 6) is constructed here, before `proc_deinit_guard` (destruction order, section 7). Starts the shutdown watcher. |
  * | 9 | `proc::refresh`, `platf::init`, `proc::init`, `reed_solomon_init`, `input::init` | unchanged; after `input::init` call `handoff::register_device_release(...)` (section 7). |
@@ -31,10 +32,11 @@
  * | 12 | `http::init()` | unchanged; on failure in H call `handoff_process.new_ops()->servers_failed("HTTP interface failed to initialize")` before `return -1`. |
  * | 13 N | the `mDNS` and `upnp` asyncs | `mDNS = handoff::hooks::mdns_start(false)` replaces `platf::publish::start()`; the `upnp::start(hooks::udp_base())` call (already skipped when `started_by_handoff()`) stays. In H neither async publishes or maps (the `COMMIT` effects of `new_ops.h` do), and `main` takes no mDNS handle. |
  * | 14 H | between `http::init()` and starting the server threads | `switch (new_ops->wait_listeners_validated(<hello timeout> + <ready timeout>))`: `ok` continues; `failed` or `timeout` starts no server thread (they would throw on the inherited fds), skips to step 17 (the new side then calls `exit_failure()` itself; the normal shutdown path runs). |
- * | 15 | `shutdown_event->peek()` check, the three `std::jthread`s | unchanged calls. Before them: `rtsp_stream::set_listening_callback(arrive)` and the same registration on `nvhttp` and `confighttp` (`arrive` is section 5); in H `rtsp_stream::adopt_listener(inherited().rtsp, true)`. `nvhttp::start()` and `confighttp::start()` do, in H, `start_adopted(fd, true, callback)` with the inherited fd (`inherited().https` and `.http` for nvhttp, `.webui` for confighttp) instead of `start()`, and in N call `start(callback)` (the callback only fires; nothing else changes). |
+ * | 15 | `shutdown_event->peek()` check, the three `std::jthread`s | unchanged calls. Before them: `rtsp_stream::set_listening_callback(arrive)`, `nvhttp::set_listening_callback(arrive)` and `confighttp::set_listening_callback(arrive)` (`arrive` is section 5; declared as in `rtsp.h`, `nvhttp.h`, `confighttp.h`); in H `rtsp_stream::adopt_listener(inherited().rtsp, true)`. Then `nvhttp::start()` and `confighttp::start()` as they are declared: in H each adopts the inherited fds paused itself (`inherited().https` and `.http` for nvhttp, `.webui` for confighttp) and registers with `handoff::listeners()`; in N `start()` binds as before and the listening callback only fires. `main` passes no fd and no callback to `start()`. |
+ * | 15b | when `runtime().enabled()`, after the RTSP server has started (the `rtsp_stream::start`/adopt step) and after its listener exists | `handoff::listeners().set(handoff::listener_e::rtsp, handoff::rtsp_listener_ops())`; the nvhttp and confighttp `start()` register their own entries (their headers). Before the RTSP server stops (the `rtspThread.join()` of step 18) call `handoff::listeners().clear(handoff::listener_e::rtsp)`, as nvhttp and confighttp do for theirs before they stop. |
  * | 16 | `init_tray()` block | skipped in H (`!hooks::started_by_handoff()` added to the condition). Unchanged in N. |
  * | 17 | `mainThreadLoop` | On Linux it calls `system_tray::run_main_loop([&]{ return shutdown_event->peek(); })` whenever the tray is compiled in and enabled (`tray_is_enabled && config::sunshine.system_tray`), including in H, where no icon exists yet and the loop idles with its 500 ms poll until `request_start()` or shutdown. Without the tray it waits on `shutdown_event->view()` as before. |
- * | 18 | after `mainThreadLoop` returns | `handoff_process.finish_new_side();` then the three `join()`s, each preceded by `handoff::note_shutdown_stage(...)` (names in `drain.h`), then `task_pool.stop()` and `task_pool.join()` preceded by `note_shutdown_stage("task pool")`. |
+ * | 18 | after `mainThreadLoop` returns | `handoff_process.finish_new_side();` then, when the feature is enabled, in this order and BEFORE the `proc` deinit guard (which runs at step 19): `coordinator.request_shutdown()`, `coordinator.stop_control()`, `coordinator.join_attempt()` (bounded, default 8 s; on expiry it logs an Error and `main` goes on, since the 10 s limit of the `SIGTERM` handler still applies; so no old-side operation runs beside the guard); `handoff::listeners().clear(rtsp)`; then the three `join()`s, each preceded by `handoff::note_shutdown_stage(...)` (names in `drain.h`), then `task_pool.stop()` and `task_pool.join()` preceded by `note_shutdown_stage("task pool")`. |
  * | 19 | `return lifetime::desired_exit_code` | Local destructors run in the order of section 7. |
  *
  * ## 2. The `--drain-handoff <MAINPID>` helper
@@ -97,18 +99,19 @@
  * thread's probe gate (step 11), which a main-thread `run_new_side` could not do.
  *
  * `post_commit_t` (the active side's view of the draining process, built after `committed`, held by
- * `handoff_process_t`):
+ * `handoff_process_t`; it is the single owner of the peer-link wiring, `coordinator.h` has none):
  * - `peer_link_t(channel, ops.take_old_pidfd())`, then `runtime().set_peer(link)`;
  * - a `channel_reader_t(channel, true, handler, on_close)`: `handler(received)` calls `ops.on_main()` for `MAIN`, and
- *   `link.deliver(message)` for everything else (`SESSIONS`, `CLOSED`, `CLOSED_CERT`, `ENDED`, `END_REJECTED`,
+ *   `link.deliver(message)` for every other message (`SESSIONS`, `CLOSED`, `CLOSED_CERT`, `ENDED`, `END_REJECTED`,
  *   `HANDOFF_STATE`; anything `deliver` does not consume is dropped), and in both cases closes an attached fd; `PING` is
- *   answered by the reader. `on_close(status)` calls `link.on_channel_closed()` and logs a Warning; it does nothing
+ *   answered by the reader. `on_close(status)` calls `link.on_channel_closed()` (so `on_channel_closed` fires on channel EOF and, below, on pidfd readiness; replies go through `deliver`) and logs a Warning; it does nothing
  *   else: a lost channel ends no session on either side and starts no exit (the old process kills this one before
  *   `MAIN`; after `MAIN` the processes run on, spec "The handoff channel");
  * - a pidfd watcher thread: it polls a `dup` of the old pidfd and a stop eventfd; when the pidfd is readable it calls
  *   `link.on_channel_closed()` once (waiting callers fail promptly; `exists()`/`gone()` already read the pidfd) and ends;
- * - `stop()` stops the watcher and the reader and joins them. It does not close the channel, `runtime().set_peer` or
- *   the link (the shutdown guard may still need them, section 7).
+ * - `stop()` stops the reader (so `deliver` and `on_channel_closed` never run on a destroyed link) and the watcher and
+ *   joins them, then calls `runtime().set_peer(nullptr)` and releases the link. It does not close the channel (section 7).
+ *   `handoff_process_t` calls it only after the `proc` guard has run, because the guard's terminate needs the link.
  * After `MAIN` the same reader keeps serving `deliver` and `PING`.
  *
  * ## 5. The `READY=1` latch
@@ -146,20 +149,21 @@
  * ## 7. Destruction order of `main`
  *
  * Locals are destroyed in reverse declaration order, so declare, in this order, from first to last: the
- * `upnp_unmap` and `mDNS` variables (existing), `handoff_process`, the `coordinator_t` (with the control server it serves),
+ * `upnp_unmap` and `mDNS` variables (existing), `handoff_process`, the `control_server_t control`, the `coordinator_t coordinator(control)`,
  * `proc_deinit_guard` (existing), `input_deinit_guard` (existing). Then the guards run as: input devices, then the `proc`
- * deinit guard, then the coordinator's teardown (`request_shutdown()`, control server stop, `stop()`; `coordinator.h` requires
- * `stop()` after the `proc` guard in an active process), then `handoff_process`.
+ * deinit guard, then the coordinator's destructor (`stop()`, then `control`), then `handoff_process`. `request_shutdown()`, `stop_control()` and
+ * `join_attempt()` are NOT left to the destructor: they run at step 18, before the `proc` guard; only the responder, the
+ * poller, the reader and the channel live past the guard (`coordinator.h` requires `stop()` after it in an active process).
  * - The `proc` guard's terminate (`terminate_app(shutdown_terminate_budget, ..., true)`, `terminate.h`) needs the peer
  *   link, the channel reader and the channel, so `handoff_process` (which owns `post_commit_t`) outlives it. A refused
  *   terminate skips `terminate()` only for an adopted app; an app this process launched is terminated as upstream. The
  *   channel is closed only after the guard has run.
- * - `~handoff_process_t` runs, in this order: `post_commit_t::stop()`, `runtime().set_peer(nullptr)`,
+ * - `~handoff_process_t` runs, in this order: `post_commit_t::stop()` (which clears `runtime().set_peer(nullptr)`),
  *   `runtime().set_channel(nullptr)`, `session_notifier().stop()`, `drain_controller().cancel()` (returns `false` and
  *   is harmless when the exit sequence is the thing that is shutting the process down), `mdns_holder().stop()` (in every
  *   process that may have published, also a draining one; idempotent), `runtime().instance_remove()`, the shutdown
- *   watcher. The coordinator's own teardown (control server stop after `old_side_t::request_shutdown()`, the old
- *   side's thread join, the responder and revocation poller stop) is in `coordinator.h`; it runs after the `proc` guard
+ *   watcher. The coordinator's early teardown (`request_shutdown()`, `stop_control()`, the bounded `join_attempt()`) ran at step 18, before the
+ *   `proc` guard; its late teardown (`stop()`: revocation poller, channel reader, responder, channel) is in `coordinator.h`; it runs after the `proc` guard
  *   and before `~handoff_process_t`. In a draining process the drain exit has already ended the sessions (`drain.h`) before
  *   `exit_graceful()` starts this order, so `stop()` finds no session to wait for.
  * - `register_device_release(f)` is called right after `input::init()` with a closure that resets `input_deinit_guard`
@@ -313,6 +317,16 @@ namespace handoff::entry {
     int _count;  ///< Construction count.
   };
 
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Test-only replacements for `post_commit_t`.
+   */
+  struct post_commit_seams_t {
+    std::function<void(std::shared_ptr<peer_link_t>)> set_peer;  ///< `runtime().set_peer`; called with the link at start and with null at `stop()`. Null means production.
+    std::function<int()> old_pidfd;  ///< The old process's pidfd (a pollable fake fd in tests; the object owns it). Null means `ops.take_old_pidfd()`.
+  };
+#endif
+
   /**
    * @brief The active side's view of the draining process, built after `COMMIT` (section 4).
    *
@@ -337,8 +351,8 @@ namespace handoff::entry {
     post_commit_t &operator=(const post_commit_t &) = delete;  ///< Not copyable.
 
     /**
-     * @brief Stop and join the pidfd watcher and the reader. Idempotent. Leaves the channel, the link and
-     * `runtime().peer()` as they are.
+     * @brief Stop and join the reader and the pidfd watcher, call `runtime().set_peer(nullptr)` (through the seam in
+     * tests) and release the link. Idempotent. Does not close the channel.
      */
     void stop();
 
@@ -348,6 +362,17 @@ namespace handoff::entry {
      * @return The peer link; valid for the life of this object.
      */
     peer_link_t &link();
+
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief Test-only constructor with replaced runtime and pidfd.
+     *
+     * @param ops The new-side ops (`on_main()` is called from the reader).
+     * @param channel The process's end of the channel (a test socketpair end).
+     * @param seams Replacements.
+     */
+    post_commit_t(sunshine_new_ops_t &ops, std::shared_ptr<channel_t> channel, const post_commit_seams_t &seams);
+#endif
 
   private:
     sunshine_new_ops_t &_ops;  ///< Ops (for `on_main()`).

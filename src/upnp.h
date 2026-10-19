@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <set>
@@ -175,4 +176,93 @@ namespace upnp {
    * @param ports UDP ports to remove, typically `upnp_ports_to_remove(...)`.
    */
   void remove_ports_async(std::set<std::uint16_t> ports);
+
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Test seam: a fake gateway (IGD) with an in-memory mapping store.
+   *
+   * While a fake gateway is installed, every gateway call of this module acts on the store instead of the network:
+   * discovery (the 2 s step of `start()`'s mapping thread and of `remove_ports_async`'s worker) finds one connected
+   * gateway at once; adding a mapping (`UPNP_AddPortMapping`) inserts or refreshes an entry; deleting one
+   * (`UPNP_DeletePortMapping`) erases it, and deleting a missing entry counts as removed ("no such entry"); listing
+   * returns the entries. So `start()`'s guard (map, refresh, and on destruction remove under the CURRENT
+   * `unmap_scope()`: `all` removes the TCP and UDP entries of the plan, `udp_only` only the UDP entries, `none`
+   * nothing) and `remove_ports_async` (UDP entries only, never an entry of this process's own plan) both act on the
+   * store. With no fake gateway installed everything behaves as in production. All functions below are thread-safe.
+   *
+   * A blind test of a post-`COMMIT` rollback asserts the FINAL store: after `wait_idle_for_test()` returned `true`, the
+   * old process's TCP and UDP entries are present, the new base's UDP entries (what the killed new process mapped) are
+   * gone, and with equal bases the store is unchanged by the cleanup.
+   */
+  namespace testing {
+    /**
+     * @brief One entry of the fake gateway's store.
+     */
+    struct fake_mapping_t {
+      std::uint16_t port;  ///< Port (the same on the LAN and the WAN side).
+      bool tcp;  ///< `true` for TCP, `false` for UDP.
+
+      /**
+       * @brief Order by port, then protocol, so a test can compare stores.
+       *
+       * @param other Other entry.
+       * @return `true` when this entry sorts first.
+       */
+      bool operator<(const fake_mapping_t &other) const {
+        return port != other.port ? port < other.port : tcp < other.tcp;
+      }
+
+      /**
+       * @brief Equality of both fields.
+       *
+       * @param other Other entry.
+       * @return `true` when equal.
+       */
+      bool operator==(const fake_mapping_t &other) const {
+        return port == other.port && tcp == other.tcp;
+      }
+    };
+
+    /**
+     * @brief Install the fake gateway with the given entries (replacing any earlier fake and its store).
+     *
+     * @param initial Entries present at the start (for example what the other process mapped).
+     */
+    void install_fake_igd(const std::set<fake_mapping_t> &initial = {});
+
+    /**
+     * @brief Remove the fake gateway; the store is discarded and production behaviour returns.
+     */
+    void remove_fake_igd();
+
+    /**
+     * @brief Add entries to the installed fake store (as a second process mapping on the same gateway would). Does
+     * nothing when no fake is installed.
+     *
+     * @param entries Entries to add.
+     */
+    void fake_igd_add(const std::set<fake_mapping_t> &entries);
+
+    /**
+     * @brief The current store.
+     *
+     * @return A copy of the entries, ordered; empty when no fake is installed.
+     */
+    std::set<fake_mapping_t> fake_igd_mappings();
+
+    /**
+     * @brief Wait until the background worker of `remove_ports_async` has finished every queued call.
+     *
+     * @param timeout Longest wait.
+     * @return `true` when the worker is idle (also when nothing was ever queued); `false` on timeout.
+     */
+    bool wait_idle_for_test(std::chrono::milliseconds timeout);
+
+    /**
+     * @brief Forget the state of this module: the plan of `start()` (so `start()` may be called again in a test), the
+     * unmap scope (back to `all`), and the worker's queue (waits for it to go idle first). Keeps the installed fake.
+     */
+    void reset_upnp_for_test();
+  }  // namespace testing
+#endif
 }  // namespace upnp

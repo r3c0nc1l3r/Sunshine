@@ -235,7 +235,8 @@ namespace handoff {
   };
 
   /**
-   * @brief Where the drain controller is. Only moves forward, except `cancelled`/`idle` as described.
+   * @brief Where the drain controller is. It moves `idle`, `draining`, `exiting`, `done`; the only way back is
+   * `cancel()` from `draining` to `idle`, after which `begin()` starts a fresh cycle.
    */
   enum class drain_phase_e {
     idle,  ///< `begin()` was not called (or `cancel()` ended a drain that had not started its exit).
@@ -277,8 +278,8 @@ namespace handoff {
      * @brief End and join every session of this process with the given reason. Default:
      * `rtsp_stream::terminate_sessions(reason)`.
      *
-     * Called on the controller thread, under no controller lock. Bounded by the session join guard (10 s per session
-     * that does not stop), which is why the forced-shutdown limit is armed only after it returned.
+     * Called on the controller thread, under no controller lock. Bounded per session by the session join guard (10 s for
+     * each session that does not stop), which is why the forced-shutdown limit is armed only after it returned.
      */
     std::function<void(stream::stop_reason_e)> end_sessions;
 
@@ -367,13 +368,22 @@ namespace handoff {
    *
    * ## Overlap rules
    *
-   * - `begin()` twice: the second call changes nothing (the first switch time wins).
+   * - `begin()` twice in one cycle: the second call changes nothing (the first switch time wins).
+   * - `begin()` after `cancel()` (the rollback made this process the active one again, and a later attempt switched
+   *   again) starts a fresh cycle: the cancel flag is cleared, `handed_over` is false again, the latch of an earlier
+   *   deadline is gone, and the deadline is the new `switch_time + deadline_s`. A `begin()` while `exiting` or `done`
+   *   changes nothing.
    * - `handed_over()` before `begin()`: remembered; takes effect at `begin()`.
-   * - `cancel()` while `phase()` is `draining`: stops the thread and returns it to `idle` (the rollback and the shutdown
-   *   path). While `exiting` or `done`: returns `false` at once and stops nothing (the exit is committed).
+   * - `cancel()` while `phase()` is `draining`: disarms the deadline timer, any armed limit (none can be armed before
+   *   the exit starts) and the exit, joins the thread and returns to `idle` (the rollback and the shutdown path). While
+   *   `exiting` or `done`: returns `false` at once and stops nothing (the exit is committed).
+   * - `on_limit_expired()` is a no-op unless this controller's exit sequence armed the limit in its current cycle (a
+   *   call after `cancel()`, before any `begin()`, or from an earlier cycle's task does nothing and logs nothing).
    * - A rollback after `handed_over()` is impossible (the old side never rolls back after a successful read-back), so
    *   `handed_over()` followed by `cancel()` happens only at shutdown.
-   * - The notifier is independent: a long `end_sessions` does not delay it.
+   * - The notifier is independent and keeps running through `begin()`, `cancel()` and the exit: a long `end_sessions` does
+   *   not delay it. After a `cancel()` (the rollback) the process is no longer draining (`runtime().mode()` is `normal`
+   *   again), so the notifier's next passes no longer send `HANDOFF_STATE`; it goes on writing the session count.
    */
   class drain_controller_t {
   public:

@@ -1,7 +1,8 @@
 /**
  * @file src/handoff/coordinator.h
  * @brief The old side's glue: the control handler, `sunshine_old_ops_t`, `pidfd_child_t`, the spawn request, the
- * cooldown, the post-handover wiring, the listener registry and the new side's peer-link wiring.
+ * cooldown, the post-handover wiring and the listener registry. The new side's peer-link wiring is
+ * `post_commit_t` in `entry.h`.
  *
  * See `docs/drain-handoff.md`, steps 1 to 8, "Stopping, restarting and quitting" and "The control socket". Linux only:
  * include it only from Linux code. Everything here is glue. The order of the switch is in `old_side.h`, the refusal
@@ -37,13 +38,13 @@
  *   operations, on its own handler threads. `revocation_poller_t`'s callback does the same on the poller thread.
  *   Neither is ever called by the coordinator with such a lock held. `stop()` of either is called with no
  *   Sunshine lock held.
- * - `peer_link_t::deliver()` and `peer_link_t::on_channel_closed()` run on the channel reader's worker thread, or (for
- *   `on_channel_closed()`) on the pidfd watcher thread. Neither takes a Sunshine lock.
+ * - The active process's peer link (`peer_link_t`, its channel reader and pidfd watcher) is not part of this header:
+ *   `post_commit_t` of `entry.h` is its single owner.
  *
  * ## Test seams
  *
  * Under `SUNSHINE_TESTS` every clock, spawn, channel creation, module call and thread-start of the handler is
- * injectable (`coordinator_env_t`, `old_ops_seams_t`, `child_seams_t`, `peer_glue_seams_t`), so the tests need no real
+ * injectable (`coordinator_env_t`, `old_ops_seams_t`, `child_seams_t`), so the tests need no real
  * process, systemd, display, GPU, Avahi, IGD or network, and never exit the test binary. The listener registry
  * (`listeners()`) is the seam of the four servers: tests register fakes there.
  */
@@ -457,7 +458,12 @@ namespace handoff {
    *   to `upnp::unmap_scope_e::none` when the new base equals this process's own base (`hooks::udp_base()`), else
    *   `udp_only`, with `upnp::set_unmap_scope`. The scope is therefore set before `COMMIT` can be sent, so it holds on
    *   every later path in which this process exits (see the UPnP rule below). `unfreeze()`: the reverse
-   *   (`set_state_frozen(false)`, `set_frozen(false)`) and the scope back to `all`.
+   *   (`set_state_frozen(false)`, `set_frozen(false)`) and the scope back to `all`. Whatever fails or is skipped in
+   *   the rollback (for example `reload_after_rollback()` returning `false`), `unfreeze()` and `leave_drain_mode()` each
+   *   restore `all` unconditionally (idempotent); and the failed-attempt cleanup of the run thread (below) sets `all`
+   *   once more for the outcome `rolled_back` and for a failure before `COMMIT` (the process is the only active one), but not
+   *   for `handed_over` and not for a `shutdown` after `COMMIT` (a new process may hold the shared mappings), so no
+   *   rollback path leaves `udp_only` behind.
    * - `withdraw_mdns(timeout)`: `mdns_holder().withdraw(timeout)`. `publish_mdns()`: `mdns_holder().start(false)`; a `false`
    *   logs a Warning.
    * - `remove_tray()`: `system_tray::suspend(tray_suspend_timeout)`; `false` logs a Warning and the switch goes on.
@@ -625,7 +631,13 @@ namespace handoff {
    * Called by the control server with the peer pid (0 when unknown). It returns the reply the server writes. It performs
    * these steps in this order and stops at the first that ends the request:
    *
-   * 1. **Claim.** An atomic claim of "an attempt is running" is taken. If it is already taken (another `handle()` call
+   * 1. **Kill pending, then claim.** First, before the claim is looked at: when the instance state of this process is
+   *    `kill_pending` (`runtime().instance_current()->handoff`; a rollback is waiting for the new process to exit and still
+   *    holds the claim), the answer is `refused` `refusal_reason::kill_pending` (never `in_progress`), logged as a
+   *    Warning with the peer pid. It is never retried by the coordinator and nothing clears it automatically; the state
+   *    ends only when the rollback's kill completes (the pending `SIGKILL` takes effect), or by the operator path of the
+   *    spec's runbook "Operator runbook: `kill_pending`": in an idle window `systemctl stop` the unit and then
+   *    `systemctl start` it (a process in `D` state stays until the kernel releases it). Then the claim: an atomic claim of "an attempt is running" is taken. If it is already taken (another `handle()` call
    *    overlaps this one, or an attempt's run thread has not finished, or the process has handed over), the answer is
    *    `refused` with `refusal_reason::in_progress` (`coordinator_reason::draining` after a handover) at once. No
    *    gatherer is called, the cooldown is not touched, and the Warning of `log_refusal()` is written. The claim is
@@ -703,7 +715,7 @@ namespace handoff {
    * After any failure after step 7 the coordinator, in this order, with no lock held: stops the responder (it is discarded: a later attempt constructs a new one,
    * and `end_all.reset()` runs only after it was stopped) and the shutdown
    * watcher, closes the channel and `runtime().set_channel(nullptr)`, re-arms the cooldown, `runtime().
-   * set_handoff_in_progress(false)`, releases the claim. The old side has already done the rollback effects
+   * set_handoff_in_progress(false)`, sets the UPnP scope `all` where `freeze()` describes (rolled back or failed before `COMMIT`), releases the claim. The old side has already done the rollback effects
    * (`old_side_t::run()` does them before it returns). A failure before the run thread starts answers the helper
    * `failed <reason>` and logs an Error with the same reason.
    *
@@ -726,6 +738,10 @@ namespace handoff {
    *   the request arrived after step 2, kills the child first (step 9) and answers `failed`.
    * - During the switch (run thread started, before `GO`): the watcher calls `old_side_t::request_shutdown()`; the old side
    *   rolls back kill-first, answers the helper `failed` if it is still waiting, and `run()` returns `shutdown`.
+   * - While a rollback is already running (a failure, a hung child or a lost channel started it, in any stage): the
+   *   shutdown does not interrupt it. The rollback finishes, kill-first and reap included, with its effects, and only
+   *   then does `run()` return (`old_side.h`: a shutdown request makes `run()` return `shutdown`, never in the middle of a
+   *   rollback that has begun). `join_attempt()` bounds the wait.
    * - In the rollback window (after `GO`): `old_side_t::request_shutdown()` makes `run()` return `shutdown` promptly, with
    *   no handover and no rollback; the helper was already answered `committed` (or, if not, gets
    *   `coordinator_reason::no_outcome`). The run thread then only does the failed-attempt cleanup without re-arming. The
@@ -737,8 +753,9 @@ namespace handoff {
    *   `proc` guard).
    * A refused terminate permission (`terminate.h`) skips `terminate()` only for an adopted app; this header changes
    * nothing there. `stop()` first marks the coordinator stopping (new `handle()` calls are refused), then forwards the
-   * shutdown to a running attempt and joins its threads. The caller stops the control server after `request_shutdown()`
-   * and before `stop()`, as `control_server_t::stop()` requires.
+   * shutdown to a running attempt and joins its threads (normally already done by `join_attempt()`, which `main` calls
+   * before the `proc` guard). The caller stops the control server (`stop_control()`) after `request_shutdown()` and before
+   * `stop()`, as `control_server_t::stop()` requires.
    *
    * ## Recorded host sink
    *
@@ -790,10 +807,49 @@ namespace handoff {
     control_reply_t handle(pid_t peer_pid);
 
     /**
+     * @brief Start the control server on `path` with `handler()`. Both a normal start and the new side's `on_main()`
+     * (`sunshine_new_ops_t`'s `start_control_server`) use it.
+     *
+     * Called only when the feature is enabled (`runtime().enabled()`), never in a handoff-started process before
+     * `MAIN`. In a normal start `main` calls it after `open_instance_file()` and before `READY=1` (`entry.h`). The path is
+     * `control_socket_path(runtime_dir, getpid())` (`control.h`), which is `$RUNTIME_DIRECTORY/control/<pid>.sock` when
+     * `RUNTIME_DIRECTORY` is set (system unit, `RuntimeDirectory=sunshine`), else
+     * `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock` (user unit). Idempotent: a second call while running returns `true`
+     * and changes nothing. A failure to listen is logged as an Error and does not stop the process (the helper then
+     * fails to connect).
+     *
+     * @param path Socket path.
+     * @return `true` when the server is listening; `false` after a failure or after `request_shutdown()`/`stop()`.
+     */
+    bool start_control(const std::string &path);
+
+    /**
+     * @brief Stop the control server (`control_server_t::stop()`). Idempotent; safe without `start_control()`. Call it
+     * after `request_shutdown()` (which makes a running handler return) and before `stop()`.
+     */
+    void stop_control();
+
+    /**
      * @brief Forward a shutdown to a running attempt (`old_side_t::request_shutdown()`) and refuse new requests.
      * Idempotent; does not wait.
      */
     void request_shutdown();
+
+    /**
+     * @brief Wait for the current attempt's run thread to end, bounded.
+     *
+     * `main`'s shutdown calls it right after `request_shutdown()` and `stop_control()`, BEFORE the `proc` deinit guard
+     * (`entry.h`, step 18), so no old-side operation (kill-first, rollback effects, the app take-back) can run
+     * concurrently with that guard. Only the responder, the revocation poller, the channel reader and the channel
+     * live past the guard (until `stop()`).
+     *
+     * @param timeout Longest wait; the default is 8 s: the kill-first reap (5 s) plus the rollback effects, below the 10 s
+     *        limit that the `SIGTERM` handler armed.
+     * @return `true` when no attempt was running or it ended in time. `false` on expiry: an Error is logged ("the
+     *         handoff attempt did not finish within <n> s at shutdown") and the caller goes on (the 10 s limit still
+     *         applies); the run thread is then joined by `stop()`.
+     */
+    bool join_attempt(std::chrono::milliseconds timeout = std::chrono::milliseconds {8000});
 
     /**
      * @brief Stop everything this object runs, in this order: refuse new requests, forward the shutdown, join the run thread
@@ -801,7 +857,8 @@ namespace handoff {
      * handler threads, bounded by the session join guard of 10 s), close the channel. Idempotent.
      *
      * Must be called after the sessions of a draining process have been ended and joined (so that a pending `END_ALL` is
-     * answered), and after `main`'s `proc` shutdown guard in an active process.
+     * answered), and after `main`'s `proc` shutdown guard in an active process. The run thread was already joined by
+     * `join_attempt()`; what lives past the guard is the responder, the poller, the reader and the channel.
      */
     void stop();
 
@@ -871,115 +928,6 @@ namespace handoff {
     std::thread _run_thread;  ///< The run thread of the current or last attempt.
 #ifdef SUNSHINE_TESTS
     coordinator_env_t _env;  ///< Test replacements.
-#endif
-  };
-
-  // ---------------------------------------------------------------------------------------------------------------
-  // The new side's peer link (the active process after COMMIT)
-  // ---------------------------------------------------------------------------------------------------------------
-
-#ifdef SUNSHINE_TESTS
-  /**
-   * @brief Test-only replacements of `peer_link_glue_t`.
-   */
-  struct peer_glue_seams_t {
-    runtime_t *runtime {nullptr};  ///< `&handoff::runtime()` (where `set_peer` is called).
-  };
-#endif
-
-  /**
-   * @brief Wires a `peer_link_t` to the channel and the old process's pidfd. Created by the new side at `COMMIT`.
-   *
-   * Requirements of `peer_link.h` that this class carries out:
-   *
-   * - `start()` creates one `peer_link_t(channel, link_pidfd)`, where `link_pidfd` is the pidfd the glue received in
-   *   `HELLO`; the link owns it. The glue keeps its own duplicate (`dup`, `FD_CLOEXEC`) for the watcher, so the two never
-   *   close the same descriptor. It calls `runtime().set_peer(link)`.
-   * - It starts a `channel_reader_t(channel, answer_pings=true, on_message, on_close)`. `on_message` first calls
-   *   `link->deliver(received.message)`; when that returns `false` and the message is `MAIN` it calls the `on_main`
-   *   callback (once); every other message is dropped with a Debug line. An fd attached to a message is closed by the
-   *   handler on every path (the link does not own it). `on_close` calls `link->on_channel_closed()` and logs a Warning
-   *   ("the channel to the draining process closed; its sessions can no longer be listed or closed").
-   * - A watcher thread polls the duplicate pidfd and a stop eventfd. When the pidfd becomes readable (the draining
-   *   process is gone or a zombie) it calls `link->on_channel_closed()` once, so callers waiting in `end_all`, `list`,
-   *   `close` or `close_cert` fail promptly instead of running to their timeout.
-   * - `on_channel_closed()` is therefore called on channel EOF or error (reader worker thread) and on pidfd readiness
-   *   (watcher thread); it is idempotent and takes no Sunshine lock.
-   * - `stop()` stops the reader (which joins its worker, so `deliver` and `on_channel_closed` never run on a destroyed
-   *   link), stops and joins the watcher, calls `runtime().set_peer(nullptr)` and only then releases the link. Safe to call
-   *   twice. After `MAIN` the glue is NOT stopped: the active process keeps the link for the life of the draining
-   *   process; it is stopped at the active process's shutdown, after the `proc` deinit guard (spec: the channel is closed
-   *   after that guard has run).
-   *
-   * Thread-safety: `start()` and `stop()` are called by the new side's thread (the `COMMIT` path and the shutdown path),
-   * never from the reader's worker or the watcher. `link()` is safe from any thread.
-   */
-  class peer_link_glue_t {
-  public:
-    /**
-     * @brief Create the glue. Nothing runs until `start()`.
-     *
-     * @param channel The new process's end of the channel; shared with the reader and the link.
-     * @param old_pidfd The old process's pidfd from `HELLO`; this object takes ownership (it is handed to the link).
-     * @param on_main Called once, on the reader's worker thread, when `MAIN` arrives. It must not call `stop()`.
-     */
-    peer_link_glue_t(std::shared_ptr<channel_t> channel, int old_pidfd, std::function<void()> on_main);
-
-    /**
-     * @brief Calls `stop()`.
-     */
-    ~peer_link_glue_t();
-
-    peer_link_glue_t(const peer_link_glue_t &) = delete;  ///< Not copyable.
-    peer_link_glue_t &operator=(const peer_link_glue_t &) = delete;  ///< Not copyable.
-
-    /**
-     * @brief Create the link, register it with the runtime and start the reader and the watcher. Idempotent.
-     *
-     * @return `true` when running; `false` when a thread could not be started (an Error is logged and nothing stays
-     *         registered).
-     */
-    bool start();
-
-    /**
-     * @brief Stop in the order of the class comment. Idempotent.
-     */
-    void stop();
-
-    /**
-     * @brief The link.
-     *
-     * @return The link, or null before `start()` and after `stop()`.
-     */
-    std::shared_ptr<peer_link_t> link() const;
-
-#ifdef SUNSHINE_TESTS
-    /**
-     * @brief Test-only constructor.
-     *
-     * @param channel The new process's end of the channel.
-     * @param old_pidfd The pidfd (or a pollable test fd).
-     * @param on_main Called once when `MAIN` arrives.
-     * @param seams Replacements.
-     */
-    peer_link_glue_t(std::shared_ptr<channel_t> channel, int old_pidfd, std::function<void()> on_main, peer_glue_seams_t seams);
-#endif
-
-  private:
-    std::shared_ptr<channel_t> _channel;  ///< Channel.
-    int _link_pidfd;  ///< Pidfd handed to the link.
-    int _watch_pidfd {-1};  ///< Duplicate polled by the watcher.
-    int _stop_fd {-1};  ///< Eventfd that wakes the watcher.
-    std::function<void()> _on_main;  ///< `MAIN` callback.
-    mutable std::mutex _mutex;  ///< Guards `_link`, `_started` and `_stopped`.
-    std::shared_ptr<peer_link_t> _link;  ///< The link.
-    std::unique_ptr<channel_reader_t> _reader;  ///< Reader.
-    std::thread _watcher;  ///< Pidfd watcher.
-    bool _started {false};  ///< `start()` succeeded.
-    bool _stopped {false};  ///< `stop()` ran.
-    std::atomic<bool> _main_seen {false};  ///< `on_main` was called.
-#ifdef SUNSHINE_TESTS
-    peer_glue_seams_t _seams;  ///< Test replacements.
 #endif
   };
 }  // namespace handoff

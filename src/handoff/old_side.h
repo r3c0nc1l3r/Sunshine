@@ -317,6 +317,8 @@ namespace handoff {
      * no handover (no `close_socket_copies`, no `MAIN`), no rollback and no rollback effects. With `systemctl stop`
      * both processes get `SIGTERM`; a `SIGTERM` to the old process alone inside the window ends the unit, as a crash
      * of the main process would (spec step 6).
+     * A rollback that has already begun is not interrupted: it finishes, kill-first and reap included, and then `run()`
+     * returns (`shutdown` when the request came before the rollback ended).
      */
     void request_shutdown();
 
