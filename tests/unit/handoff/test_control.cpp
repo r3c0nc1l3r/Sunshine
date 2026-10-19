@@ -17,7 +17,10 @@
   #include <cstring>
   #include <filesystem>
   #include <fstream>
+  #include <functional>
+  #include <future>
   #include <iterator>
+  #include <memory>
   #include <optional>
   #include <poll.h>
   #include <string>
@@ -753,6 +756,354 @@ TEST_F(HandoffControlTest, ServerDestructorStopsAndUnlinks) {
       << "start must succeed, error: " << error;
   }
   EXPECT_FALSE(fs::exists(path)) << "the destructor must stop the server and unlink the socket";
+}
+
+namespace {
+
+  /**
+   * @brief Poll `pred` every 5 ms until it is true or `timeout` passes.
+   *
+   * @return `true` when `pred` became true in time.
+   */
+  template<typename Pred>
+  bool wait_until(Pred pred, std::chrono::milliseconds timeout) {
+    auto end = std::chrono::steady_clock::now() + timeout;
+    while (!pred()) {
+      if (std::chrono::steady_clock::now() >= end) {
+        return false;
+      }
+      std::this_thread::sleep_for(5ms);
+    }
+    return true;
+  }
+
+  /**
+   * @brief Run `fn` on a detached thread and report whether it finished within `timeout`.
+   *
+   * Used so a blocked call fails the test instead of hanging it. The thread keeps its captures alive through the
+   * `done` promise it owns.
+   */
+  bool run_bounded(std::function<void()> fn, std::chrono::milliseconds timeout) {
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> finished = done->get_future();
+    std::thread([fn = std::move(fn), done] {
+      fn();
+      done->set_value();
+    }).detach();
+    return finished.wait_for(timeout) == std::future_status::ready;
+  }
+
+}  // namespace
+
+TEST_F(HandoffControlTest, EncodeReplacesCarriageReturnAndNewlineWithSpaces) {
+  EXPECT_EQ(hf::encode_reply({hf::reply_kind_e::refused, "a\r\nb\rc\n", 0, 0}), "refused a  b c \n")
+    << "both \\r and \\n inside a reason must be replaced by spaces, leaving one terminating newline";
+}
+
+TEST_F(HandoffControlTest, EncodeCutsLongReasonToThousandBytesAndRoundTrips) {
+  std::string reason(5000, 'x');
+  std::string line = hf::encode_reply({hf::reply_kind_e::failed, reason, 0, 0});
+  EXPECT_EQ(line, "failed " + std::string(1000, 'x') + "\n")
+    << "a reason longer than 1000 bytes must be cut to its first 1000 bytes";
+  auto parsed = hf::parse_reply(line);
+  ASSERT_TRUE(parsed.has_value()) << "the cut line must still parse";
+  EXPECT_EQ(parsed->kind, hf::reply_kind_e::failed) << "the kind must survive the cut";
+  EXPECT_EQ(parsed->reason, std::string(1000, 'x')) << "the parsed reason must be the 1000-byte cut";
+}
+
+TEST_F(HandoffControlTest, HelperEnvDefaultReplyTimeoutIs65Seconds) {
+  hf::helper_env_t env {};
+  EXPECT_EQ(env.reply_timeout, 65000ms) << "the default reply timeout must be 65000 ms";
+}
+
+TEST_F(HandoffControlTest, HelperDrainingWithHandoverFailedReportsHandoverFailing) {
+  temp_dir_t tmp;
+  write_instance(tmp.path, make_instance(4242, 1, hf::role_e::draining, hf::state_e::handover_failed));
+  std::string err;
+  EXPECT_EQ(hf::run_helper({"4242"}, make_env(tmp.path), err), hf::helper_exit_e::refused)
+    << "role draining with state handover_failed must give exit 1";
+  EXPECT_NE(err.find("handover failing"), std::string::npos)
+    << "state handover_failed must be reported before the draining role, got: " << err;
+}
+
+TEST_F(HandoffControlTest, HelperDrainingWithKillPendingReportsKillPending) {
+  temp_dir_t tmp;
+  write_instance(tmp.path, make_instance(4242, 1, hf::role_e::draining, hf::state_e::kill_pending));
+  std::string err;
+  EXPECT_EQ(hf::run_helper({"4242"}, make_env(tmp.path), err), hf::helper_exit_e::refused)
+    << "role draining with state kill_pending must give exit 1";
+  EXPECT_NE(err.find("kill pending"), std::string::npos)
+    << "state kill_pending must be reported before the draining role, got: " << err;
+}
+
+TEST_F(HandoffControlTest, HelperDrainingWithDrainStateReportsDrainInProgress) {
+  temp_dir_t tmp;
+  write_instance(tmp.path, make_instance(4242, 1, hf::role_e::draining, hf::state_e::draining));
+  std::string err;
+  EXPECT_EQ(hf::run_helper({"4242"}, make_env(tmp.path), err), hf::helper_exit_e::refused)
+    << "role draining with state draining must give exit 1";
+  EXPECT_NE(err.find("a drain is in progress"), std::string::npos)
+    << "role draining must give \"a drain is in progress\", got: " << err;
+}
+
+TEST_F(HandoffControlTest, ServerCloseListenerFromHandlerKeepsReplyAndRemovesPath) {
+  temp_dir_t tmp;
+  fs::path path = hf::control_socket_path(tmp.path, 4242);
+  hf::control_server_t server;
+  std::string error;
+  ASSERT_TRUE(server.start(path, [&](pid_t) -> hf::control_reply_t {
+    server.close_listener();
+    return {hf::reply_kind_e::refused, "closing", 0, 0};
+  },
+                           &error))
+    << "start must succeed, error: " << error;
+  auto line = talk(path, "handoff\n");
+  ASSERT_TRUE(line.has_value()) << "the client whose handler closed the listener must still get a reply";
+  EXPECT_EQ(*line, "refused closing\n") << "the reply written after close_listener() must be the handler's reply";
+  EXPECT_FALSE(fs::exists(path)) << "close_listener() must remove the socket path";
+  EXPECT_FALSE(talk(path, "handoff\n").has_value()) << "a new connect after close_listener() must fail";
+}
+
+TEST_F(HandoffControlTest, ServerReopenListenerFromHandlerServesAfterReturn) {
+  temp_dir_t tmp;
+  fs::path path = hf::control_socket_path(tmp.path, 4242);
+  hf::control_server_t server;
+  std::atomic<int> calls {0};
+  std::atomic<bool> reopened {false};
+  std::string error;
+  ASSERT_TRUE(server.start(path, [&](pid_t) -> hf::control_reply_t {
+    int n = ++calls;
+    if (n == 1) {
+      server.close_listener();
+      std::string reopen_error;
+      reopened = server.reopen_listener(&reopen_error);
+      return {hf::reply_kind_e::refused, "first", 0, 0};
+    }
+    return {hf::reply_kind_e::refused, "second", 0, 0};
+  },
+                           &error))
+    << "start must succeed, error: " << error;
+  auto first = talk(path, "handoff\n");
+  ASSERT_TRUE(first.has_value()) << "the first connection must get the first handler's reply";
+  EXPECT_EQ(*first, "refused first\n") << "the first reply must come from the first handler call";
+  EXPECT_TRUE(reopened.load()) << "reopen_listener() after close_listener() in the handler must return true";
+  EXPECT_TRUE(fs::exists(path)) << "after reopen_listener() the socket path must exist again";
+  auto second = talk(path, "handoff\n");
+  ASSERT_TRUE(second.has_value()) << "a new connection must be served once the first handler has returned";
+  EXPECT_EQ(*second, "refused second\n") << "the second connection must reach the handler again";
+  EXPECT_EQ(calls.load(), 2) << "the handler must have run exactly twice";
+}
+
+TEST_F(HandoffControlTest, ServerStopFromHandlerReturnsAndReplyIsDelivered) {
+  temp_dir_t tmp;
+  fs::path path = hf::control_socket_path(tmp.path, 4242);
+  hf::control_server_t server;
+  std::atomic<bool> stop_threw {false};
+  std::string error;
+  ASSERT_TRUE(server.start(path, [&](pid_t) -> hf::control_reply_t {
+    try {
+      server.stop();
+    } catch (...) {
+      stop_threw = true;
+    }
+    return {hf::reply_kind_e::refused, "bye", 0, 0};
+  },
+                           &error))
+    << "start must succeed, error: " << error;
+  auto line = talk(path, "handoff\n");
+  ASSERT_TRUE(line.has_value()) << "the client must get a reply when the handler calls stop()";
+  EXPECT_EQ(*line, "refused bye\n") << "the handler's reply must be delivered, not an internal error line";
+  EXPECT_FALSE(stop_threw.load()) << "stop() called from the handler must not throw";
+  EXPECT_TRUE(run_bounded([&] {
+    server.stop();
+  },
+                          2000ms))
+    << "a later stop() from the test thread must return, joining the server thread";
+}
+
+TEST_F(HandoffControlTest, ServerStopFromOtherThreadWaitsForBlockedHandler) {
+  temp_dir_t tmp;
+  fs::path path = hf::control_socket_path(tmp.path, 4242);
+  hf::control_server_t server;
+  std::atomic<bool> entered {false};
+  std::atomic<bool> released {false};
+  std::string error;
+  ASSERT_TRUE(server.start(path, [&](pid_t) -> hf::control_reply_t {
+    entered = true;
+    // Bounded: gives up after 3 s even if the test never releases it.
+    for (int i = 0; i < 300 && !released.load(); ++i) {
+      std::this_thread::sleep_for(10ms);
+    }
+    return {hf::reply_kind_e::refused, "late", 0, 0};
+  },
+                           &error))
+    << "start must succeed, error: " << error;
+
+  std::optional<std::string> reply;
+  std::thread client([&] {
+    reply = talk(path, "handoff\n");
+  });
+  bool handler_started = wait_until([&] {
+    return entered.load();
+  },
+                                    2000ms);
+  if (!handler_started) {
+    released = true;
+    client.join();
+    FAIL() << "the handler must start within 2 s of the client connecting";
+  }
+
+  std::atomic<bool> stop_done {false};
+  std::thread stopper([&] {
+    server.stop();
+    stop_done = true;
+  });
+  std::this_thread::sleep_for(200ms);
+  EXPECT_FALSE(stop_done.load()) << "stop() from another thread must not return while the handler still runs";
+
+  released = true;
+  bool finished = wait_until([&] {
+    return stop_done.load();
+  },
+                             2000ms);
+  client.join();
+  if (finished) {
+    stopper.join();
+  } else {
+    stopper.detach();
+  }
+  EXPECT_TRUE(finished) << "stop() must return once the blocked handler has returned";
+  ASSERT_TRUE(reply.has_value()) << "the client blocked in the handler must still get its reply";
+  EXPECT_EQ(*reply, "refused late\n") << "the reply of the handler that stop() waited for must be delivered";
+}
+
+TEST_F(HandoffControlTest, ServerCloseListenerTwiceAndWithoutStartIsSafe) {
+  hf::control_server_t idle;
+  EXPECT_NO_THROW(idle.close_listener()) << "close_listener() without start() must be safe";
+  EXPECT_NO_THROW(idle.close_listener()) << "a second close_listener() without start() must be safe";
+
+  temp_dir_t tmp;
+  fs::path path = hf::control_socket_path(tmp.path, 4242);
+  hf::control_server_t server;
+  std::string error;
+  ASSERT_TRUE(server.start(path, [](pid_t) {
+    return hf::control_reply_t {hf::reply_kind_e::refused, "x", 0, 0};
+  },
+                           &error))
+    << "start must succeed, error: " << error;
+  EXPECT_NO_THROW(server.close_listener()) << "the first close_listener() must succeed";
+  EXPECT_NO_THROW(server.close_listener()) << "a second close_listener() must be safe";
+  EXPECT_FALSE(fs::exists(path)) << "close_listener() must remove the socket path";
+}
+
+TEST_F(HandoffControlTest, ServerReopenListenerFailsBeforeStartAndAfterStop) {
+  hf::control_server_t idle;
+  std::string error;
+  EXPECT_FALSE(idle.reopen_listener(&error)) << "reopen_listener() before start() must return false";
+
+  temp_dir_t tmp;
+  fs::path path = hf::control_socket_path(tmp.path, 4242);
+  hf::control_server_t server;
+  ASSERT_TRUE(server.start(path, [](pid_t) {
+    return hf::control_reply_t {hf::reply_kind_e::refused, "x", 0, 0};
+  },
+                           &error))
+    << "start must succeed, error: " << error;
+  server.stop();
+  EXPECT_FALSE(server.reopen_listener(&error)) << "reopen_listener() after stop() must return false";
+  EXPECT_FALSE(fs::exists(path)) << "a refused reopen must not create the socket path";
+}
+
+TEST_F(HandoffControlTest, ServerReopenListenerWhileListeningIsTrue) {
+  temp_dir_t tmp;
+  fs::path path = hf::control_socket_path(tmp.path, 4242);
+  hf::control_server_t server;
+  std::string error;
+  ASSERT_TRUE(server.start(path, [](pid_t) {
+    return hf::control_reply_t {hf::reply_kind_e::refused, "up", 0, 0};
+  },
+                           &error))
+    << "start must succeed, error: " << error;
+  EXPECT_TRUE(server.reopen_listener(&error)) << "reopen_listener() while already listening must return true";
+  auto line = talk(path, "handoff\n");
+  ASSERT_TRUE(line.has_value()) << "the server must still answer after the no-op reopen";
+  EXPECT_EQ(*line, "refused up\n") << "the handler reply must be unchanged";
+}
+
+TEST_F(HandoffControlTest, ServerCloseListenerLeavesReplacedSocketInPlace) {
+  temp_dir_t tmp;
+  fs::path path = hf::control_socket_path(tmp.path, 4242);
+  hf::control_server_t server;
+  std::string error;
+  ASSERT_TRUE(server.start(path, [](pid_t) {
+    return hf::control_reply_t {hf::reply_kind_e::refused, "x", 0, 0};
+  },
+                           &error))
+    << "start must succeed, error: " << error;
+  server.close_listener();
+  ASSERT_FALSE(fs::exists(path)) << "precondition: close_listener() removed the socket";
+
+  // Someone else binds a socket at the path after the close.
+  int other = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_GE(other, 0) << "the test must create its own socket";
+  sockaddr_un addr = make_addr(path);
+  ASSERT_EQ(bind(other, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)), 0)
+    << "the test must bind its socket at the path";
+
+  EXPECT_NO_THROW(server.close_listener()) << "a second close_listener() must be safe";
+  EXPECT_TRUE(fs::exists(path)) << "close_listener() must not unlink a socket that another process bound at the path";
+  close(other);
+}
+
+TEST_F(HandoffControlTest, ServerSecondConnectionWhileHandlerRunsIsServedAfterIt) {
+  temp_dir_t tmp;
+  fs::path path = hf::control_socket_path(tmp.path, 4242);
+  hf::control_server_t server;
+  std::atomic<int> calls {0};
+  std::atomic<bool> entered {false};
+  std::atomic<bool> released {false};
+  std::string error;
+  ASSERT_TRUE(server.start(path, [&](pid_t) -> hf::control_reply_t {
+    int n = ++calls;
+    if (n == 1) {
+      entered = true;
+      // Bounded: gives up after 3 s even if the test never releases it.
+      for (int i = 0; i < 300 && !released.load(); ++i) {
+        std::this_thread::sleep_for(10ms);
+      }
+      return {hf::reply_kind_e::refused, "first", 0, 0};
+    }
+    return {hf::reply_kind_e::refused, "second", 0, 0};
+  },
+                           &error))
+    << "start must succeed, error: " << error;
+
+  std::optional<std::string> first;
+  std::optional<std::string> second;
+  std::thread client1([&] {
+    first = talk(path, "handoff\n");
+  });
+  bool started = wait_until([&] {
+    return entered.load();
+  },
+                            2000ms);
+  if (!started) {
+    released = true;
+    client1.join();
+    FAIL() << "the first handler must start within 2 s";
+  }
+  std::thread client2([&] {
+    second = talk(path, "handoff\n");
+  });
+  std::this_thread::sleep_for(150ms);
+  released = true;
+  client1.join();
+  client2.join();
+
+  ASSERT_TRUE(first.has_value()) << "the first client must get a reply";
+  EXPECT_EQ(*first, "refused first\n") << "the first client must get the first handler's reply";
+  ASSERT_TRUE(second.has_value()) << "a connection made while a handler runs must be served after it, not dropped";
+  EXPECT_EQ(*second, "refused second\n") << "the second connection must get the second handler call's reply";
 }
 
 #endif  // __linux__

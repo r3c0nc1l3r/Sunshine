@@ -715,4 +715,106 @@ TEST_F(HandoffInstanceFileTest, WaitForActiveHonoursTimeoutWhenNoFile) {
   EXPECT_LT(elapsed, 1500ms) << "wait_for_active must not wait much longer than its timeout";
 }
 
+TEST_F(HandoffInstanceFileTest, RuntimeDirTreatsRelativeRuntimeDirectoryAsUnset) {
+  auto dir = hf::runtime_dir("relative/dir", "/run/user/1000");
+  ASSERT_TRUE(dir.has_value()) << "a relative RUNTIME_DIRECTORY must fall back to XDG_RUNTIME_DIR";
+  EXPECT_EQ(*dir, fs::path("/run/user/1000/sunshine")) << "a relative RUNTIME_DIRECTORY must count as unset";
+}
+
+TEST_F(HandoffInstanceFileTest, RuntimeDirTreatsRelativeXdgRuntimeDirAsUnset) {
+  EXPECT_FALSE(hf::runtime_dir("", "relative").has_value())
+    << "a relative XDG_RUNTIME_DIR must count as unset, giving nullopt when RUNTIME_DIRECTORY is also unset";
+  EXPECT_FALSE(hf::runtime_dir("relative", "also/relative").has_value())
+    << "when both values are relative there is no runtime directory";
+}
+
+TEST_F(HandoffInstanceFileTest, ScanFileNamedDifferentlyFromItsPidIsUnreadable) {
+  temp_dir_t tmp;
+  fs::path dir = tmp.path / "instances";
+  write_raw(dir, "123.json", hf::to_json(make_instance(456, 1, hf::role_e::active, hf::state_e::none, 0)));
+  auto scan = hf::scan_instances(dir, [](pid_t) {
+    return std::optional<std::uint64_t>(1);
+  });
+  EXPECT_TRUE(scan.any_unreadable) << "a file named 123.json whose content pid is 456 must count as unreadable";
+}
+
+TEST_F(HandoffInstanceFileTest, WriterWritesNothingAfterRemove) {
+  temp_dir_t tmp;
+  fs::path dir = tmp.path / "instances";
+  hf::instance_writer_t writer(dir, make_instance(4242, 99, hf::role_e::active, hf::state_e::none, 0));
+  ASSERT_TRUE(writer.write()) << "precondition: the first write must succeed";
+  writer.remove();
+  EXPECT_FALSE(writer.set_sessions(5)) << "set_sessions() after remove() must return false";
+  EXPECT_FALSE(writer.set_role(hf::role_e::draining)) << "set_role() after remove() must return false";
+  EXPECT_FALSE(writer.set_state(hf::state_e::kill_pending)) << "set_state() after remove() must return false";
+  EXPECT_FALSE(writer.write()) << "write() after remove() must return false";
+  EXPECT_FALSE(fs::exists(dir / "4242.json")) << "no instance file may reappear after remove()";
+}
+
+TEST_F(HandoffInstanceFileTest, WriterDoesNotFollowSymlinkAtTempName) {
+  temp_dir_t tmp;
+  fs::path dir = tmp.path / "instances";
+  fs::create_directories(dir);
+  fs::permissions(dir, fs::perms::owner_all);
+  fs::path victim = tmp.path / "victim.txt";
+  {
+    std::ofstream out(victim);
+    out << "original";
+  }
+  fs::create_symlink(victim, dir / "4242.json.tmp");
+
+  hf::instance_writer_t writer(dir, make_instance(4242, 99, hf::role_e::active, hf::state_e::none, 0));
+  bool ok = writer.write();  // Either outcome is acceptable; writing through the symlink is not.
+  std::ifstream in(victim);
+  std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  EXPECT_EQ(content, "original") << "the symlink target must never be written through the temporary name";
+  if (ok) {
+    std::ifstream file(dir / "4242.json");
+    std::string json((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    EXPECT_TRUE(hf::parse_instance(json).has_value()) << "a successful write must leave a valid instance file";
+  }
+}
+
+TEST_F(HandoffInstanceFileTest, WrittenFileHasMode0600) {
+  temp_dir_t tmp;
+  fs::path dir = tmp.path / "instances";
+  hf::instance_writer_t writer(dir, make_instance(4242, 99, hf::role_e::active, hf::state_e::none, 0));
+  ASSERT_TRUE(writer.write()) << "precondition: write() must succeed";
+  EXPECT_EQ(fs::status(dir / "4242.json").permissions() & fs::perms::all, fs::perms::owner_read | fs::perms::owner_write)
+    << "the instance file must be created with mode 0600";
+}
+
+TEST_F(HandoffInstanceFileTest, WriteFailsWhenInstancesDirIsSymlink) {
+  temp_dir_t tmp;
+  fs::path real = tmp.path / "real";
+  fs::create_directories(real);
+  fs::create_symlink(real, tmp.path / "instances");
+  hf::instance_writer_t writer(tmp.path / "instances", make_instance(4242, 99, hf::role_e::active, hf::state_e::none, 0));
+  EXPECT_FALSE(writer.write()) << "a symlink as the instances directory must make write() fail";
+  EXPECT_TRUE(fs::is_empty(real)) << "nothing may be written through the symlinked directory";
+}
+
+TEST_F(HandoffInstanceFileTest, WriteFailsWhenInstancesDirIsGroupOrOtherWritable) {
+  temp_dir_t tmp;
+  fs::path group_dir = tmp.path / "group";
+  fs::path other_dir = tmp.path / "other";
+  fs::create_directories(group_dir);
+  fs::create_directories(other_dir);
+  fs::permissions(group_dir, fs::perms::owner_all | fs::perms::group_write, fs::perm_options::replace);
+  fs::permissions(other_dir, fs::perms::owner_all | fs::perms::others_write, fs::perm_options::replace);
+
+  hf::instance_writer_t group_writer(group_dir, make_instance(4242, 99, hf::role_e::active, hf::state_e::none, 0));
+  EXPECT_FALSE(group_writer.write()) << "a group-writable instances directory must make write() fail";
+  hf::instance_writer_t other_writer(other_dir, make_instance(4242, 99, hf::role_e::active, hf::state_e::none, 0));
+  EXPECT_FALSE(other_writer.write()) << "an other-writable instances directory must make write() fail";
+}
+
+TEST_F(HandoffInstanceFileTest, WriterCreatesMissingNestedParents) {
+  temp_dir_t tmp;
+  fs::path dir = tmp.path / "a" / "b" / "instances";
+  hf::instance_writer_t writer(dir, make_instance(4242, 99, hf::role_e::active, hf::state_e::none, 0));
+  EXPECT_TRUE(writer.write()) << "write() must create missing parent directories";
+  EXPECT_TRUE(fs::is_directory(dir)) << "the nested instances directory must exist after write()";
+}
+
 #endif  // __linux__
