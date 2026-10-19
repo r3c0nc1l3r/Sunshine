@@ -219,7 +219,8 @@ namespace handoff {
    */
   struct scan_result_t {
     bool dir_missing {false};  ///< The directory does not exist.
-    bool any_unreadable {false};  ///< At least one `*.json` file could not be read or parsed.
+    bool any_unreadable {false};  ///< A `*.json` file could not be read or parsed, or the directory could not be
+                                  ///< listed completely.
     std::vector<instance_t> live;  ///< Files whose pid is alive with the recorded start time.
     std::vector<pid_t> stale;  ///< Pids of files whose process is gone or has another start time (pid reuse).
   };
@@ -227,7 +228,10 @@ namespace handoff {
   /**
    * @brief Read every `*.json` file in the instances directory; other names are ignored. A file whose name pid differs
    * from the `pid` inside it counts as unreadable, as does one that cannot be opened or read for any reason but `ENOENT`;
-   * a file that vanishes during the scan (`ENOENT`, its process removed it) is skipped.
+   * a file that vanishes during the scan (`ENOENT`, its process removed it) is skipped. Fail closed: when the directory
+   * exists but cannot be listed completely (it is not a directory, opening it fails, or reading it fails, also in the
+   * middle of the scan), `any_unreadable` is set, so `consumer_busy()` answers busy; a partial listing is never
+   * returned as if it were complete.
    *
    * @param dir Instances directory.
    * @param start_time_of Returns a pid's current start time, or `std::nullopt` when it does not exist (tests inject
