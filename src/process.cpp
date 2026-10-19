@@ -5,10 +5,16 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <algorithm>
 #include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+  #include <cerrno>
+  #include <csignal>
+#endif
 
 // lib includes
 #include <boost/algorithm/string.hpp>
@@ -162,13 +168,13 @@ namespace proc {
       return 404;
     }
 
-    _app_id = app_id;
     _app = *iter;
+    _live.app_id.store(app_id);
     _app_prep_begin = std::begin(_app.prep_cmds);
     _app_prep_it = _app_prep_begin;
 
     // Add Stream-specific environment variables
-    _env["SUNSHINE_APP_ID"] = std::to_string(_app_id);
+    _env["SUNSHINE_APP_ID"] = std::to_string(app_id);
     _env["SUNSHINE_APP_NAME"] = _app.name;
     _env["SUNSHINE_CLIENT_NAME"] = launch_session->client_name;
     _env["SUNSHINE_CLIENT_WIDTH"] = std::to_string(launch_session->width);
@@ -213,7 +219,9 @@ namespace proc {
       terminate();
     });
 
-    for (; _app_prep_it != std::end(_app.prep_cmds); ++_app_prep_it) {
+    // The applied count is stored after each step, skipped (empty) commands included, so it always equals
+    // `_app_prep_it - _app_prep_begin` once a step is done.
+    for (; _app_prep_it != std::end(_app.prep_cmds); ++_app_prep_it, _live.applied.store(static_cast<std::uint32_t>(_app_prep_it - _app_prep_begin))) {
       auto &cmd = *_app_prep_it;
 
       // Skip empty commands
@@ -264,7 +272,7 @@ namespace proc {
 
     if (_app.cmd.empty()) {
       BOOST_LOG(info) << "Executing [Desktop]"sv;
-      placebo = true;
+      _live.placebo.store(true);
     } else {
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
                                               find_working_directory(_app.cmd, _env) :
@@ -275,6 +283,11 @@ namespace proc {
         BOOST_LOG(warning) << "Couldn't run ["sv << _app.cmd << "]: System: "sv << ec.message();
         return -1;
       }
+#ifndef _WIN32
+      if (_process_group.valid()) {
+        _live.pgid.store(static_cast<long>(_process_group.native_handle()));
+      }
+#endif
     }
 
     _app_launch_time = std::chrono::steady_clock::now();
@@ -295,19 +308,21 @@ namespace proc {
     });
 #endif
 
-    if (placebo) {
-      return _app_id;
+    if (_live.placebo.load()) {
+      // A concurrent drop_released_app() or terminate() may have set the id to -1: report 0 then, never -1.
+      int id = _live.app_id.load();
+      return id > 0 ? id : 0;
     } else if (_app.wait_all && _process_group && platf::process_group_running((std::uintptr_t) _process_group.native_handle())) {
       // The app is still running if any process in the group is still running
-      return _app_id;
+      return _live.app_id.load();
     } else if (_process.running()) {
       // The app is still running only if the initial process launched is still running
-      return _app_id;
-    } else if (_app.auto_detach && _process.native_exit_code() == 0 && std::chrono::steady_clock::now() - _app_launch_time < 5s) {
+      return _live.app_id.load();
+    } else if (_app.auto_detach && _process && _process.native_exit_code() == 0 && std::chrono::steady_clock::now() - _app_launch_time < 5s) {
       BOOST_LOG(info) << "App exited gracefully within 5 seconds of launch. Treating the app as a detached command."sv;
       BOOST_LOG(info) << "Adjust this behavior in the Applications tab or apps.json if this is not what you want."sv;
-      placebo = true;
-      return _app_id;
+      _live.placebo.store(true);
+      return _live.app_id.load();
     }
 
     // Perform cleanup actions now if needed
@@ -320,9 +335,22 @@ namespace proc {
   }
 
   void proc_t::terminate() {
+    if (_live.released.load()) {
+      // The app was released to another process: only drop the state. No undo command, no process group kill, no
+      // tray, gamepad or display revert (the other process owns all of that now).
+      _live.placebo.store(false);
+      _app_prep_it = _app_prep_begin;
+      _pipe.reset();
+      _live.app_id.store(-1);
+      _live.pgid.store(0);
+      _live.applied.store(0);
+      _live.released.store(false);
+      return;
+    }
+
     input::terminate_gamepads();
     std::error_code ec;
-    placebo = false;
+    _live.placebo.store(false);
     terminate_process_group(_process, _process_group, _app.exit_timeout);
     _process = boost::process::v1::child();
     _process_group = boost::process::v1::group();
@@ -354,7 +382,7 @@ namespace proc {
 
     _pipe.reset();
 
-    bool has_run = _app_id > 0;
+    bool has_run = _live.app_id.load() > 0;
 
     // Only show the Stopped notification if we actually have an app to stop
     // Since terminate() is always run when a new app has started
@@ -366,7 +394,10 @@ namespace proc {
       display_device::revert_configuration();
     }
 
-    _app_id = -1;
+    _live.app_id.store(-1);
+    _live.pgid.store(0);
+    _live.applied.store(0);
+    _live.released.store(false);
   }
 
   const std::vector<ctx_t> &proc_t::get_apps() const {
@@ -394,12 +425,253 @@ namespace proc {
     return _app.name;
   }
 
+  app_atomics_t::app_atomics_t(app_atomics_t &&other) noexcept:
+      app_id(other.app_id.load()),
+      placebo(other.placebo.load()),
+      pgid(other.pgid.load()),
+      applied(other.applied.load()),
+      released(other.released.load()) {
+  }
+
+  app_atomics_t &app_atomics_t::operator=(app_atomics_t &&other) noexcept {
+    if (this != &other) {
+      app_id.store(other.app_id.load());
+      placebo.store(other.placebo.load());
+      pgid.store(other.pgid.load());
+      applied.store(other.applied.load());
+      released.store(other.released.load());
+    }
+    return *this;
+  }
+
+  bool is_launch_env_name(std::string_view name) {
+    return name.starts_with("SUNSHINE_APP_"sv) || name.starts_with("SUNSHINE_CLIENT_"sv);
+  }
+
+  std::vector<std::pair<std::string, std::string>> base_env_for_digest(const boost::process::v1::environment &env) {
+    std::vector<std::pair<std::string, std::string>> result;
+
+    for (const auto &entry : env) {
+      std::string name = entry.get_name();
+      if (is_launch_env_name(name) || name == "SUNSHINE_UDP_BASE"sv || name == "SUNSHINE_GENERATION"sv || name.starts_with("SUNSHINE_HANDOFF_"sv)) {
+        continue;
+      }
+      result.emplace_back(std::move(name), entry.to_string());
+    }
+
+    // std::string compares byte-wise (unsigned), so this is a byte-wise sort by name
+    std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) {
+      return a.first < b.first;
+    });
+    return result;
+  }
+
+  std::vector<std::pair<std::string, std::string>> proc_t::digest_base_env() const {
+    return base_env_for_digest(_env);
+  }
+
+  bool proc_t::adoptable(std::string *why, const group_probe_t &probe) const {
+    if (_live.app_id.load() <= 0) {
+      return true;
+    }
+
+    if (!_live.placebo.load()) {
+      if (why) {
+        *why = "the running app is not in placebo mode";
+      }
+      return false;
+    }
+
+    long pgid = _live.pgid.load();
+    if (pgid > 1) {
+      bool present = false;
+      if (probe) {
+        present = probe(static_cast<pid_t>(pgid));
+      } else {
+#ifndef _WIN32
+        // Success or EPERM means a process is present (zombies count); ESRCH means none.
+        present = kill(-static_cast<pid_t>(pgid), 0) == 0 || errno == EPERM;
+#endif
+      }
+      if (present) {
+        if (why) {
+          *why = "the running app still has processes in its process group";
+        }
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  void proc_t::set_released(bool released) {
+    _live.released.store(released);
+  }
+
+  bool proc_t::released() const {
+    return _live.released.load();
+  }
+
+  bool proc_t::drop_released_app() {
+    if (!_live.released.load()) {
+      return false;
+    }
+
+    _live.app_id.store(-1);
+    _live.applied.store(0);
+    _live.placebo.store(false);
+    _live.pgid.store(0);
+
+    // Not read by any other thread while the app is released; _process and _process_group stay untouched.
+    _app_prep_it = _app_prep_begin;
+    _pipe.reset();
+
+    _live.released.store(false);
+    return true;
+  }
+
+  void proc_t::swap_app_list(std::vector<ctx_t> &&apps) {
+    _apps = std::move(apps);
+  }
+
+#ifdef __linux__
+  handoff::app_digest_input_t digest_input(const ctx_t &app, const boost::process::v1::environment &env) {
+    handoff::app_digest_input_t input;
+    input.prep.reserve(app.prep_cmds.size());
+    for (const auto &cmd : app.prep_cmds) {
+      input.prep.push_back(handoff::prep_entry_t {cmd.do_cmd, cmd.undo_cmd, cmd.elevated});
+    }
+    input.working_dir = app.working_dir;
+    input.output = app.output;
+    input.exit_timeout_s = static_cast<std::int64_t>(app.exit_timeout.count());
+    input.base_env = base_env_for_digest(env);
+    return input;
+  }
+
+  std::optional<handoff::protocol::app_snapshot_t> proc_t::snapshot() const {
+    int id = _live.app_id.load();
+    if (id <= 0) {
+      return std::nullopt;
+    }
+
+    handoff::protocol::app_snapshot_t snap;
+    snap.app_id = id;
+    snap.name = _app.name;
+    snap.applied_prep = _live.applied.load();
+    snap.digest = handoff::app_digest(digest_input(_app, _env));
+    for (const auto &entry : _env) {
+      std::string name = entry.get_name();
+      if (is_launch_env_name(name)) {
+        snap.launch_env.emplace_back(std::move(name), entry.to_string());
+      }
+    }
+    std::sort(snap.launch_env.begin(), snap.launch_env.end(), [](const auto &a, const auto &b) {
+      return a.first < b.first;
+    });
+    return snap;
+  }
+
+  std::optional<adoption_plan_t> proc_t::prepare_adoption(const handoff::protocol::go_t &go, std::string &reason) const {
+    reason.clear();
+
+    adoption_plan_t plan;
+    if (!go.app) {
+      return plan;
+    }
+    const auto &snap = *go.app;
+
+    if (_live.app_id.load() > 0) {
+      reason = "this process already runs an app";
+      return std::nullopt;
+    }
+
+    if (snap.digest.empty()) {
+      reason = "invalid app snapshot";
+      return std::nullopt;
+    }
+
+    constexpr auto changed = "app or prep commands changed while an app runs; cancel the app first"sv;
+
+    const std::string id_text = std::to_string(snap.app_id);
+    auto iter = std::find_if(_apps.begin(), _apps.end(), [&](const ctx_t &candidate) {
+      return candidate.id == id_text && candidate.name == snap.name;
+    });
+    if (iter == _apps.end()) {
+      reason = changed;
+      return std::nullopt;
+    }
+
+    std::string own_digest = handoff::app_digest(digest_input(*iter, _env));
+    if (own_digest.empty()) {
+      reason = "invalid app snapshot";
+      return std::nullopt;
+    }
+    if (own_digest != snap.digest || snap.applied_prep > iter->prep_cmds.size()) {
+      reason = changed;
+      return std::nullopt;
+    }
+
+    plan.has_app = true;
+    plan.app_id = snap.app_id;
+    plan.app = *iter;
+    plan.applied_prep = snap.applied_prep;
+    plan.launch_env = snap.launch_env;
+    return plan;
+  }
+
+  void proc_t::install_adoption(adoption_plan_t &&plan) {
+    if (!plan.has_app) {
+      return;
+    }
+
+    _app = std::move(plan.app);
+    _app_prep_begin = _app.prep_cmds.cbegin();
+    auto applied = std::min<std::size_t>(plan.applied_prep, _app.prep_cmds.size());
+    _app_prep_it = _app_prep_begin + static_cast<std::ptrdiff_t>(applied);
+
+    for (const auto &[name, value] : plan.launch_env) {
+      _env[name] = value;
+    }
+
+    _pipe.reset();
+    if (!_app.output.empty() && _app.output != "null"sv) {
+      _pipe.reset(fopen(_app.output.c_str(), "a"));
+      if (!_pipe) {
+        BOOST_LOG(warning) << "Couldn't reopen the app output file for appending; continuing without it"sv;
+      }
+    }
+
+    _live.app_id.store(plan.app_id);
+    _live.placebo.store(true);
+    _live.pgid.store(0);
+    _live.applied.store(static_cast<std::uint32_t>(applied));
+    _live.released.store(false);
+  }
+#endif
+
+#ifdef SUNSHINE_TESTS
+  void proc_t::set_running_for_test(const ctx_t &app, int app_id, bool is_placebo, pid_t pgid, std::uint32_t applied_prep) {
+    _app = app;
+    _app_prep_begin = _app.prep_cmds.cbegin();
+    auto applied = std::min<std::size_t>(applied_prep, _app.prep_cmds.size());
+    _app_prep_it = _app_prep_begin + static_cast<std::ptrdiff_t>(applied);
+    _live.app_id.store(app_id);
+    _live.placebo.store(is_placebo);
+    _live.pgid.store(static_cast<long>(pgid));
+    _live.applied.store(static_cast<std::uint32_t>(applied));
+  }
+
+  void proc_t::set_env_for_test(const std::string &name, const std::string &value) {
+    _env[name] = value;
+  }
+#endif
+
   proc_t::~proc_t() {
     // It's not safe to call terminate() here because our proc_t is a static variable
     // that may be destroyed after the Boost loggers have been destroyed. Instead,
     // we return a deinit_t to main() to handle termination when we're exiting.
     // Once we reach this point here, termination must have already happened.
-    assert(!placebo);
+    assert(!_live.placebo.load());
     assert(!_process.running());
   }
 
