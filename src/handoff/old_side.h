@@ -141,8 +141,17 @@ namespace handoff {
      */
     virtual bool reload_after_rollback() = 0;
 
-    virtual void enter_drain_mode() = 0;  ///< After `COMMIT`: become the draining process (no control socket).
-    virtual void leave_drain_mode() = 0;  ///< Rollback: become the active process again.
+    /**
+     * @brief After `COMMIT`: become the draining process. The control socket is closed with
+     * `control_server_t::close_listener()`, never `stop()` (the helper's handler still waits on the server thread).
+     */
+    virtual void enter_drain_mode() = 0;
+
+    /**
+     * @brief Rollback: become the active process again; the control socket is reopened with
+     * `control_server_t::reopen_listener()`.
+     */
+    virtual void leave_drain_mode() = 0;
 
     /**
      * @brief Set this process's instance-file role.
@@ -293,8 +302,11 @@ namespace handoff {
     old_outcome_e run(const std::function<void(received_t)> &on_drain_request);
 
     /**
-     * @brief Report a shutdown request (`SIGTERM`); thread-safe. Before `GO` it aborts with a rollback; after `GO`
-     * a child death during shutdown starts no rollback and `run()` returns `shutdown`.
+     * @brief Report a shutdown request (`SIGTERM`); thread-safe. Before `GO` it aborts with a rollback (kill-first) and
+     * `run()` returns `shutdown`. After `GO` `run()` returns `shutdown` promptly, whether the child is alive or dies:
+     * no handover (no `close_socket_copies`, no `MAIN`), no rollback and no rollback effects. With `systemctl stop`
+     * both processes get `SIGTERM`; a `SIGTERM` to the old process alone inside the window ends the unit, as a crash
+     * of the main process would (spec step 6).
      */
     void request_shutdown();
 

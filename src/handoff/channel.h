@@ -149,7 +149,7 @@ namespace handoff {
     std::mutex _mutex;  ///< Guards the members below.
     std::condition_variable _cv;  ///< Signals delivered replies.
     std::uint64_t _next_id {1};  ///< Next id.
-    std::uint64_t _fail_generation {0};  ///< Increased by `fail_all()`.
+
     std::map<std::uint64_t, std::optional<protocol::message_t>> _pending;  ///< Expected ids and their replies.
   };
 }  // namespace handoff
