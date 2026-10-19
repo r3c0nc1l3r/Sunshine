@@ -458,7 +458,8 @@ namespace handoff::protocol {
    * @brief Strictly decode one datagram.
    *
    * Rules for known types: every member listed for the type must be present with the right JSON type, no
-   * unsigned value may be negative or exceed its C++ type, `cert_sha256` must be 64 lowercase hex characters,
+   * unsigned value may be negative or exceed its C++ type, `cert_sha256` and `app_snapshot_t::digest` must be 64 lowercase hex characters (an empty digest, which
+   * `app_digest()` returns on a hash failure, is malformed, so two failed digests can never compare equal),
    * `CLOSED.result` must be one of its three values and `HANDOFF_STATE.state` one of its four values. Members not
    * listed for the type are ignored.
    *
