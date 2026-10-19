@@ -7,10 +7,16 @@
 #include "../tests_common.h"
 
 // standard includes
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <set>
+#include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 // lib includes
 #include <enet/enet.h>
@@ -50,12 +56,12 @@ namespace {
 TEST(StreamStopReasonTest, EveryEnumeratorHasExactName) {
   EXPECT_EQ(stream::to_string(stream::stop_reason_e::unknown), std::string_view {"unknown"});
   EXPECT_EQ(stream::to_string(stream::stop_reason_e::disconnect), std::string_view {"disconnect"});
-  EXPECT_EQ(stream::to_string(stream::stop_reason_e::enet_timeout), std::string_view {"enet-timeout"});
   EXPECT_EQ(stream::to_string(stream::stop_reason_e::ping_timeout), std::string_view {"ping-timeout"});
   EXPECT_EQ(stream::to_string(stream::stop_reason_e::media_ping_timeout), std::string_view {"media-ping-timeout"});
   EXPECT_EQ(stream::to_string(stream::stop_reason_e::initial_ping_timeout), std::string_view {"initial-ping-timeout"});
   EXPECT_EQ(stream::to_string(stream::stop_reason_e::protocol_error), std::string_view {"protocol-error"});
   EXPECT_EQ(stream::to_string(stream::stop_reason_e::api_close), std::string_view {"api-close"});
+  EXPECT_EQ(stream::to_string(stream::stop_reason_e::stream_ended), std::string_view {"stream-ended"});
   EXPECT_EQ(stream::to_string(stream::stop_reason_e::terminated), std::string_view {"terminated"});
 }
 
@@ -157,6 +163,306 @@ TEST(MediaLivenessTest, PeriodicPingsKeepAliveAndExpireAfterLast) {
   const auto last = base_time() + (pings - 1) * ping_gap;
   EXPECT_FALSE(media.expired(last + 999ms, timeout));
   EXPECT_TRUE(media.expired(last + 1000ms, timeout));
+}
+
+// ---------------------------------------------------------------------------
+// S1a registry: shared_media_liveness_t
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Shared tracker is not armed and never expired before any ping (S1a registry).
+ */
+TEST(SharedMediaLivenessTest, NotArmedAndNeverExpiredBeforeAnyPing) {
+  stream::liveness::shared_media_liveness_t media;
+  EXPECT_FALSE(media.armed());
+  EXPECT_FALSE(media.expired(base_time() + std::chrono::hours {24 * 365}, 1s));
+  EXPECT_FALSE(media.expired(base_time(), 0ms));
+}
+
+/**
+ * @brief Shared tracker is armed after the first ping (S1a registry).
+ */
+TEST(SharedMediaLivenessTest, ArmedAfterFirstPing) {
+  stream::liveness::shared_media_liveness_t media;
+  media.on_ping(base_time());
+  EXPECT_TRUE(media.armed());
+}
+
+/**
+ * @brief Shared tracker expires exactly at the timeout and not one millisecond before (S1a registry).
+ */
+TEST(SharedMediaLivenessTest, ExpiryBoundaryMatchesMediaLiveness) {
+  stream::liveness::shared_media_liveness_t media;
+  media.on_ping(base_time());
+  EXPECT_FALSE(media.expired(base_time() + 4999ms, 5000ms));
+  EXPECT_TRUE(media.expired(base_time() + 5000ms, 5000ms));
+  EXPECT_TRUE(media.expired(base_time() + 5001ms, 5000ms));
+}
+
+/**
+ * @brief A new ping on the shared tracker resets the clock (S1a registry).
+ */
+TEST(SharedMediaLivenessTest, NewPingResetsClock) {
+  stream::liveness::shared_media_liveness_t media;
+  media.on_ping(base_time());
+  media.on_ping(base_time() + 4s);
+  EXPECT_FALSE(media.expired(base_time() + 8s, 5s));
+  EXPECT_TRUE(media.expired(base_time() + 9s, 5s));
+}
+
+/**
+ * @brief Several threads pinging while another thread polls expired() does not crash, and the final state is armed
+ *        and not expired relative to the last ping time (S1a registry, thread safety).
+ */
+TEST(SharedMediaLivenessTest, ConcurrentPingsAndExpiredAreSafe) {
+  stream::liveness::shared_media_liveness_t media;
+  constexpr int writers = 4;
+  constexpr int pings_per_writer = 2000;
+
+  std::atomic<bool> polling {true};
+  std::vector<std::thread> threads;
+
+  threads.emplace_back([&media, &polling] {
+    while (polling.load()) {
+      (void) media.expired(base_time() + 1ms, 1s);
+      (void) media.armed();
+    }
+  });
+
+  for (int w = 0; w < writers; ++w) {
+    threads.emplace_back([&media] {
+      for (int i = 0; i < pings_per_writer; ++i) {
+        media.on_ping(base_time() + std::chrono::milliseconds {i});
+      }
+    });
+  }
+
+  for (std::size_t t = 1; t < threads.size(); ++t) {
+    threads[t].join();
+  }
+  polling.store(false);
+  threads[0].join();
+
+  EXPECT_TRUE(media.armed());
+  // Every recorded ping lies within [base, base + pings_per_writer ms), so at base + pings_per_writer ms the last ping
+  // is less than one hour old, and one hour after that point it has expired.
+  const auto newest = base_time() + std::chrono::milliseconds {pings_per_writer};
+  EXPECT_FALSE(media.expired(newest, 1h));
+  EXPECT_TRUE(media.expired(newest + 1h, 1h));
+}
+
+// ---------------------------------------------------------------------------
+// S1a registry: media_ping_registry_t
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief An empty registry has size 0 and an unknown key is not routed (S1a registry).
+ */
+TEST(MediaPingRegistryTest, EmptyRegistryHasNoKeys) {
+  stream::liveness::media_ping_registry_t registry;
+  EXPECT_EQ(registry.size(), 0u);
+  EXPECT_FALSE(registry.on_ping("unknown", base_time()));
+}
+
+/**
+ * @brief add() routes a ping to the tracker: on_ping returns true and arms the tracker (S1a registry).
+ */
+TEST(MediaPingRegistryTest, AddThenOnPingArmsTracker) {
+  stream::liveness::media_ping_registry_t registry;
+  auto tracker = std::make_shared<stream::liveness::shared_media_liveness_t>();
+
+  registry.add("key-a", tracker);
+  EXPECT_EQ(registry.size(), 1u);
+  EXPECT_FALSE(tracker->armed());
+
+  EXPECT_TRUE(registry.on_ping("key-a", base_time()));
+  EXPECT_TRUE(tracker->armed());
+  EXPECT_TRUE(tracker->expired(base_time() + 5s, 5s));
+  EXPECT_FALSE(tracker->expired(base_time() + 4s, 5s));
+}
+
+/**
+ * @brief on_ping with a key that was never added returns false and feeds no tracker (S1a registry).
+ */
+TEST(MediaPingRegistryTest, UnknownKeyReturnsFalseAndFeedsNothing) {
+  stream::liveness::media_ping_registry_t registry;
+  auto tracker = std::make_shared<stream::liveness::shared_media_liveness_t>();
+  registry.add("key-a", tracker);
+
+  EXPECT_FALSE(registry.on_ping("key-b", base_time()));
+  EXPECT_FALSE(tracker->armed());
+  EXPECT_EQ(registry.size(), 1u);
+}
+
+/**
+ * @brief add() with a null tracker is ignored: the size does not change (S1a registry).
+ */
+TEST(MediaPingRegistryTest, AddNullTrackerIsIgnored) {
+  stream::liveness::media_ping_registry_t registry;
+  registry.add("key-a", nullptr);
+  EXPECT_EQ(registry.size(), 0u);
+  EXPECT_FALSE(registry.on_ping("key-a", base_time()));
+}
+
+/**
+ * @brief add() with a null tracker does not remove or replace an existing entry for the same key (S1a registry).
+ *
+ * The spec only says a null tracker is ignored, so an existing route is kept.
+ */
+TEST(MediaPingRegistryTest, AddNullTrackerKeepsExistingRoute) {
+  stream::liveness::media_ping_registry_t registry;
+  auto tracker = std::make_shared<stream::liveness::shared_media_liveness_t>();
+  registry.add("key-a", tracker);
+
+  registry.add("key-a", nullptr);
+  EXPECT_EQ(registry.size(), 1u);
+  EXPECT_TRUE(registry.on_ping("key-a", base_time()));
+  EXPECT_TRUE(tracker->armed());
+}
+
+/**
+ * @brief Adding an existing key replaces its tracker: pings go to the new one and the old one is not fed (S1a registry).
+ */
+TEST(MediaPingRegistryTest, AddExistingKeyReplacesTracker) {
+  stream::liveness::media_ping_registry_t registry;
+  auto old_tracker = std::make_shared<stream::liveness::shared_media_liveness_t>();
+  auto new_tracker = std::make_shared<stream::liveness::shared_media_liveness_t>();
+
+  registry.add("key-a", old_tracker);
+  registry.add("key-a", new_tracker);
+  EXPECT_EQ(registry.size(), 1u);
+
+  EXPECT_TRUE(registry.on_ping("key-a", base_time()));
+  EXPECT_TRUE(new_tracker->armed());
+  EXPECT_FALSE(old_tracker->armed());
+}
+
+/**
+ * @brief remove() removes every key routed to the tracker and leaves keys of other trackers alone (S1a registry).
+ */
+TEST(MediaPingRegistryTest, RemoveDropsOnlyThatTrackersKeys) {
+  stream::liveness::media_ping_registry_t registry;
+  auto tracker_a = std::make_shared<stream::liveness::shared_media_liveness_t>();
+  auto tracker_b = std::make_shared<stream::liveness::shared_media_liveness_t>();
+
+  registry.add("a-1", tracker_a);
+  registry.add("a-2", tracker_a);
+  registry.add("b-1", tracker_b);
+  EXPECT_EQ(registry.size(), 3u);
+
+  registry.remove(tracker_a);
+  EXPECT_EQ(registry.size(), 1u);
+  EXPECT_FALSE(registry.on_ping("a-1", base_time()));
+  EXPECT_FALSE(registry.on_ping("a-2", base_time()));
+  EXPECT_FALSE(tracker_a->armed());
+
+  EXPECT_TRUE(registry.on_ping("b-1", base_time()));
+  EXPECT_TRUE(tracker_b->armed());
+}
+
+/**
+ * @brief remove() of a tracker that has no keys in the registry changes nothing (S1a registry).
+ */
+TEST(MediaPingRegistryTest, RemoveUnregisteredTrackerIsNoOp) {
+  stream::liveness::media_ping_registry_t registry;
+  auto registered = std::make_shared<stream::liveness::shared_media_liveness_t>();
+  auto stranger = std::make_shared<stream::liveness::shared_media_liveness_t>();
+  registry.add("key-a", registered);
+
+  registry.remove(stranger);
+  EXPECT_EQ(registry.size(), 1u);
+  EXPECT_TRUE(registry.on_ping("key-a", base_time()));
+}
+
+/**
+ * @brief A tracker whose key was taken over by a newer tracker owns no keys, so removing it keeps the newer route (S1a registry).
+ */
+TEST(MediaPingRegistryTest, RemoveReplacedTrackerKeepsNewerRoute) {
+  stream::liveness::media_ping_registry_t registry;
+  auto old_tracker = std::make_shared<stream::liveness::shared_media_liveness_t>();
+  auto new_tracker = std::make_shared<stream::liveness::shared_media_liveness_t>();
+  registry.add("key-a", old_tracker);
+  registry.add("key-a", new_tracker);
+
+  registry.remove(old_tracker);
+  EXPECT_EQ(registry.size(), 1u);
+  EXPECT_TRUE(registry.on_ping("key-a", base_time()));
+  EXPECT_TRUE(new_tracker->armed());
+}
+
+/**
+ * @brief size() counts keys, not trackers: several keys on one tracker count separately (S1a registry).
+ */
+TEST(MediaPingRegistryTest, SizeCountsKeys) {
+  stream::liveness::media_ping_registry_t registry;
+  auto tracker = std::make_shared<stream::liveness::shared_media_liveness_t>();
+  registry.add("k1", tracker);
+  registry.add("k2", tracker);
+  registry.add("k3", tracker);
+  EXPECT_EQ(registry.size(), 3u);
+}
+
+/**
+ * @brief Concurrent add/remove of different keys while other threads ping and read size() is safe, and each
+ *        thread's keys route correctly while they are registered (S1a registry, thread safety).
+ */
+TEST(MediaPingRegistryTest, ConcurrentAddRemoveAndPingAreSafe) {
+  stream::liveness::media_ping_registry_t registry;
+  constexpr int adders = 4;
+  constexpr int rounds = 50;
+  constexpr int keys_per_round = 16;
+
+  std::atomic<int> routing_misses {0};
+  std::atomic<bool> pinging {true};
+  std::vector<std::thread> threads;
+
+  for (int w = 0; w < adders; ++w) {
+    threads.emplace_back([&registry, &routing_misses, w] {
+      for (int r = 0; r < rounds; ++r) {
+        auto tracker = std::make_shared<stream::liveness::shared_media_liveness_t>();
+        std::vector<std::string> keys;
+        for (int k = 0; k < keys_per_round; ++k) {
+          keys.push_back("t" + std::to_string(w) + "-k" + std::to_string(k));
+          registry.add(keys.back(), tracker);
+        }
+        // Only this thread touches these keys, so they must still route to this tracker.
+        for (const auto &key : keys) {
+          if (!registry.on_ping(key, base_time())) {
+            ++routing_misses;
+          }
+        }
+        registry.remove(tracker);
+      }
+    });
+  }
+
+  for (int p = 0; p < 2; ++p) {
+    threads.emplace_back([&registry, &pinging] {
+      int i = 0;
+      while (pinging.load()) {
+        const auto key = "t" + std::to_string(i % adders) + "-k" + std::to_string(i % keys_per_round);
+        (void) registry.on_ping(key, base_time());
+        ++i;
+      }
+    });
+  }
+
+  threads.emplace_back([&registry, &pinging] {
+    while (pinging.load()) {
+      (void) registry.size();
+    }
+  });
+
+  for (int t = 0; t < adders; ++t) {
+    threads[static_cast<std::size_t>(t)].join();
+  }
+  pinging.store(false);
+  for (std::size_t t = static_cast<std::size_t>(adders); t < threads.size(); ++t) {
+    threads[t].join();
+  }
+
+  EXPECT_EQ(routing_misses.load(), 0);
+  EXPECT_EQ(registry.size(), 0u);
 }
 
 // ---------------------------------------------------------------------------
