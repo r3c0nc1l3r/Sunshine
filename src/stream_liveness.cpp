@@ -31,6 +31,10 @@ namespace stream {
         return "stream-ended";
       case stop_reason_e::terminated:
         return "terminated";
+      case stop_reason_e::stop:
+        return "stop";
+      case stop_reason_e::drain_deadline:
+        return "drain-deadline";
       case stop_reason_e::unknown:
         break;
     }
