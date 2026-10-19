@@ -141,8 +141,17 @@ namespace handoff {
      */
     virtual bool reload_after_rollback() = 0;
 
-    virtual void enter_drain_mode() = 0;  ///< After `COMMIT`: become the draining process (no control socket).
-    virtual void leave_drain_mode() = 0;  ///< Rollback: become the active process again.
+    /**
+     * @brief After `COMMIT`: become the draining process. The control socket is closed with
+     * `control_server_t::close_listener()`, never `stop()` (the helper's handler still waits on the server thread).
+     */
+    virtual void enter_drain_mode() = 0;
+
+    /**
+     * @brief Rollback: become the active process again; the control socket is reopened with
+     * `control_server_t::reopen_listener()`.
+     */
+    virtual void leave_drain_mode() = 0;
 
     /**
      * @brief Set this process's instance-file role.
@@ -249,7 +258,8 @@ namespace handoff {
    *    state back to `draining`.
    *
    * Rollback (whatever the child does): `end_all.decide_rollback()` first; then `kill_and_reap(reap)` until the
-   * child is gone, and after the first `timeout` `set_state(kill_pending)` (and, if the helper was not yet answered,
+   * child is gone (`reaped` or `reaped_elsewhere`; an `error` counts as gone only when `exited()` is true, otherwise it
+   * is handled like `timeout`), and after the first `timeout` `set_state(kill_pending)` (and, if the helper was not yet answered,
    * answer it `kill_pending`); when gone, answer a still-waiting helper `failed <reason>`; then, only for the steps
    * that happened: `wait_in_flight(-1)` and then `reload_after_rollback()` and `unfreeze()` if frozen (the unbounded
    * wait only protects the reload and app-list swap, so a failure before the freeze does not wait),
@@ -280,8 +290,11 @@ namespace handoff {
     /**
      * @brief Run the handoff until the handover, a completed rollback, or a shutdown.
      *
-     * Messages other than `HELLO`, `READY`, `GO_ACK` and `PONG` that arrive (`END_ALL`, `SESSIONS?`, `CLOSE`,
-     * `CLOSE_CERT`) are passed to `on_drain_request` on another thread and never block this one.
+     * `END_ALL`, `SESSIONS?`, `CLOSE` and `CLOSE_CERT` are passed to `on_drain_request` on another thread and never
+     * block this one; other messages are dropped (their fds closed) with a Warning. At most 1024 messages wait for the
+     * handler and at most 1024 for this thread; beyond that the newest is dropped with a Warning. Handled messages
+     * never delay the `PING` and handover timers. `run()` returns only after the handler's current call has finished,
+     * so the handler must be bounded (the drain glue bounds `END_ALL` by the session join guard).
      *
      * @param on_drain_request Handler for drain requests; it replies on the channel itself.
      * @return Outcome.
@@ -289,8 +302,11 @@ namespace handoff {
     old_outcome_e run(const std::function<void(received_t)> &on_drain_request);
 
     /**
-     * @brief Report a shutdown request (`SIGTERM`); thread-safe. Before `GO` it aborts with a rollback; after `GO`
-     * a child death during shutdown starts no rollback and `run()` returns `shutdown`.
+     * @brief Report a shutdown request (`SIGTERM`); thread-safe. Before `GO` it aborts with a rollback (kill-first) and
+     * `run()` returns `shutdown`. After `GO` `run()` returns `shutdown` promptly, whether the child is alive or dies:
+     * no handover (no `close_socket_copies`, no `MAIN`), no rollback and no rollback effects. With `systemctl stop`
+     * both processes get `SIGTERM`; a `SIGTERM` to the old process alone inside the window ends the unit, as a crash
+     * of the main process would (spec step 6).
      */
     void request_shutdown();
 
