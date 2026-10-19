@@ -299,7 +299,7 @@ TEST(SessionApiRtspTest, RequestSessionCloseUnknownIdReturnsNotFound) {
  */
 class SessionApiHttpTest: public BaseTest {  // NOSONAR(cpp:S3656): protected members are intentional for test fixture subclassing
 protected:
-  std::unique_ptr<SimpleWeb::Server<SimpleWeb::HTTPS>> server;  ///< Test HTTPS server.
+  std::unique_ptr<confighttp::https_server_t> server;  ///< Test HTTPS server.
   std::unique_ptr<SimpleWeb::Client<SimpleWeb::HTTPS>> client;  ///< Test HTTPS client.
   std::jthread server_thread;  ///< Thread running the server loop.
   unsigned short port = 0;  ///< Port assigned by the OS.
@@ -348,7 +348,7 @@ protected:
     key_out << TEST_PRIVATE_KEY;
     key_out.close();
 
-    server = std::make_unique<SimpleWeb::Server<SimpleWeb::HTTPS>>(cert_file.string(), key_file.string());
+    server = std::make_unique<confighttp::https_server_t>(cert_file.string(), key_file.string());
     server->config.port = 0;
     server->config.reuse_address = true;
     server->config.timeout_request = 5;

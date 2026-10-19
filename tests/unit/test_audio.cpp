@@ -11,7 +11,7 @@
 
 using namespace audio;
 
-struct AudioTest: PlatformTestSuite, testing::WithParamInterface<std::tuple<std::basic_string_view<char>, config_t>> {
+struct AudioTest: PlatformTestSuite, ::testing::WithParamInterface<std::tuple<std::basic_string_view<char>, config_t>> {
   void SetUp() override {
     BaseTest::SetUp();
     m_config = std::get<1>(GetParam());
@@ -33,7 +33,7 @@ constexpr std::bitset<config_t::MAX_FLAGS> config_flags(const int flag = -1) {
 INSTANTIATE_TEST_SUITE_P(
   Configurations,
   AudioTest,
-  testing::Values(
+  ::testing::Values(
     std::make_tuple("HIGH_STEREO", config_t {.packetDuration = 5, .channels = 2, .mask = 0x3, .customStreamParams = {}, .flags = config_flags(config_t::HIGH_QUALITY)}),
     std::make_tuple("SURROUND51", config_t {.packetDuration = 5, .channels = 6, .mask = 0x3F, .customStreamParams = {}, .flags = config_flags()}),
     std::make_tuple("SURROUND71", config_t {.packetDuration = 5, .channels = 8, .mask = 0x63F, .customStreamParams = {}, .flags = config_flags()}),
