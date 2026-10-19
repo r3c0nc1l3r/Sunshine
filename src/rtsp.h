@@ -16,8 +16,10 @@
 #include <string_view>
 #include <vector>
 
-// lib includes
-#include <boost/system/error_code.hpp>
+#ifdef SUNSHINE_TESTS
+  // lib includes
+  #include <boost/system/error_code.hpp>
+#endif
 
 // local includes
 #include "crypto.h"
@@ -513,7 +515,8 @@ namespace rtsp_stream {
      * The injected error is consumed by exactly one completion (success or abort) and follows the normal rules: unless
      * it is the silent `operation_aborted` of an accept that `pause_accept` or `close_listener` cancelled, it is an
      * Error log plus `clear()` of all sessions and no re-arm, and `accept_errors()` grows by one. A test arms it, then
-     * connects (or cancels) to trigger the completion. Cleared by `reset_server`.
+     * connects (or cancels) to trigger the completion. An injection made while no accept is outstanding stays pending
+     * until the next completion. Cleared by `reset_server`.
      *
      * @param ec Error code to inject; a default-constructed one (no error) removes a pending injection.
      */
@@ -522,6 +525,8 @@ namespace rtsp_stream {
     /**
      * @brief Number of accepts armed whose completion handler has not yet run: 0 or 1. The invariant "at most one
      * outstanding accept" means this never exceeds 1; it is 0 while paused once the aborted completion was handled.
+     * Reads an atomic; safe from any thread. Right after `pause_accept` returns it can still read 1 until the aborted
+     * completion has been handled, so a test polls briefly.
      *
      * @return 0 or 1.
      */

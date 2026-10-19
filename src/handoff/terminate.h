@@ -133,9 +133,9 @@ namespace handoff {
   /**
    * @brief Number of sessions the draining process reports.
    *
-   * @param timeout Longest wait for the `SESSIONS?` reply.
    * Same mode rule as `terminate_gate`: in mode `new_pending` or `draining` the result is 0 and nothing is sent.
    *
+   * @param timeout Longest wait for the `SESSIONS?` reply.
    * @return 0 with nothing sent when no peer exists, the mode is `new_pending` or `draining`, or the peer is gone; the number of entries of the reply; and
    *         `std::nullopt` (unknown) when a peer exists that is not gone and gave no answer in time, or the peer has no
    *         session knowledge (it is not a `session_peer_t`). Thread-safety: any thread; blocks up to `timeout`.
