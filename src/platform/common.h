@@ -555,8 +555,8 @@ namespace platf {
      * Never a Sunshine virtual sink (a name starting with `sink-sunshine-`). The Linux backend's `sink_info()` takes
      * the host sink in this order: `handoff::hooks::host_sink()` when a handoff start supplied one
      * (`SUNSHINE_HANDOFF_HOST_SINK`, which the draining process recorded before the switch); otherwise the current
-     * default sink, unless that is a Sunshine virtual sink, in which case the host is empty. Empty means "no host sink";
-     * the caller then falls back to `config::audio.sink`. Other platforms are unchanged.
+     * default sink, unless that is a Sunshine virtual sink, in which case the host is empty. Empty means "no host
+     * sink"; the caller then falls back to `config::audio.sink`. Other platforms are unchanged.
      */
     std::string host;  ///< Host playback sink name.
 

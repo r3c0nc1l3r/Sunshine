@@ -691,11 +691,18 @@ namespace video {
    * Set by a handoff child whose probe identity matched (see `handoff::accepted_probe`). The values have the same
    * meaning as the globals they replace: `hevc_mode`/`av1_mode` for `active_hevc_mode`/`active_av1_mode`, and `yuv444`
    * for `last_encoder_probe_supported_yuv444_for_codec` (index 0 H.264, 1 HEVC, 2 AV1).
+   *
+   * Mapping from `handoff::protocol::probe_results_t`: `hevc_mode` to `hevc_mode`, `av1_mode` to `av1_mode`,
+   * `yuv444_h264`, `yuv444_hevc` and `yuv444_av1` to `yuv444[0]`, `yuv444[1]` and `yuv444[2]`.
+   *
+   * Read sites (the only ones): `nvhttp.cpp` `get_codec_mode_flags()` (about lines 1264-1286), which builds
+   * `ServerCodecModeSupport`, and the `serverinfo` call to it (about line 1324). Nothing else reads the override: the
+   * `rtsp.cpp` uses of `active_hevc_mode`/`active_av1_mode` (about lines 1101, 1105, 1425, 1432) keep the globals.
    */
   struct handoff_probe_override_t {
     int hevc_mode {0};  ///< HEVC mode (0 to 5) that `/serverinfo` reports in place of `active_hevc_mode`.
     int av1_mode {0};  ///< AV1 mode (0 to 5) that `/serverinfo` reports in place of `active_av1_mode`.
-    std::array<bool, 3> yuv444 {};  ///< Per-codec 4:4:4 support in place of `last_encoder_probe_supported_yuv444_for_codec`.
+    std::array<bool, 3> yuv444 {};  ///< Per-codec 4:4:4 support (H.264, HEVC, AV1) in place of the probe.
   };
 
   /**

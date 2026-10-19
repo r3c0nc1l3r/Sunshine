@@ -24,10 +24,10 @@ namespace input {
   /**
    * @brief Stable identifiers of the virtual input devices, with the handoff generation folded in.
    *
-   * The two processes of a drain handoff must never create a device with the same stable id, so every id carries the
-   * generation (`hooks::generation()`, which is 0 for a process that was never started by a handoff). Generation 0 gives
-   * exactly the upstream strings, so a normal start is unchanged. These are pure functions: they touch no device and no
-   * state, are safe from any thread, and are the single place where the format is defined. The platform backend
+   * The two processes of a drain handoff must never create a device with the same stable id, so every id carries
+   * the generation (`hooks::generation()`, which is 0 for a process that was never started by a handoff). Generation 0
+   * gives exactly the upstream strings, so a normal start is unchanged. These are pure functions: they touch no device
+   * and no state, are safe from any thread, and are the single place where the format is defined. The platform backend
    * (`src/platform/virtualhid_input.cpp`) calls them.
    *
    * Formats (the generation is written in decimal in the id and in the MAC; `g` is a literal letter):
@@ -38,7 +38,8 @@ namespace input {
    * - gamepad (non-MAC profiles): `sunshine-gamepad-<idx>` at 0, `sunshine-gamepad-<gen>-<idx>` above;
    * - gamepad MAC (DualShock 4 and DualSense profiles): `02:00:00:00:00:<idx>` (two-digit lowercase hex) at 0, and
    *   `02:00:<gen_hi>:<gen_lo>:00:<idx>` above, where `gen_hi` and `gen_lo` are the two bytes of the generation (both
-   *   two-digit lowercase hex). The two bytes keep the MAC unique for every generation up to 65535.
+   *   two-digit lowercase hex). The two bytes keep the MAC unique for every generation up to 65535. Generations above
+   *   65535 reuse older MACs; only two processes are live at a time, so this is harmless.
    */
   namespace device_ids {
     /**
