@@ -40,6 +40,10 @@ namespace {
     bool wake = false;  ///< `exit` was called while `loop` was blocked.
     bool stuck = false;  ///< `loop` ignores `exit` until `release` (a loop that cannot be woken).
     bool released = false;  ///< Set by `release`.
+    bool unstick = false;  ///< Wakes a stuck `loop` once, and ends the stuck mode.
+    bool queued_mode = false;  ///< Model Qt: `exit` from a non-loop thread only queues an event.
+    bool queued_exit = false;  ///< A queued exit event waits for the next `loop` call.
+    bool icon_up = false;  ///< The fake icon exists (set by `init`, cleared by a delivered exit).
     std::thread::id init_thread;  ///< Thread of the last `init` call.
     std::thread::id loop_thread;  ///< Thread of the last `loop` call.
     std::function<void()> in_loop_hook;  ///< Run (unlocked) at the start of the next `loop` call, then cleared.
@@ -55,6 +59,7 @@ namespace {
       --g_fake.init_failures;
       return -1;
     }
+    g_fake.icon_up = true;
     return 0;
   }
 
@@ -75,18 +80,47 @@ namespace {
       --g_fake.zero_loops;
       return 0;
     }
+    if (g_fake.queued_mode && g_fake.queued_exit) {
+      // A queued exit is delivered by this call: with an icon up it tears the icon down and ends the blocking loop.
+      g_fake.queued_exit = false;
+      if (g_fake.icon_up) {
+        g_fake.icon_up = false;
+        return -1;
+      }
+    }
     g_fake.in_loop = true;
     g_fake.cv.wait_for(lk, 10s, [] {
-      return g_fake.stuck ? g_fake.released : (g_fake.wake || g_fake.released);
+      return g_fake.stuck ? (g_fake.unstick || g_fake.released) : (g_fake.wake || g_fake.released);
     });
     g_fake.in_loop = false;
     g_fake.wake = false;
+    if (g_fake.stuck && g_fake.unstick) {
+      g_fake.stuck = false;
+      g_fake.unstick = false;
+    }
+    if (g_fake.queued_mode && g_fake.queued_exit) {
+      g_fake.queued_exit = false;
+      g_fake.icon_up = false;
+    }
     return -1;
   }
 
   void fake_exit() {
     std::lock_guard lk {g_fake.m};
     ++g_fake.exit_calls;
+    if (g_fake.queued_mode) {
+      if (std::this_thread::get_id() == g_fake.loop_thread) {
+        g_fake.icon_up = false;  // direct call on the loop thread: handled at once
+        g_fake.queued_exit = false;
+      } else {
+        g_fake.queued_exit = true;
+        if (g_fake.in_loop) {
+          g_fake.wake = true;
+          g_fake.cv.notify_all();
+        }
+      }
+      return;
+    }
     if (g_fake.in_loop) {
       g_fake.wake = true;
       g_fake.cv.notify_all();
@@ -96,6 +130,12 @@ namespace {
   void release_fake() {
     std::lock_guard lk {g_fake.m};
     g_fake.released = true;
+    g_fake.cv.notify_all();
+  }
+
+  void unstick_fake() {
+    std::lock_guard lk {g_fake.m};
+    g_fake.unstick = true;
     g_fake.cv.notify_all();
   }
 
@@ -145,6 +185,7 @@ namespace {
       g_fake.zero_loops = 0;
       g_fake.init_calls = g_fake.loop_calls = g_fake.exit_calls = 0;
       g_fake.in_loop = g_fake.wake = g_fake.stuck = g_fake.released = false;
+      g_fake.unstick = g_fake.queued_mode = g_fake.queued_exit = g_fake.icon_up = false;
       g_fake.in_loop_hook = nullptr;
       g_fake.init_thread = g_fake.loop_thread = {};
       shutdown_flag_ = false;
@@ -532,6 +573,66 @@ TEST_F(TrayLifecycleHandoffTest, EndTrayIsIdempotentAndCommandsDoNothingAfterIt)
   EXPECT_TRUE(st::suspend(200ms)) << "suspend after end_tray must return true";
   EXPECT_EQ(st::current_phase(), st::tray_phase_e::ended) << "ended is terminal";
   EXPECT_EQ(init_calls(), 0);
+}
+
+TEST_F(TrayLifecycleHandoffTest, StaleQueuedExitDoesNotKillTheResumedIcon) {
+  // SPEC-QUESTION: a suspend pending before run_main_loop is entered cannot be built with a fake backend; the suspend
+  // is issued while the first loop iteration is running its event, i.e. between two iterations.
+  g_fake.queued_mode = true;
+  g_fake.zero_loops = 1;
+  std::promise<bool> suspended;
+  auto suspended_future = suspended.get_future();
+  std::thread suspender;
+  g_fake.in_loop_hook = [&suspender, &suspended] {
+    suspender = std::thread([&suspended] {
+      suspended.set_value(st::suspend(3000ms));
+    });
+    wait_until(
+      [] {
+        return exit_calls() >= 1;
+      },
+      300ms
+    );
+  };
+  ASSERT_TRUE(st::request_start());
+  start_loop();
+  ASSERT_EQ(suspended_future.wait_for(3s), std::future_status::ready) << "suspend must be acknowledged";
+  suspender.join();
+  ASSERT_TRUE(suspended_future.get());
+  ASSERT_TRUE(phase_becomes(st::tray_phase_e::suspended));
+  ASSERT_TRUE(st::resume()) << "resume after suspend must be accepted";
+  EXPECT_TRUE(phase_becomes(st::tray_phase_e::running)) << "the icon must come back";
+  std::this_thread::sleep_for(250ms);
+  bool icon_up = false;
+  {
+    std::lock_guard lk {g_fake.m};
+    icon_up = g_fake.icon_up;
+  }
+  EXPECT_TRUE(icon_up) << "a stale queued exit from the earlier suspend must not tear down the resumed icon";
+  EXPECT_EQ(st::current_phase(), st::tray_phase_e::running) << "the phase must stay running";
+  EXPECT_FALSE(loop_returned(10ms)) << "run_main_loop must not return because of a stale exit";
+  st::end_tray();
+  release_fake();
+  EXPECT_TRUE(loop_returned(2000ms)) << "the loop must end cleanly after end_tray";
+}
+
+TEST_F(TrayLifecycleHandoffTest, ResumeDuringSuspendIsDeferredAndRunsAfterIt) {
+  g_fake.stuck = true;
+  get_running();
+  auto pending = std::async(std::launch::async, [] {
+    return st::suspend(4000ms);
+  });
+  std::this_thread::sleep_for(100ms);
+  EXPECT_TRUE(st::resume()) << "a resume that arrives during a suspend must be accepted";
+  unstick_fake();
+  ASSERT_EQ(pending.wait_for(3s), std::future_status::ready) << "the suspend must finish";
+  EXPECT_TRUE(pending.get());
+  EXPECT_TRUE(wait_until([] {
+    return init_calls() >= 2;
+  }))
+    << "the deferred resume must re-init after the suspend finished";
+  EXPECT_TRUE(phase_becomes(st::tray_phase_e::running)) << "the final phase must be running";
+  EXPECT_FALSE(loop_returned(100ms)) << "run_main_loop must keep running";
 }
 
 TEST_F(TrayLifecycleHandoffTest, ResetLifecycleRestoresFreshState) {
