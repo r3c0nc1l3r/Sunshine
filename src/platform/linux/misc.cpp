@@ -606,7 +606,8 @@ namespace platf {
    * @brief Restart the Sunshine process through the platform launcher.
    */
   void restart() {
-    // Keep the UDP base and generation across the re-exec; an empty list (feature disabled) changes nothing
+    // Keep the UDP base and generation across the re-exec. With the feature disabled the entries only unset the
+    // handoff variables, so the restart behaves as upstream.
     for (const auto &[name, value] : handoff::hooks::restart_environment()) {
       if (value) {
         if (setenv(name.c_str(), value->c_str(), 1) != 0) {
