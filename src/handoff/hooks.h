@@ -15,6 +15,7 @@
 #pragma once
 
 // standard includes
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -23,6 +24,7 @@
 // local includes
 #include "settings.h"
 #include "src/config.h"
+#include "src/platform/common.h"
 #include "types.h"
 
 #ifdef __linux__
@@ -126,6 +128,20 @@ namespace handoff::hooks {
    * @return Empty when Quit may proceed; otherwise a one-line explanation. Non-Linux: empty.
    */
   std::string quit_blocked();
+
+  /**
+   * @brief Start mDNS publishing for this process; replaces `main`'s bare `platf::publish::start()`.
+   *
+   * Calls `handoff::mdns_holder().start(arm_rename_checks)` and returns a handle whose destruction calls
+   * `handoff::mdns_holder().stop()`, so `main` keeps its `mDNS` handle and its destruction order unchanged. With the
+   * feature disabled, or in a normal start (`arm_rename_checks` false), the service is published exactly as before.
+   * The caller must not call this in a process started by a handoff (`started_by_handoff()`) before `COMMIT`: the new
+   * side publishes through the holder itself at `COMMIT`, and `main` then takes no handle. Main thread only.
+   *
+   * @param arm_rename_checks False for a normal start; true only for the new process at `COMMIT`.
+   * @return A handle that stops publishing when destroyed. Never null (the holder handles an unavailable publisher).
+   */
+  std::unique_ptr<platf::deinit_t> mdns_start(bool arm_rename_checks);
 
   /**
    * @brief Called first in the `SIGTERM` handler, before the shutdown event is raised.
@@ -251,6 +267,17 @@ namespace handoff::hooks {
    */
   inline std::string quit_blocked() {
     return {};
+  }
+
+  /**
+   * @brief Start mDNS publishing exactly as before: `platf::publish::start()`.
+   *
+   * @param arm_rename_checks Ignored on this platform.
+   * @return The publisher handle (may be null when publishing is unavailable, as before).
+   */
+  inline std::unique_ptr<platf::deinit_t> mdns_start(bool arm_rename_checks) {
+    (void) arm_rename_checks;
+    return platf::publish::start();
   }
 
   /**
