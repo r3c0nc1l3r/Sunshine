@@ -61,6 +61,7 @@
 #include "misc.h"
 #include "src/config.h"
 #include "src/entry_handler.h"
+#include "src/handoff/hooks.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "vaapi.h"
@@ -605,6 +606,17 @@ namespace platf {
    * @brief Restart the Sunshine process through the platform launcher.
    */
   void restart() {
+    // Keep the UDP base and generation across the re-exec; an empty list (feature disabled) changes nothing
+    for (const auto &[name, value] : handoff::hooks::restart_environment()) {
+      if (value) {
+        if (setenv(name.c_str(), value->c_str(), 1) != 0) {
+          BOOST_LOG(warning) << "setenv() failed for "sv << name << ": "sv << errno;
+        }
+      } else {
+        unsetenv(name.c_str());
+      }
+    }
+
     // Gracefully clean up and restart ourselves instead of exiting
     atexit(restart_on_exit);
     lifetime::exit_sunshine(0, true);
