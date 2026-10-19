@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 
 // lib includes
 #include <boost/core/null_deleter.hpp>
@@ -53,16 +54,30 @@ BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", int)
 BOOST_LOG_ATTRIBUTE_KEYWORD(process_tag_keyword, "ProcessTag", std::string)
 
 namespace {
+  /// Process tag attribute type. The mutex makes `set` and the record-creation read safe across threads.
+  using process_tag_attribute_t = bl::attributes::mutable_constant<
+    std::string,
+    std::mutex,
+    std::lock_guard<std::mutex>,
+    std::lock_guard<std::mutex>>;
+
   /**
    * @brief The process tag as a global Boost.Log attribute.
    *
    * Boost.Log takes a snapshot of every attribute value when a record is created, so the tag is fixed at the
-   * log call even though the asynchronous sink formats the record later. The attribute is thread-safe.
+   * log call even though the asynchronous sink formats the record later. The attribute has static storage
+   * duration and is registered globally once, on the first `init()`, so repeated `init()`/`deinit()` calls never
+   * register it twice or leave a dangling reference.
    *
    * @return Reference to the process-wide tag attribute.
    */
-  bl::attributes::mutable_constant<std::string> &process_tag_attribute() {
-    static bl::attributes::mutable_constant<std::string> attribute {std::string {}};
+  process_tag_attribute_t &process_tag_attribute() {
+    static process_tag_attribute_t attribute {std::string {}};
+    static const bool registered = [] {
+      bl::core::get()->add_global_attribute(process_tag_keyword.get_name(), attribute);
+      return true;
+    }();
+    (void) registered;
     return attribute;
   }
 }  // namespace
@@ -213,8 +228,8 @@ namespace logging {
     // Always append, so a process that shares the file with its predecessor never overwrites its data.
     sink->locked_backend()->add_stream(boost::make_shared<std::ofstream>(log_file, std::ios::app));
 
-    // Records created from now on carry the process tag. Adding it again is a no-op.
-    bl::core::get()->add_global_attribute(process_tag_keyword.get_name(), process_tag_attribute());
+    // Make sure records created from now on carry the process tag (registered once, see process_tag_attribute()).
+    process_tag_attribute();
     sink->set_filter(severity >= min_log_level);
     sink->set_formatter(&formatter);
 
