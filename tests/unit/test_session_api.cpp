@@ -36,6 +36,10 @@
 #include <src/config.h>
 #include <src/confighttp.h>
 #include <src/crypto.h>
+#ifdef __linux__
+  #include <src/handoff/peer_link.h>
+  #include <src/handoff/runtime.h>
+#endif
 #include <src/httpcommon.h>
 #include <src/rtsp.h>
 #include <src/stream.h>
@@ -192,7 +196,7 @@ namespace {
 }  // namespace
 
 /**
- * @brief Test: the session JSON has exactly the four documented keys and nothing else.
+ * @brief Test: the session JSON has exactly the five documented keys (including `draining`) and nothing else.
  */
 TEST(SessionApiJsonTest, HasExactlyTheDocumentedKeys) {
   const nlohmann::json json = confighttp::session_info_to_json(make_session_info());
@@ -202,6 +206,7 @@ TEST(SessionApiJsonTest, HasExactlyTheDocumentedKeys) {
     "started",
     "transport",
     "client_category",
+    "draining",
   };
 
   std::set<std::string> actual_keys;
@@ -210,7 +215,20 @@ TEST(SessionApiJsonTest, HasExactlyTheDocumentedKeys) {
   }
 
   EXPECT_EQ(actual_keys, expected_keys);
-  EXPECT_EQ(actual_keys.size(), 4U);
+  EXPECT_EQ(actual_keys.size(), 5U);
+}
+
+/**
+ * @brief Test: `draining` is `false` by default and `true` when the caller passes it.
+ */
+TEST(SessionApiJsonTest, DrainingFlagFollowsArgument) {
+  const nlohmann::json own = confighttp::session_info_to_json(make_session_info());
+  ASSERT_TRUE(own.contains("draining"));
+  EXPECT_EQ(own["draining"], false);
+
+  const nlohmann::json draining = confighttp::session_info_to_json(make_session_info(), true);
+  ASSERT_TRUE(draining.contains("draining"));
+  EXPECT_EQ(draining["draining"], true);
 }
 
 /**
@@ -253,6 +271,7 @@ TEST(SessionApiJsonTest, ValuesMatchSessionInfo) {
     {"started", 1700000000},
     {"transport", "udp/ipv4"},
     {"client_category", "lan"},
+    {"draining", false},
   };
 
   EXPECT_EQ(json, expected);
@@ -276,6 +295,7 @@ TEST(SessionApiJsonTest, ValuesMatchSessionInfoForIpv6Wan) {
     {"started", 1700000000},
     {"transport", "udp/ipv6"},
     {"client_category", "wan"},
+    {"draining", false},
   };
   EXPECT_EQ(json, expected);
 }
@@ -1057,3 +1077,56 @@ TEST_F(SessionApiHttpTest, DisablingRateLimiterRestoresAccess) {
   ASSERT_EQ(response->status_code, "200 OK");
   EXPECT_EQ(stream::session::state(*session), stream::session::state_e::STOPPING);
 }
+
+#ifdef __linux__
+/**
+ * @brief Test double for the draining peer that records whether `close` was called.
+ */
+class RecordingClosePeer final: public handoff::session_peer_t {
+public:
+  bool close_called = false;  ///< Set when `close` runs.
+
+  bool exists() override {
+    return true;
+  }
+
+  bool gone() override {
+    return false;
+  }
+
+  handoff::drain_peer_t::reply_e end_all(std::chrono::milliseconds) override {
+    return handoff::drain_peer_t::reply_e::no_reply;
+  }
+
+  std::optional<std::vector<handoff::protocol::session_entry_t>> list(std::chrono::milliseconds) override {
+    return std::nullopt;
+  }
+
+  std::optional<rtsp_stream::close_result_e> close(std::uint32_t, std::chrono::milliseconds) override {
+    close_called = true;
+    return rtsp_stream::close_result_e::closed;
+  }
+
+  std::optional<std::uint32_t> close_cert(std::string_view, std::chrono::milliseconds) override {
+    return std::nullopt;
+  }
+
+  handoff::state_e state() override {
+    return handoff::state_e::draining;
+  }
+};
+
+/**
+ * @brief Test: an unauthenticated close of a draining session is rejected and the draining peer is never asked to close.
+ */
+TEST_F(SessionApiHttpTest, CloseDrainingSessionWithoutCredentialsIsRejectedAndNotForwarded) {
+  auto peer = std::make_shared<RecordingClosePeer>();
+  handoff::runtime().set_peer(peer);
+
+  const auto response = client->request("POST", "/api/sessions/4242/close", "");
+
+  handoff::runtime().set_peer(nullptr);
+  EXPECT_EQ(response->status_code, "401 Unauthorized");
+  EXPECT_FALSE(peer->close_called) << "An unauthenticated close must not reach the draining peer.";
+}
+#endif
