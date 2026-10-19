@@ -861,24 +861,42 @@ namespace {
     }
 
     /**
+     * @brief Result of `flood_until_main`.
+     */
+    struct flood_result_t {
+      std::chrono::steady_clock::time_point seen;  ///< When the pump saw `MAIN`, or when it stopped (EOF or the deadline).
+      int sent {0};  ///< Sends that succeeded (the whole datagram was sent), out of the target.
+    };
+
+    /**
      * @brief Flood the old side from a thread of its own while this thread answers PINGs until `MAIN` arrives.
      *
-     * The flood thread retries a send while the socket is full, so all `count` messages are sent (more than the
-     * drain queue bound, so the queue-full path runs). The test thread keeps pumping, so PINGs are answered however
-     * slow the sends are (sanitizer builds). The flood thread is stopped and joined before this returns.
+     * The flood thread sends `message` until `sent_target` sends have succeeded. It retries only when `send()`
+     * fails with `EAGAIN` or `EWOULDBLOCK` (the socket is full); any other failure ends the flood. The test thread
+     * keeps pumping, so PINGs are answered however slow the sends are (sanitizer builds). The pump stops at `MAIN`,
+     * at end of channel, or at a 1500 ms deadline. After that the flood may keep going, up to the same deadline,
+     * until it reaches the target or fails. The flood thread is stopped and joined before this returns.
      *
-     * @param message Message sent `count` times.
-     * @param count Number of sends.
-     * @return The time at which the pump saw `MAIN`, or the time at the deadline when it did not arrive.
+     * @param message Message sent repeatedly.
+     * @param sent_target Number of successful sends to aim for.
+     * @return `seen` is the time the pump stopped (MAIN, EOF or the deadline); `sent` is the number of successful sends.
      */
-    std::chrono::steady_clock::time_point flood_until_main(const protocol::message_t &message, int count) {
+    flood_result_t flood_until_main(const protocol::message_t &message, int sent_target) {
       std::atomic<bool> stop_flood {false};
-      std::thread flooder([this, &message, count, &stop_flood]() {
-        for (int i = 0; i < count && !stop_flood; ++i) {
-          while (!stop_flood && !peer->send(message)) {
+      std::atomic<int> sent {0};
+      std::atomic<bool> done {false};
+      std::thread flooder([this, &message, sent_target, &stop_flood, &sent, &done]() {
+        while (!stop_flood && sent < sent_target) {
+          errno = 0;
+          if (peer->send(message)) {
+            ++sent;
+          } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             std::this_thread::yield();  // socket full: the old side has not drained it yet
+          } else {
+            break;  // closed channel or encoding failure: retrying cannot help
           }
         }
+        done = true;
       });
       flood_joiner_t joiner {stop_flood, flooder};
       const auto deadline = std::chrono::steady_clock::now() + 1500ms;
@@ -887,10 +905,15 @@ namespace {
           break;
         }
       }
-      const auto seen = std::chrono::steady_clock::now();
+      flood_result_t result;
+      result.seen = std::chrono::steady_clock::now();
+      while (!done && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms);
+      }
       stop_flood = true;
       flooder.join();
-      return seen;
+      result.sent = sent.load();
+      return result;
     }
 
     /// Expected tail of a rollback of a failed start (before the first switch substep).
@@ -1935,7 +1958,11 @@ TEST_F(HandoffOldSideTest, FloodOfDrainRequestsWithBlockedHandlerDoesNotDelayHan
   ASSERT_TRUE(to_committed());
   const auto committed_at = std::chrono::steady_clock::now();
   const protocol::message_t request = protocol::sessions_request_t {7};
-  const auto seen = flood_until_main(request, 2000);
+  const auto flood = flood_until_main(request, 2000);
+  ASSERT_GT(flood.sent, 1025) << "the flood must deliver more requests than the drain queue bounds (1024 waiting for the handler plus "
+                                 "1024 for the run thread), so the queue-full path runs; only "
+                              << flood.sent << " sends succeeded (the old side may be too slow to drain the socket)";
+  const auto seen = flood.seen;
   EXPECT_EQ(1, peer->mains) << "MAIN must still arrive while the drain handler is blocked and requests flood in";
   // Measured from the first blocked handler call, not from the start of the flood: a handover that waited for the
   // handler would arrive about 700 ms after that call (the handler's cap), while a correct one arrives about the
@@ -1957,8 +1984,9 @@ TEST_F(HandoffOldSideTest, FloodOfDrainRequestsWithBlockedHandlerDoesNotDelayHan
   const auto outcome = finish();
   ASSERT_TRUE(outcome.has_value());
   EXPECT_EQ(old_outcome_e::handed_over, *outcome);
-  std::lock_guard lock {handler_mutex};
-  EXPECT_LE(handled.size(), 1025U) << "the number of requests waiting for the handler is bounded";
+  // Not checked: the 1024 + 1024 queue bounds. With the handler blocked only its first call is observable (so
+  // `handled` cannot exceed 1), and `run()` has returned by the time the handler is released, so queued requests
+  // cannot be counted through the header's contract. The bound is covered only by the delivered-count assertion above.
 }
 
 TEST_F(HandoffOldSideTest, FloodOfPongsDoesNotDelayPingsOrHandover) {
@@ -1967,8 +1995,7 @@ TEST_F(HandoffOldSideTest, FloodOfPongsDoesNotDelayPingsOrHandover) {
   ASSERT_TRUE(to_committed());
   const auto committed_at = std::chrono::steady_clock::now();
   const protocol::message_t pong = protocol::pong_t {100000};
-  const auto seen = flood_until_main(pong, 2000);
-  const auto elapsed = seen - committed_at;
+  const auto elapsed = flood_until_main(pong, 2000).seen - committed_at;
   EXPECT_EQ(1, peer->mains) << "MAIN must arrive after a flood of PONGs";
   EXPECT_LT(elapsed, 900ms) << "the handover must happen about rollback_window after COMMIT despite the flood";
   EXPECT_GE(peer->pings.size(), 2U) << "PINGs keep being sent during the flood";
