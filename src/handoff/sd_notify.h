@@ -46,7 +46,8 @@ namespace handoff::sd {
   /**
    * @brief Unit of this process, from the content of `/proc/self/cgroup`.
    *
-   * Uses the cgroup v2 line (`0::<path>`). The unit is the last path component that ends in `.service`.
+   * Uses the cgroup v2 line (`0::<path>`). The unit is the last path component that ends in `.service`, skipping the
+   * user manager's own `user@<uid>.service` (a process in a scope or app slice under it has no service unit).
    *
    * @param cgroup Content of `/proc/self/cgroup`.
    * @return Unit name, or `std::nullopt` when none is found.
@@ -78,8 +79,17 @@ namespace handoff::sd {
   std::optional<pid_t> parse_mainpid(std::string_view output);
 
   /**
-   * @brief Run `systemctl [--user] show -p MainPID --value <unit>` with a timeout and parse it.
+   * @brief Run `systemctl [--user] show -p MainPID --value -- <unit>` with a timeout and parse it.
    *
+   * The draining process's control loop reaps any child with `waitpid(-1, WNOHANG)` [C27], so the command is tracked
+   * by pidfd only: it is spawned with `pidfd_spawn` (or `pidfd_open` right after the spawn, before any wait could run),
+   * signalled with `pidfd_send_signal` and reaped with `waitid(P_PIDFD)`; never by pid. If it was reaped elsewhere
+   * (`ECHILD`) after its output reached end-of-file, the parsed output is used (the exit status is then unknown).
+   *
+   * The command is `/usr/bin/systemctl` (no `PATH` search), with no shell, fds 3 and up closed in the child
+   * (`posix_spawn_file_actions_addclosefrom_np(3)`), the default signal mask and dispositions, and the output capped at
+   * 4096 bytes. For a user unit a valid `XDG_RUNTIME_DIR` of the caller is kept; it is set to `/run/user/<uid>` only
+   * when unset or empty.
    * @param unit Unit name.
    * @param user_unit `true` for `--user`.
    * @param timeout Longest run time; the command is killed after it.
