@@ -394,7 +394,9 @@ namespace nvhttp {
    *
    * While frozen (see @ref set_state_frozen) it writes nothing and returns `true` (nothing was lost on purpose, so
    * the caller must not report a failure). Otherwise it does what the internal save does today (merge the host unique
-   * id and `root.named_devices` into the existing file, keeping other keys) but writes the result with
+   * id and `root.named_devices` into the existing file, replacing those two nodes and keeping other keys, except the
+   * legacy `root.devices` list, which is removed: the loader has already imported it into `root.named_devices`, and
+   * keeping it would re-import unpaired clients on every load) but writes the result with
    * `file_handler::write_file_atomic` (temporary file in the same directory, fsync, rename). If the existing file
    * exists and cannot be parsed, or the write fails, it writes nothing, logs an Error and returns `false`. Takes
    * `client_auth_mutex()` itself, so it must not be called with that mutex held. The saves done by pairing, unpair and
@@ -464,7 +466,8 @@ namespace nvhttp {
    * @brief Set the id the next launch will get (the new process, at `COMMIT`, from `GO`'s
    * `next_launch_session_id`). Sets unconditionally; call it before the server accepts.
    *
-   * @param next_id The id for the next allocation (the counter becomes `next_id - 1`, wrapping).
+   * @param next_id The id for the next allocation (the counter becomes `next_id - 1`). Ids start at 1, so 0 is
+   *        treated as 1.
    */
   void set_next_launch_session_id(std::uint32_t next_id);
 
