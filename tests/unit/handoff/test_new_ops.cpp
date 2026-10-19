@@ -1443,4 +1443,375 @@ TEST_F(HandoffNewOpsCoordinatorHookTest, DefaultControlServerWithACoordinatorSta
   coordinator.stop_control();
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The inherited listener fds (start_servers_paused contract): closed exactly once, the channel fd never
+// ---------------------------------------------------------------------------------------------------------------------
+
+namespace {
+  /**
+   * @brief Whether a descriptor number is closed (not open in this process).
+   *
+   * @param fd Descriptor.
+   * @return `true` when `fcntl(F_GETFD)` fails with `EBADF`.
+   */
+  bool fd_is_closed(int fd) {
+    return ::fcntl(fd, F_GETFD) == -1 && errno == EBADF;
+  }
+}  // namespace
+
+/**
+ * @brief Fixture with real descriptors behind the inherited listener and channel numbers.
+ *
+ * The four listener numbers and the channel number of the fake handoff environment are real socketpair ends owned by
+ * the test until the ops close them, so a close is observable with `fcntl(F_GETFD)`.
+ */
+class HandoffNewOpsInheritedFdsTest: public ::testing::Test {
+protected:
+  /**
+   * @brief Create the descriptors, the runtime and the ops.
+   */
+  void SetUp() override {
+    const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
+    _dir = std::filesystem::temp_directory_path() / ("sunshine-t18d-fds-" + std::to_string(::getpid()) + "-" + info->name());
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
+    std::filesystem::create_directories(_dir, ec);
+
+    for (int i = 0; i < 4; ++i) {
+      int pair[2] = {-1, -1};
+      ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair), 0) << "setup: socketpair";
+      listener[i] = pair[0];
+      listener_peer[i] = pair[1];
+    }
+    int cpair[2] = {-1, -1};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, cpair), 0) << "setup: socketpair";
+    channel_fd = cpair[0];
+    channel_fd_peer = cpair[1];
+
+    config.port = 47989;
+    config.feature_enabled = true;
+    config.servers_listening_timeout = 2000ms;
+
+    seams.validate_listener = [this](int, int, bool) {
+      return validate_reason;
+    };
+    seams.exit_process = [this](int code) {
+      exit_codes.add("exit_process(" + std::to_string(code) + ")");
+    };
+    seams.shutdown_channel = [](handoff::channel_t &) {
+    };
+    seams.set_unmap_scope = [](upnp::unmap_scope_e) {
+    };
+    seams.publish_mdns = [] {
+      return true;
+    };
+    seams.start_upnp = []() -> std::unique_ptr<platf::deinit_t> {
+      return nullptr;
+    };
+    seams.request_tray_start = [] {
+    };
+
+    std::map<std::string, std::string> vars {
+      {"SUNSHINE_HANDOFF_FDS", "https:" + std::to_string(listener[0]) + ",http:" + std::to_string(listener[1]) + ",webui:" + std::to_string(listener[2]) + ",rtsp:" + std::to_string(listener[3])},
+      {"SUNSHINE_HANDOFF_CHANNEL", std::to_string(channel_fd)},
+      {"SUNSHINE_HANDOFF_UDP_BASE", "48100"},
+      {"SUNSHINE_HANDOFF_GENERATION", "1"},
+    };
+    handoff::runtime().reset_for_test();
+    handoff::early_init_env_t env;
+    env.getenv = [&vars](const char *name) -> const char * {
+      auto it = vars.find(name);
+      return it == vars.end() ? nullptr : it->second.c_str();
+    };
+    env.unsetenv = [&vars](const char *name) {
+      vars.erase(name);
+    };
+    env.scrub_fds = [] {
+    };
+    ASSERT_EQ(handoff::runtime().early_init(env), "") << "setup: early_init with a valid fake handoff environment must succeed";
+
+    handoff::instance_t initial;
+    initial.pid = ::getpid();
+    initial.start_time = 1;
+    initial.role = handoff::role_e::pending;
+    initial.udp_base = 48100;
+    ASSERT_TRUE(handoff::runtime().open_instance(_dir / "instances", initial)) << "setup: the instance file must be writable";
+
+    const auto pair = handoff::make_channel_pair();
+    ASSERT_TRUE(pair.has_value()) << "setup: socketpair";
+    channel = std::make_shared<handoff::channel_t>(pair->first);
+    peer = std::make_unique<handoff::channel_t>(pair->second);
+    build();
+  }
+
+  /**
+   * @brief Release the ops, the descriptors that are still open, the runtime and the temporary directory.
+   */
+  void TearDown() override {
+    ops.reset();
+    peer.reset();
+    channel.reset();
+    for (const int fd : sentinels) {
+      ::close(fd);
+    }
+    for (int i = 0; i < 4; ++i) {
+      if (!fd_is_closed(listener[i]) && !sentinel_owns(listener[i])) {
+        ::close(listener[i]);
+      }
+      ::close(listener_peer[i]);
+    }
+    if (!fd_is_closed(channel_fd) && !sentinel_owns(channel_fd)) {
+      ::close(channel_fd);
+    }
+    ::close(channel_fd_peer);
+    handoff::runtime().instance_remove();
+    handoff::runtime().reset_for_test();
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
+  }
+
+  /**
+   * @brief (Re)build the ops from `config` and `seams`.
+   */
+  void build() {
+    ops = std::make_unique<handoff::sunshine_new_ops_t>(config, channel, upnp_slot, seams);
+  }
+
+  /**
+   * @brief Whether the four listener descriptors are all closed.
+   *
+   * @return `true` when none is open.
+   */
+  bool listeners_closed() const {
+    return std::all_of(std::begin(listener), std::end(listener), [](int fd) {
+      return fd_is_closed(fd);
+    });
+  }
+
+  /**
+   * @brief Whether the four listener descriptors are all still open.
+   *
+   * @return `true` when all are open.
+   */
+  bool listeners_open() const {
+    return std::none_of(std::begin(listener), std::end(listener), [](int fd) {
+      return fd_is_closed(fd);
+    });
+  }
+
+  /**
+   * @brief Whether a sentinel took this descriptor number.
+   *
+   * @param fd Number.
+   * @return `true` when one did.
+   */
+  bool sentinel_owns(int fd) const {
+    return std::find(sentinels.begin(), sentinels.end(), fd) != sentinels.end();
+  }
+
+  /**
+   * @brief Take the numbers of the closed listeners with eventfds, to see a second close of the same number.
+   *
+   * A descriptor closed twice would close whatever reused its number in between; the sentinels are that reuse.
+   *
+   * @return How many listener numbers a sentinel now holds.
+   */
+  int occupy_listener_numbers() {
+    std::vector<int> extra;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+      const int fd = ::eventfd(0, EFD_CLOEXEC);
+      if (fd < 0) {
+        break;
+      }
+      if (std::find(std::begin(listener), std::end(listener), fd) != std::end(listener)) {
+        sentinels.push_back(fd);
+      } else {
+        extra.push_back(fd);
+      }
+      if (sentinels.size() == 4) {
+        break;
+      }
+    }
+    for (const int fd : extra) {
+      ::close(fd);
+    }
+    return static_cast<int>(sentinels.size());
+  }
+
+  /**
+   * @brief Validate and report all four servers listening, then start the servers (adoption).
+   *
+   * @return The result of `start_servers_paused()`.
+   */
+  std::string adopt_all() {
+    EXPECT_EQ(ops->validate_listeners(), "") << "setup: validate_listeners must succeed";
+    for (int i = 0; i < 4; ++i) {
+      ops->server_listening();
+    }
+    return ops->start_servers_paused();
+  }
+
+  handoff::new_ops_config_t config;  ///< Ops configuration.
+  handoff::new_ops_seams_t seams;  ///< Ops seams.
+  recorder_t exit_codes;  ///< Record of `exit_process` calls.
+  std::string validate_reason;  ///< Result of the `validate_listener` seam.
+  int listener[4] = {-1, -1, -1, -1};  ///< The inherited listener numbers (https, http, webui, rtsp).
+  int listener_peer[4] = {-1, -1, -1, -1};  ///< The other ends, kept open by the test.
+  int channel_fd {-1};  ///< The inherited channel number.
+  int channel_fd_peer {-1};  ///< Its other end.
+  std::vector<int> sentinels;  ///< Eventfds that took closed listener numbers.
+  std::unique_ptr<platf::deinit_t> upnp_slot;  ///< The guard slot.
+  std::shared_ptr<handoff::channel_t> channel;  ///< The ops' own channel.
+  std::unique_ptr<handoff::channel_t> peer;  ///< Its peer.
+  std::unique_ptr<handoff::sunshine_new_ops_t> ops;  ///< Ops under test.
+
+private:
+  std::filesystem::path _dir;  ///< Temporary directory.
+};
+
+TEST_F(HandoffNewOpsInheritedFdsTest, ListenersStayOpenUntilTheLastServerListens) {
+  ASSERT_EQ(ops->validate_listeners(), "");
+  EXPECT_TRUE(listeners_open()) << "validate_listeners must not close the inherited listeners";
+  std::promise<std::string> result;
+  auto future = result.get_future();
+  std::thread worker([&] {
+    result.set_value(ops->start_servers_paused());
+  });
+  for (int i = 0; i < 3; ++i) {
+    ops->server_listening();
+  }
+  EXPECT_EQ(future.wait_for(60ms), std::future_status::timeout) << "start_servers_paused must still wait for the fourth server";
+  EXPECT_TRUE(listeners_open()) << "the inherited listeners must stay open until every server has adopted its listener";
+  ops->server_listening();
+  ASSERT_EQ(future.wait_for(1500ms), std::future_status::ready);
+  worker.join();
+  EXPECT_EQ(future.get(), "");
+  EXPECT_TRUE(listeners_closed()) << "after every server adopted its listener the four inherited fds must be closed";
+}
+
+TEST_F(HandoffNewOpsInheritedFdsTest, AdoptionClosesTheFourListenersAndKeepsTheChannel) {
+  ASSERT_EQ(adopt_all(), "");
+  EXPECT_TRUE(listeners_closed()) << "the four inherited listener fds must be closed after adoption";
+  EXPECT_FALSE(fd_is_closed(channel_fd)) << "the inherited channel fd must stay open";
+  EXPECT_FALSE(fd_is_closed(channel_fd_peer)) << "control: the test's own descriptors are untouched";
+}
+
+TEST_F(HandoffNewOpsInheritedFdsTest, ListenersAreClosedExactlyOnce) {
+  ASSERT_EQ(adopt_all(), "");
+  ASSERT_TRUE(listeners_closed());
+  ASSERT_EQ(occupy_listener_numbers(), 4) << "setup: could not reuse the closed descriptor numbers";
+  ops->mark_finished();
+  ops->exit_failure();
+  ops->mark_finished();
+  for (const int fd : sentinels) {
+    EXPECT_FALSE(fd_is_closed(fd)) << "a later call closed a descriptor number again (fd " << fd << "): the inherited fds must be closed exactly once";
+  }
+  ops.reset();
+  for (const int fd : sentinels) {
+    EXPECT_FALSE(fd_is_closed(fd)) << "the destructor closed an inherited fd number again (fd " << fd << ")";
+  }
+  EXPECT_FALSE(fd_is_closed(channel_fd)) << "the channel fd must stay open";
+}
+
+TEST_F(HandoffNewOpsInheritedFdsTest, FailedValidationClosesTheListeners) {
+  validate_reason = "port in use";
+  EXPECT_TRUE(listeners_open()) << "control: open before the validation";
+  EXPECT_NE(ops->validate_listeners(), "");
+  EXPECT_EQ(ops->wait_listeners_validated(200ms), validation_e::failed);
+  ops->mark_finished();
+  // SPEC-QUESTION: new_ops.h says the fds are closed "there" on a failed validation; this test checks after
+  // mark_finished(), which the new-side thread always calls, so it holds whether the close is in validate_listeners()
+  // or in mark_finished().
+  EXPECT_TRUE(listeners_closed()) << "a failed validation must close the four inherited listener fds";
+  EXPECT_FALSE(fd_is_closed(channel_fd)) << "the channel fd must stay open";
+}
+
+TEST_F(HandoffNewOpsInheritedFdsTest, TimedOutValidationClosesTheListeners) {
+  EXPECT_EQ(ops->wait_listeners_validated(30ms), validation_e::timeout);
+  ops->mark_finished();
+  // SPEC-QUESTION: same as FailedValidationClosesTheListeners (when exactly the close happens on a timeout).
+  EXPECT_TRUE(listeners_closed()) << "a timed-out validation must close the four inherited listener fds";
+  EXPECT_FALSE(fd_is_closed(channel_fd)) << "the channel fd must stay open";
+}
+
+TEST_F(HandoffNewOpsInheritedFdsTest, ServersNotListeningInTimeCloseTheListeners) {
+  config.servers_listening_timeout = 100ms;
+  build();
+  ASSERT_EQ(ops->validate_listeners(), "");
+  ops->server_listening();
+  const std::string reason = ops->start_servers_paused();
+  EXPECT_NE(reason, "") << "setup: the wait must time out with one of four servers listening";
+  ops->mark_finished();
+  EXPECT_TRUE(listeners_closed()) << "listeners that were not adopted in time must be closed";
+  EXPECT_FALSE(fd_is_closed(channel_fd)) << "the channel fd must stay open";
+}
+
+TEST_F(HandoffNewOpsInheritedFdsTest, ServersFailedClosesTheListeners) {
+  ASSERT_EQ(ops->validate_listeners(), "");
+  ops->servers_failed("HTTP interface failed to initialize");
+  EXPECT_EQ(ops->start_servers_paused(), "HTTP interface failed to initialize");
+  ops->mark_finished();
+  EXPECT_TRUE(listeners_closed()) << "listeners of servers that failed to start must be closed";
+  EXPECT_FALSE(fd_is_closed(channel_fd)) << "the channel fd must stay open";
+}
+
+TEST_F(HandoffNewOpsInheritedFdsTest, ExitFailureClosesTheListenersAndKeepsTheChannel) {
+  ASSERT_EQ(ops->validate_listeners(), "");
+  EXPECT_TRUE(listeners_open()) << "control: open before exit_failure";
+  ops->exit_failure();
+  EXPECT_EQ(exit_codes.count("exit_process(1)"), 1) << "exit_failure must exit with code 1 through the seam";
+  EXPECT_TRUE(listeners_closed()) << "exit_failure must close the four inherited listener fds";
+  EXPECT_FALSE(fd_is_closed(channel_fd)) << "the channel fd is never closed by the ops";
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// set_new_ops_coordinator(nullptr): no seam touches the coordinator afterwards
+// ---------------------------------------------------------------------------------------------------------------------
+
+// SPEC-QUESTION: new_ops.h says set_new_ops_coordinator(nullptr) waits for a running seam call, but no public seam of
+// the default cooldown or control-server path can be held in flight by a test. The test below checks the consequence:
+// the coordinator may be destroyed right after set_new_ops_coordinator(nullptr) returns while another thread keeps
+// delivering cooldown deadlines through the default seam. Under ASan a use after free is reported.
+TEST_F(HandoffNewOpsCoordinatorHookTest, ClearingTheHookWhileSeamCallsRunMakesTheCoordinatorSafeToDestroy) {
+  handoff::control_server_t control;
+  auto coordinator = std::make_unique<handoff::coordinator_t>(control);
+  std::atomic<bool> stop {false};
+  std::atomic<int> delivered {0};
+  std::thread deliverer([&] {
+    while (!stop.load()) {
+      auto hello = old_hello();
+      hello.cooldown_deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>((std::chrono::steady_clock::now() + 30s).time_since_epoch()).count();
+      const int pidfd = make_fake_pidfd();
+      ops->accept_old_hello(hello, pidfd);
+      const int taken = ops->take_old_pidfd();
+      if (taken >= 0) {
+        ::close(taken);
+      }
+      ++delivered;
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+  for (int i = 0; i < 40; ++i) {
+    handoff::set_new_ops_coordinator(coordinator.get());
+    std::this_thread::sleep_for(1ms);
+    handoff::set_new_ops_coordinator(nullptr);
+  }
+  ASSERT_TRUE(wait_until([&] {
+    return delivered.load() > 3;
+  },
+                         1000ms))
+    << "setup: the deliverer thread must have run";
+  handoff::set_new_ops_coordinator(coordinator.get());
+  handoff::set_new_ops_coordinator(nullptr);
+  coordinator.reset();  // no seam call may touch it from here on
+  const int before = delivered.load();
+  EXPECT_TRUE(wait_until([&] {
+    return delivered.load() > before + 2;
+  },
+                         1000ms))
+    << "deliveries must go on (to the stored-deadline path) after the coordinator is gone";
+  stop = true;
+  deliverer.join();
+}
+
 #endif  // __linux__

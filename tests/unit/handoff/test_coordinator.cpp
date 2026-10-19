@@ -3370,4 +3370,46 @@ TEST_F(HandoffCoordinatorTest, StartControlWorksAgainAfterStopControl) {
   EXPECT_EQ(std::string {hf::refusal_reason::no_notify_socket}, reply->reason);
 }
 
+TEST_F(HandoffCoordinatorTest, ConcurrentStartControlStartsOneServerAndNoCallFails) {
+  notify_value = "";
+  const auto path = hf::control_socket_path(tmp, ::getpid()).string();
+  for (int round = 0; round < 4; ++round) {
+    constexpr int callers = 6;
+    std::atomic<bool> go {false};
+    std::atomic<int> ready {0};
+    std::atomic<int> succeeded {0};
+    std::atomic<int> failed {0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < callers; ++i) {
+      threads.emplace_back([&] {
+        ++ready;
+        while (!go.load()) {
+          std::this_thread::yield();
+        }
+        if (C().start_control(path)) {
+          ++succeeded;
+        } else {
+          ++failed;
+        }
+      });
+    }
+    while (ready.load() < callers) {
+      std::this_thread::yield();
+    }
+    go = true;
+    for (auto &t : threads) {
+      t.join();
+    }
+    EXPECT_EQ(0, failed.load()) << "round " << round << ": a start_control() that raced another one must return true (idempotent), not fail";
+    EXPECT_EQ(callers, succeeded.load()) << "round " << round << ": every concurrent start_control() must return true";
+    const int before = cnt_notify.load();
+    const auto reply = control_request(path);
+    ASSERT_TRUE(reply.has_value()) << "round " << round << ": the one server must answer";
+    EXPECT_EQ(std::string {hf::refusal_reason::no_notify_socket}, reply->reason);
+    EXPECT_EQ(before + 1, cnt_notify.load()) << "round " << round << ": one request must reach exactly one handler";
+    C().stop_control();
+    EXPECT_FALSE(control_request(path).has_value()) << "round " << round << ": after stop_control() no second server may still listen on the path";
+  }
+}
+
 #endif  // __linux__
