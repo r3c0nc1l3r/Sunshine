@@ -1180,9 +1180,11 @@ protected:
   }
 
   /**
-   * @brief Stop the server and restore configuration.
+   * @brief Close the client, stop the server and restore configuration.
    */
   void TearDown() override {
+    // Close the client first, so the server has no open connection to this process when it stops and joins.
+    client.reset();
     if (server) {
       server->stop();
     }
