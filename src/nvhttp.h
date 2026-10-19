@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -361,6 +362,106 @@ namespace nvhttp {
    * @examples_end
    */
   void erase_all_clients();
+
+  /**
+   * @brief Outcome of reloading the state file.
+   */
+  enum class load_status_e {
+    loaded,  ///< The file was read, had `root.uniqueid`, and the in-memory state was replaced from it.
+    no_file,  ///< The state file does not exist. Nothing was changed.
+    no_uniqueid,  ///< The file exists and parses but has no `root.uniqueid` (not Sunshine credentials). Nothing was changed.
+    unreadable,  ///< The file exists but cannot be read, parsed, or has a malformed client list. Nothing was changed.
+  };
+
+  /**
+   * @brief Reload `sunshine_state.json` into memory: the host unique id, the paired clients, and the trusted
+   * certificate chain (as the startup load does).
+   *
+   * Used by the drain-handoff `GO` (new process) and by a rollback (old process). Unlike the startup load, it never
+   * generates a new unique id and never leaves a partial state: the file is parsed completely first, and only a
+   * fully parsed file with `root.uniqueid` replaces the in-memory state; for every other status nothing changes
+   * (the caller treats it as a failure and logs the reason). Takes `client_auth_mutex()` itself, so it must not be
+   * called with that mutex held. Logs an Error for `unreadable` and an Info line for the other failures.
+   *
+   * @return The outcome.
+   */
+  load_status_e reload_state();
+
+  /**
+   * @brief Persist the paired-client state and report whether it succeeded.
+   *
+   * While frozen (see @ref set_state_frozen) it writes nothing and returns `true` (nothing was lost on purpose, so
+   * the caller must not report a failure). Otherwise it does what the internal save does today (merge the host unique
+   * id and `root.named_devices` into the existing file, keeping other keys) but writes the result with
+   * `file_handler::write_file_atomic` (temporary file in the same directory, fsync, rename). If the existing file
+   * exists and cannot be parsed, or the write fails, it writes nothing, logs an Error and returns `false`. Takes
+   * `client_auth_mutex()` itself, so it must not be called with that mutex held. The saves done by pairing, unpair and
+   * client enable go through the same atomic write and the same frozen rule.
+   *
+   * @return `true` when the file now holds the current state, or when frozen; `false` on failure.
+   */
+  bool save_state_checked();
+
+  /**
+   * @brief Freeze or unfreeze the state file. While frozen every save (including `save_state_checked`) is a no-op.
+   *
+   * Thread-safe (an atomic flag). The old process freezes at the switch and unfreezes on a rollback; the flag is not
+   * persisted.
+   *
+   * @param frozen `true` to freeze.
+   */
+  void set_state_frozen(bool frozen);
+
+  /**
+   * @brief Whether saves are frozen.
+   *
+   * @return The flag set by @ref set_state_frozen; `false` at startup.
+   */
+  bool state_frozen();
+
+  /**
+   * @brief Number of pairing sessions that are still waiting (for the PIN or for the next phase).
+   *
+   * Calls @ref expire_pair_sessions with the current time first, then counts the entries of the session map under its
+   * mutex. Pairing sessions that sit in `async_insert_pin` waiting for the PIN count.
+   *
+   * @return Count.
+   */
+  std::size_t pairing_session_count();
+
+  /**
+   * @brief The current `host_audio` value: the `localAudioPlayMode` of the last `/launch` or `/resume` that carried
+   * it (what `/resume` uses when the parameter is absent). `false` at startup.
+   *
+   * Thread-safe (an atomic).
+   *
+   * @return The value.
+   */
+  bool host_audio();
+
+  /**
+   * @brief Set the `host_audio` value (the new process, at `COMMIT`, from `GO`).
+   *
+   * @param value New value.
+   */
+  void set_host_audio(bool value);
+
+  /**
+   * @brief The launch session id that the next `/launch` or `/resume` will get. 1 at startup (ids start at 1).
+   *
+   * Thread-safe (an atomic). Only a snapshot: a launch can allocate right after the call.
+   *
+   * @return The next id (one more than the last allocated id, wrapping at 2^32).
+   */
+  std::uint32_t next_launch_session_id();
+
+  /**
+   * @brief Set the id the next launch will get (the new process, at `COMMIT`, from `GO`'s
+   * `next_launch_session_id`). Sets unconditionally; call it before the server accepts.
+   *
+   * @param next_id The id for the next allocation (the counter becomes `next_id - 1`, wrapping).
+   */
+  void set_next_launch_session_id(std::uint32_t next_id);
 
 #ifdef SUNSHINE_TESTS
   /**

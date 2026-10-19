@@ -100,21 +100,47 @@ namespace logging {
   /**
    * @brief Format a Boost.Log record for Sunshine log output.
    *
+   * The line is `[<time>]: <Severity>: [<tag>] <message>` when a process tag is set (see @ref set_process_tag), for
+   * example `[2026-01-01 12:00:00.000]: Info: [drain] Session ended`, and `[<time>]: <Severity>: <message>` when it
+   * is not. The tag is read once per record.
+   *
    * @param view Boost.Log record view being formatted.
    * @param os Boost.Log output stream receiving formatted text.
    */
   void formatter(const boost::log::record_view &view, boost::log::formatting_ostream &os);
 
   /**
+   * @brief Set the process tag that every later log line carries right after the severity (`[drain] ` for a draining
+   * handoff process).
+   *
+   * Thread-safe and callable from any thread at any time, also while other threads log; a record is formatted with
+   * either the old or the new tag, never a torn one. The tag is stored as given, without the brackets (the formatter
+   * adds `[` and `]` and one trailing space). Nothing is logged by this call.
+   *
+   * @param tag New tag, for example `drain`. An empty string clears the tag.
+   */
+  void set_process_tag(std::string tag);
+
+  /**
+   * @brief The current process tag.
+   *
+   * @return The tag without brackets; empty when none is set.
+   */
+  std::string process_tag();
+
+  /**
    * @brief Rotate the current log file and initialize the logging system.
    * @param min_log_level The minimum log level to output.
    * @param log_file The log file to write to.
+   * @param append_no_rotate When `true` (a drain-handoff child process), the log file is not rotated and is opened
+   *        for appending (`std::ios::app`), so the new process continues the running process's log instead of
+   *        renaming or truncating it. When `false` (the default), behaviour is unchanged: rotate, then truncate.
    * @return An object that will deinitialize the logging system when it goes out of scope.
    * @examples
    * log_init(2, "sunshine.log");
    * @examples_end
    */
-  [[nodiscard]] std::unique_ptr<deinit_t> init(int min_log_level, const std::string &log_file);
+  [[nodiscard]] std::unique_ptr<deinit_t> init(int min_log_level, const std::string &log_file, bool append_no_rotate = false);
 
   /**
    * @brief Setup AV logging.
