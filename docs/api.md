@@ -97,6 +97,12 @@ curl -u user:pass -H "X-CSRF-Token: your_token_here" \
 ## POST /api/restart
 @copydoc confighttp::restart()
 
+## GET /api/sessions
+@copydoc confighttp::getSessions()
+
+## POST /api/sessions/{id}/close
+@copydoc confighttp::closeSession()
+
 ## GET /api/virtual-input/status
 @copydoc confighttp::getVirtualInputStatus()
 
