@@ -3,8 +3,8 @@
  * @brief The refusal rules of the handoff verb (spec step 1, "Trigger and checks") and the functions that gather
  * their inputs.
  *
- * `check_refusal()` is a pure function: the coordinator gathers a `refusal_inputs_t`, calls it, and when the result is
- * not empty answers the helper `refused <reason>` (exit 1), logs a Warning that names the reason and the peer pid
+ * `check_refusal()` is a pure function: the coordinator gathers a `refusal_inputs_t`, calls it, and when the result
+ * is not empty answers the helper `refused <reason>` (exit 1), logs a Warning that names the reason and the peer pid
  * (`log_refusal()`), and changes nothing else. A refusal does not start the cooldown and is never retried by the
  * coordinator. The switch repeats the app, pairing and pending-launch checks in `old_side_ops_t::recheck()` (substep 4);
  * that path is owned by the coordinator, may reuse the gatherers below, and does not use `check_refusal()`.
@@ -106,7 +106,9 @@ namespace handoff {
    *    `refusal_reason::systemd_old`. Version 254 itself and above pass.
    * 7. `!unit_found`: `refusal_reason::no_unit`.
    * 8. `!app_adoptable`: `refusal_reason::app_generic` when `app_reason` is empty, else
-   *    `refusal_reason::app_prefix` followed by `app_reason`.
+   *    `refusal_reason::app_prefix` followed by `app_reason` after it was sanitised: every CR and LF is replaced with a
+   *    space and the text is truncated to 200 bytes (so the result is always one line). If the sanitised text is empty
+   *    the generic reason is used.
    * 9. `pairing_count > 0`: `refusal_reason::pairing`.
    * 10. `pending_launch`: `refusal_reason::pending_launch`.
    *
@@ -195,14 +197,17 @@ namespace handoff {
   /**
    * @brief Run `systemctl --version` and parse it.
    *
-   * The result of the first successful parse is cached for the life of the process (the systemd version cannot change
-   * under a running service); a failure is not cached and is retried at the next call. The default runner executes
+   * Cache: only a call with the default (empty) runner reads and fills the cache. The cache holds the first successful
+   * parse for the life of the process (the systemd version cannot change under a running service) and is guarded by a
+   * mutex (or `call_once`), so concurrent callers are safe and run the command at most once per success. A failure is
+   * not cached and is retried at the next default-runner call. A call with an injected runner never reads or writes the
+   * cache, so tests do not depend on order or repetition. The default runner executes
    * `/usr/bin/systemctl --version` under the same rules as `sd::read_back_mainpid` (no `PATH` search, no shell, fds 3
    * and up closed, tracked by pidfd only because the control loop reaps with `waitpid(-1)` [C27], output capped at
    * 4096 bytes) with a 2 s timeout.
    *
    * @param runner Returns the command output, or `std::nullopt` on a spawn failure, a timeout, or a non-zero exit;
-   *        empty means the default runner. A test passes a fake.
+   *        empty means the default runner (and the cache). A test passes a fake (and bypasses the cache).
    * @return `sd::parse_systemd_version(output)`; `std::nullopt` when the runner failed or the output did not parse.
    */
   std::optional<int> gather_systemd_version(const std::function<std::optional<std::string>()> &runner = {});
@@ -229,5 +234,8 @@ namespace handoff {
    * @param cooldown_until The coordinator's cooldown deadline (`time_point::min()` for none).
    * @return Inputs for `check_refusal()`.
    */
-  refusal_inputs_t gather_refusal_inputs(const refusal_sources_t &sources, std::chrono::steady_clock::time_point cooldown_until);
+  refusal_inputs_t gather_refusal_inputs(
+    const refusal_sources_t &sources,
+    std::chrono::steady_clock::time_point cooldown_until
+  );
 }  // namespace handoff

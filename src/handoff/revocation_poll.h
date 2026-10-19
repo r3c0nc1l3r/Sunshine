@@ -13,12 +13,17 @@
  *    session: log a Warning (never the content or any certificate) and retry at the next wake. A client missing from
  *    the file ends nothing.
  * 3. For each returned PEM: canonicalize it (production: the same conversion as `nvhttp`'s
- *    `canonical_certificate_pem`, `crypto::pem(crypto::x509(pem))`; an empty result means an invalid certificate, which
- *    is skipped with a Warning) and call the terminate callback (production:
- *    `rtsp_stream::terminate_sessions_by_cert(canonical_pem)`) once for each certificate that is newly disabled: not in
- *    the disabled set of the previous successful pass. The first successful pass counts every disabled certificate as
- *    new. A certificate that was enabled again and disabled again is new again. A callback that throws is logged as an
- *    Error and the certificate stays "new" for the next pass.
+ *    `canonical_certificate_pem`: `crypto::x509(pem)`, and `crypto::pem()` of it only when that is not null; when it is
+ *    null the canonicalizer returns an empty string without calling `crypto::pem`). An empty result means an invalid
+ *    certificate: it is skipped with a Warning, and (see the handled set) that Warning is logged once, not every wake.
+ *    Otherwise call the terminate callback (production: `rtsp_stream::terminate_sessions_by_cert(canonical_pem)`) once
+ *    for each certificate that is new: not in the handled set.
+ * 4. The handled set, keyed by the raw PEM from the file, becomes the current disabled set minus the certificates whose
+ *    callback threw (logged as an Error; they stay new for the next pass) and minus those that were not processed
+ *    because `stop()` was requested. A skipped (invalid) certificate is in the handled set, so it is not retried or
+ *    logged again until it leaves the file's disabled set and returns. The first successful pass has an empty handled
+ *    set, so every disabled certificate is new. A certificate that was enabled again and disabled again is new again.
+ *    A failed pass leaves the handled set unchanged.
  *
  * Wakes: a pass runs immediately at the start, on every `inotify` event of the state file's directory that names the
  * state file (events `IN_CLOSE_WRITE`, `IN_MOVED_TO`, `IN_MOVED_FROM`, `IN_CREATE`, `IN_DELETE`, `IN_MODIFY`; the
@@ -32,9 +37,14 @@
  * episode log at most one Warning per 60 s (by the injected clock); the first successful pass after a failure logs an
  * Info line.
  *
+ * Directory: the watched directory is the state file's parent path; a relative path with no parent directory (a bare
+ * file name) watches `"."`. If the directory does not exist (or the watch cannot be added), the poller logs one Warning
+ * and continues with the timer alone; the passes then report the missing file as a failure (Warning rate limit above).
+ *
  * Only while draining: `start()` refuses unless the process is draining, and each wake first checks again; a wake in
- * which the process is no longer draining (a rollback happened) runs no pass. The coordinator calls `stop()` when the
- * process leaves draining mode.
+ * which the process is no longer draining (a rollback happened) runs no pass and does not count in
+ * `passes_for_test()`. The coordinator calls `stop()` when the process leaves draining mode, from a thread that can
+ * wait: `stop()` may block for as long as one running terminate callback (see `stop()`).
  *
  * Thread-safety: `start()`, `stop()` and `running()` may be called from any thread except the poller's own thread and
  * the terminate callback. They are serialised by one mutex that is not held while the poller thread runs a pass.
@@ -83,7 +93,8 @@ namespace handoff {
      * @brief Start the poller thread.
      *
      * Does nothing and returns `false` when the process is not draining (production: `runtime().mode() ==
-     * mode_e::draining`) or when the state file path is empty. Returns `true` when the thread is running after the
+     * mode_e::draining`; the test config's `is_draining` gates `start()` the same way) or when the state file path is
+     * empty. Returns `true` when the thread is running after the
      * call, also when it already was (idempotent, no second thread). After `stop()` it can start again with a fresh
      * "previous disabled set" (empty).
      *
@@ -97,7 +108,8 @@ namespace handoff {
      * The thread is woken at once (an internal eventfd or pipe is polled with the inotify fd), so `stop()` does not wait
      * for the 2 s cap. A pass that is running finishes reading, but once the stop is requested no further terminate
      * callback is started: the remaining certificates are skipped (they will not be revisited). A terminate callback
-     * that is already running is not interrupted; `stop()` waits for it, bounded by the session join hang guard. A
+     * that is already running is not interrupted; `stop()` waits for it (it may block for as long as one running
+     * callback, bounded by the session join hang guard), so the caller must be a thread that can wait. A
      * wake or inotify event that arrives during `stop()` is discarded. The inotify fd is closed by the thread before it
      * exits.
      */
@@ -121,7 +133,8 @@ namespace handoff {
       std::function<std::string(const std::string &)> canonicalize;  ///< Canonicalizer; empty means the identity
                                                                      ///< function (the production one needs real
                                                                      ///< certificates). An empty return skips the cert.
-      std::function<bool()> is_draining;  ///< Replaces the mode check; empty means "always draining".
+      std::function<bool()> is_draining;  ///< Replaces the mode check (also the one in `start()`); empty means "always
+                                          ///< draining".
       std::function<std::chrono::steady_clock::time_point()> now;  ///< Clock for the Warning rate limit; empty means
                                                                    ///< `steady_clock::now`.
       std::chrono::milliseconds cap {50};  ///< Replaces `wake_cap` so a test needs no 2 s waits.
@@ -135,7 +148,8 @@ namespace handoff {
     explicit revocation_poller_t(test_config_t config);
 
     /**
-     * @brief Test-only: number of completed passes (successful or not), counted after the pass's last callback.
+     * @brief Test-only: number of completed passes (successful or not), counted after the pass's last callback. A wake
+     * that was skipped because the process was not draining is not counted.
      *
      * @return Count.
      */
