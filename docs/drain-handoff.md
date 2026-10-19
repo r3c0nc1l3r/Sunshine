@@ -206,11 +206,13 @@ On `READY` the old process, in this order:
     process's instance file (that pid with that start time) to show role `active`, and only then exits 0. If the old
     process stalls so long that the new process reads `COMMIT` after its own bound, the new process exits without
     writing role `active` and the old process rolls back as for any dead new process before `MAIN` (logged as an Error);
-    the helper then sees no `active` file and exits 4 (`unconfirmed`), so its exit code never reports a switch that did
-    not happen. On a failed `GO_ACK` (with a reason), a timeout, a failed `COMMIT` send, a channel error or a dead new
-    process, it rolls back with the kill-first rule of step 6 (it is still the main process), which clears the release
-    flag, and answers the helper non-zero. Releasing before `GO` means that a stop of both processes in between can at
-    worst lose the `undo` commands, never run them twice.
+    the helper then sees no `active` file and exits 4 (`unconfirmed`), so exit 0 always means "committed and role
+    `active` observed". After `committed` the helper's code is only 0 or 4: a later rollback inside the window (and a
+    `kill_pending` it may end in) is seen only in the instance files, which tooling checks after every reload. On a
+    failed `GO_ACK` (with a reason), a timeout, a failed `COMMIT` send, a channel error or a dead new process, it rolls
+    back with the kill-first rule of step 6 (it is still the main process), which clears the release flag, and answers
+    the helper non-zero. Releasing before `GO` means that a stop of both processes in between can at worst lose the
+    `undo` commands, never run them twice.
 
 The new process writes no state file before `GO`. On `GO` it reloads `sunshine_state.json` (`load_state` also rebuilds
 the trusted client certificate chain [C30]), the credentials file and `apps.json`, all under `client_auth_mutex`. Each
@@ -280,9 +282,9 @@ re-arm its accept after `operation_aborted`, so resuming must start its accept a
   no process accepts on the web UI port, so `/api/sessions` cannot answer; the instance file (and the helper's exit code
   3) is then where tooling reads it. Tooling treats `kill_pending` as busy, alerts, and never retries a reload while it
   is set; a new reload is refused in this state anyway (exit 1).
-- The helper is answered non-zero as soon as the kill-first step completes (or with `kill_pending` when it does not
-  complete in 5 s), before the in-flight wait, the reload and the swap; the rest of the rollback runs without it, so the
-  `ExecReload` bound (see "systemd unit") holds.
+- If the helper is still waiting (no `committed` sent yet), it is answered non-zero as soon as the kill-first step
+  completes (or with `kill_pending` when it does not complete in 5 s), before the in-flight wait, the reload and the
+  swap; the rest of the rollback runs without it, so the `ExecReload` bound (see "systemd unit") holds.
 - A death of the new process between `READY` and `GO` is handled as a rollback too (of the steps that happened, below).
 - After the kill-first step, the old process, in this order: waits for the in-flight counters to reach zero (the gate is
   still up, so they only fall; it keeps the gate up and waits as long as needed, logging a Warning every 5 s, and never
