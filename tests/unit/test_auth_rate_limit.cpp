@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -271,4 +272,141 @@ TEST(AuthRateLimiterTest, ConcurrentDistinctSourcesAreAllTracked) {
   }
 
   EXPECT_EQ(limiter.size(), 800U);
+}
+
+/**
+ * @brief Test: with the table full, a flood of new sources never evicts a locked-out source while unlocked entries exist.
+ *
+ * The locked source is the oldest entry by far, so a plain oldest-first rule would evict it first.
+ */
+TEST(AuthRateLimiterTest, FloodOfNewSourcesNeverEvictsLockedSource) {
+  confighttp::auth_rate_limiter_t limiter(std::size_t {2}, DEFAULT_WINDOW, std::size_t {3});
+  const auto t0 = std::chrono::steady_clock::now();
+
+  ASSERT_EQ(record_failures(limiter, SOURCE_A, 2, t0), 1U);
+
+  for (int i = 0; i < 50; ++i) {
+    const std::string source = "flood-" + std::to_string(i);
+    (void) limiter.on_failure(source, t0 + std::chrono::seconds {1} + std::chrono::milliseconds {i});
+    EXPECT_LE(limiter.size(), 3U);
+  }
+
+  EXPECT_TRUE(limiter.blocked(SOURCE_A, t0 + std::chrono::seconds {10}))
+    << "A locked source must survive a flood of new sources while unlocked entries exist";
+  EXPECT_TRUE(limiter.blocked(SOURCE_A, t0 + std::chrono::seconds {299}));
+  EXPECT_EQ(limiter.size(), 3U);
+}
+
+/**
+ * @brief Test: when the table is full, an entry whose window has ended is dropped before any live entry.
+ *
+ * The table holds an expired unlocked source and a live unlocked source. Adding a third source must drop the expired one,
+ * so the live source keeps its count: its next failures still reach the threshold on the second failure after the insert.
+ */
+TEST(AuthRateLimiterTest, ExpiredEntriesAreDroppedBeforeLiveEntries) {
+  confighttp::auth_rate_limiter_t limiter(std::size_t {3}, DEFAULT_WINDOW, std::size_t {2});
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto insert_time = t0 + DEFAULT_WINDOW;
+
+  EXPECT_FALSE(limiter.on_failure("192.0.2.31", t0)) << "Expired at insert time";
+  EXPECT_FALSE(limiter.on_failure(SOURCE_B, t0 + std::chrono::seconds {100})) << "Still live at insert time";
+  ASSERT_EQ(limiter.size(), 2U);
+
+  EXPECT_FALSE(limiter.on_failure("192.0.2.33", insert_time));
+  EXPECT_EQ(limiter.size(), 2U);
+
+  EXPECT_FALSE(limiter.on_failure(SOURCE_B, insert_time)) << "The live source must still hold its first failure (count two)";
+  EXPECT_TRUE(limiter.on_failure(SOURCE_B, insert_time))
+    << "The live source must still hold its earlier failures, so its third one starts a lockout";
+}
+
+/**
+ * @brief Test: when every tracked source is locked out, the one with the oldest first failure is evicted and size stays at the limit.
+ */
+TEST(AuthRateLimiterTest, FullTableOfLockedSourcesEvictsOldestLockedAndKeepsSize) {
+  confighttp::auth_rate_limiter_t limiter(std::size_t {2}, DEFAULT_WINDOW, std::size_t {2});
+  const auto t0 = std::chrono::steady_clock::now();
+  const std::string_view source_c {"192.0.2.3"};
+  const std::string_view source_d {"192.0.2.4"};
+
+  ASSERT_EQ(record_failures(limiter, SOURCE_A, 2, t0), 1U);
+  ASSERT_EQ(record_failures(limiter, SOURCE_B, 2, t0 + std::chrono::seconds {1}), 1U);
+  ASSERT_EQ(limiter.size(), 2U);
+
+  EXPECT_FALSE(limiter.on_failure(source_c, t0 + std::chrono::seconds {2}));
+  EXPECT_EQ(limiter.size(), 2U) << "Adding a source to a full table must keep the size at the limit";
+  EXPECT_FALSE(limiter.blocked(SOURCE_A, t0 + std::chrono::seconds {2})) << "The oldest locked source is the one evicted";
+  EXPECT_TRUE(limiter.blocked(SOURCE_B, t0 + std::chrono::seconds {2}));
+
+  EXPECT_FALSE(limiter.on_failure(source_d, t0 + std::chrono::seconds {3}));
+  EXPECT_EQ(limiter.size(), 2U);
+  EXPECT_TRUE(limiter.blocked(SOURCE_B, t0 + std::chrono::seconds {3})) << "An unlocked source is evicted before a locked one";
+}
+
+/**
+ * @brief Test: retry_after is nullopt for a source the limiter has never seen.
+ */
+TEST(AuthRateLimiterTest, RetryAfterIsNulloptForUnknownSource) {
+  confighttp::auth_rate_limiter_t limiter;
+  const auto now = std::chrono::steady_clock::now();
+
+  EXPECT_FALSE(limiter.retry_after(SOURCE_A, now).has_value());
+}
+
+/**
+ * @brief Test: retry_after is nullopt for a source with failures but no lockout.
+ */
+TEST(AuthRateLimiterTest, RetryAfterIsNulloptWithoutLockout) {
+  confighttp::auth_rate_limiter_t limiter;
+  const auto t0 = std::chrono::steady_clock::now();
+
+  ASSERT_EQ(record_failures(limiter, SOURCE_A, DEFAULT_MAX_FAILURES - 1, t0), 0U);
+  EXPECT_FALSE(limiter.retry_after(SOURCE_A, t0).has_value());
+}
+
+/**
+ * @brief Test: at the exact lockout start, retry_after reports the full window (300 seconds).
+ */
+TEST(AuthRateLimiterTest, RetryAfterAtLockoutStartIsFullWindow) {
+  confighttp::auth_rate_limiter_t limiter;
+  const auto t0 = std::chrono::steady_clock::now();
+
+  ASSERT_EQ(record_failures(limiter, SOURCE_A, DEFAULT_MAX_FAILURES, t0), 1U);
+
+  const auto retry = limiter.retry_after(SOURCE_A, t0);
+  ASSERT_TRUE(retry.has_value());
+  EXPECT_EQ(retry.value_or(std::chrono::seconds {0}), std::chrono::seconds {300});
+}
+
+/**
+ * @brief Test: retry_after rounds the remaining lockout up to whole seconds, with a minimum of one second.
+ *
+ * Half a second left gives 1, one millisecond left gives 1, and 299.2 seconds left gives 300.
+ */
+TEST(AuthRateLimiterTest, RetryAfterRoundsRemainingTimeUp) {
+  confighttp::auth_rate_limiter_t limiter;
+  const auto t0 = std::chrono::steady_clock::now();
+
+  ASSERT_EQ(record_failures(limiter, SOURCE_A, DEFAULT_MAX_FAILURES, t0), 1U);
+
+  EXPECT_EQ(limiter.retry_after(SOURCE_A, t0 + std::chrono::milliseconds {299500}).value_or(std::chrono::seconds {0}), std::chrono::seconds {1})
+    << "0.5 s left must round up to 1";
+  EXPECT_EQ(limiter.retry_after(SOURCE_A, t0 + std::chrono::milliseconds {299999}).value_or(std::chrono::seconds {0}), std::chrono::seconds {1})
+    << "1 ms left must round up to 1";
+  EXPECT_EQ(limiter.retry_after(SOURCE_A, t0 + std::chrono::milliseconds {800}).value_or(std::chrono::seconds {0}), std::chrono::seconds {300})
+    << "299.2 s left must round up to 300";
+}
+
+/**
+ * @brief Test: retry_after is nullopt from the moment the lockout ends (first failure plus window) onward.
+ */
+TEST(AuthRateLimiterTest, RetryAfterIsNulloptAtAndAfterLockoutEnd) {
+  confighttp::auth_rate_limiter_t limiter;
+  const auto t0 = std::chrono::steady_clock::now();
+
+  ASSERT_EQ(record_failures(limiter, SOURCE_A, DEFAULT_MAX_FAILURES, t0), 1U);
+
+  EXPECT_FALSE(limiter.retry_after(SOURCE_A, t0 + DEFAULT_WINDOW).has_value())
+    << "Exactly at first failure plus window the lockout has ended";
+  EXPECT_FALSE(limiter.retry_after(SOURCE_A, t0 + DEFAULT_WINDOW + std::chrono::seconds {1}).has_value());
 }
