@@ -35,6 +35,7 @@
 #include "display_device.h"
 #include "entry_handler.h"
 #include "globals.h"
+#include "handoff/hooks.h"
 #include "httpcommon.h"
 #include "logging.h"
 #include "main.h"
@@ -480,7 +481,7 @@ int main(int argc, char *argv[]) {
 
   std::unique_ptr<platf::deinit_t> upnp_unmap;
   auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
-    upnp_unmap = upnp::start();
+    upnp_unmap = upnp::start(handoff::hooks::udp_base());
   });
 
   // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
