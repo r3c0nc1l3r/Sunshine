@@ -7,8 +7,7 @@
  * Every test installs a fake `handoff::session_peer_t` through `handoff::runtime().set_peer()` and a fake terminate
  * through `handoff::set_terminate_for_test()`, so no app is started or killed and no real process or channel exists.
  *
- * Groups:
- * Three groups: `HandoffTerminateCallersTest` (the building blocks), `HandoffCallersConfigHttpTest` (the web UI
+ * Groups: `HandoffTerminateCallersTest` (the building blocks), `HandoffCallersConfigHttpTest` (the web UI
  * handlers through `confighttp::register_app_client_routes`) and `HandoffCallersNvhttpTest` (`/cancel`, `/launch` and
  * `/resume` through `nvhttp::test_support::*_https`). Every test sets a short `handoff::set_request_budget_for_test`.
  *
