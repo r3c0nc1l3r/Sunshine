@@ -145,6 +145,7 @@ namespace system_tray {
       bool ended {false};  ///< `end_tray` ran.
       bool loop_entered {false};  ///< `run_main_loop` was entered.
       bool loop_exited {false};  ///< `run_main_loop` returned.
+      bool initializing {false};  ///< The loop is inside a backend `init`; `suspend` waits for it.
       std::thread::id loop_thread;  ///< The thread that runs `run_main_loop`.
       bool enabled_for_testing {false};  ///< Count the tray as enabled (tests).
       tray_backend_t backend;  ///< Backend entry points; null members take the production values.
@@ -171,7 +172,17 @@ namespace system_tray {
     }
 
     /**
+     * @brief Production backend `poll`: deliver pending Qt events without blocking.
+     */
+    void backend_poll_default() {
+      (void) tray_loop(0);
+    }
+
+    /**
      * @brief The backend entry points with the production defaults filled in.
+     *
+     * `poll` takes the production value only together with the production `loop`, so a fake backend that sets no `poll`
+     * never reaches Qt.
      *
      * Call it with the lifecycle mutex held; use the returned copy after releasing the mutex.
      *
@@ -179,6 +190,9 @@ namespace system_tray {
      */
     tray_backend_t effective_backend_locked() {
       tray_backend_t backend = lifecycle().backend;
+      if (!backend.poll && !backend.loop) {
+        backend.poll = &backend_poll_default;
+      }
       if (!backend.init) {
         backend.init = &init_tray;
       }
@@ -1050,12 +1064,21 @@ namespace system_tray {
      * start or resume that arrived meanwhile becomes the pending command.
      *
      * @param lock The held lifecycle lock; released and taken again.
+     * @param from_exec True when the backend's blocking loop has just returned (the queued exit event was consumed).
      */
-    void complete_suspend(std::unique_lock<std::mutex> &lock) {
+    void complete_suspend(std::unique_lock<std::mutex> &lock, bool from_exec) {
       auto &state = lifecycle();
       const auto backend = effective_backend_locked();
       state.command = tray_command_e::none;
       lock.unlock();
+
+      // A suspend from another thread queued an exit event to the Qt thread. When the loop did not just return from
+      // `exec()` (a pre-loop suspend), that event is still in the queue and the next `exec()` after a resume would
+      // deliver it to the NEW icon and tear it down. Drain the queue while the old icon still exists: the backend's
+      // non-blocking `poll` (processEvents) delivers the stale event.
+      if (!from_exec && backend.poll) {
+        backend.poll();
+      }
 
       tray_initialized_state().store(false);
       backend.exit();
@@ -1095,11 +1118,14 @@ namespace system_tray {
         if (state.phase == tray_phase_e::not_started || state.phase == tray_phase_e::suspended) {
           const auto backend = effective_backend_locked();
           state.command = tray_command_e::none;
+          state.initializing = true;
           lock.unlock();
 
           const int result = backend.init();
 
           lock.lock();
+          state.initializing = false;
+          state.cv.notify_all();
           if (result == 0) {
             if (!state.ended) {
               state.phase = tray_phase_e::running;
@@ -1122,7 +1148,7 @@ namespace system_tray {
       if (state.phase == tray_phase_e::running) {
         // 3. A pending suspend completes without calling the loop.
         if (state.command == tray_command_e::suspend) {
-          complete_suspend(lock);
+          complete_suspend(lock, false);
           continue;
         }
 
@@ -1135,7 +1161,7 @@ namespace system_tray {
           continue;
         }
         if (state.command == tray_command_e::suspend && !state.ended) {
-          complete_suspend(lock);
+          complete_suspend(lock, true);
           continue;
         }
         // end_tray ran, or Quit was chosen, or the backend failed: the loop ends as the old one did.
@@ -1168,8 +1194,18 @@ namespace system_tray {
 
   bool suspend(std::chrono::milliseconds timeout) {
   #ifdef __linux__
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     auto &state = lifecycle();
     std::unique_lock lock(state.mutex);
+
+    const bool on_loop_thread = state.loop_entered && !state.loop_exited && state.loop_thread == std::this_thread::get_id();
+
+    // A resume's `init` is in progress on the loop thread: the phase is not yet `running`, so wait for it.
+    if (!on_loop_thread && !state.cv.wait_until(lock, deadline, [&state]() {
+          return !state.initializing;
+        })) {
+      return false;
+    }
 
     if (state.ended) {
       return true;
@@ -1184,7 +1220,6 @@ namespace system_tray {
     state.command = tray_command_e::suspend;
     state.resume_after_suspend = false;
     const auto backend = effective_backend_locked();
-    const bool on_loop_thread = state.loop_entered && !state.loop_exited && state.loop_thread == std::this_thread::get_id();
     const bool loop_gone = state.loop_exited;
     lock.unlock();
 
@@ -1198,10 +1233,27 @@ namespace system_tray {
     }
 
     {
-      // As end_tray: remove the icon from here, never from the main thread.
-      const std::scoped_lock tray_lock(tray_state_mutex());
-      tray_initialized_state().exchange(false);
-      backend.exit();
+      // As end_tray: remove the icon from here, never from the main thread. The main thread may be idle (a pre-loop
+      // suspend) behind an `update_tray_*` that holds the mutex and waits for it, so never block without the
+      // deadline. On timeout the command stays pending (the loop still completes it) and nothing else changes.
+      std::unique_lock tray_lock(tray_state_mutex(), std::defer_lock);
+      while (!tray_lock.try_lock()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          return false;
+        }
+        std::this_thread::sleep_for(1ms);
+      }
+
+      // Re-check: the loop may have completed this suspend, and a resume may have followed, since the unlock above.
+      bool still_pending = false;
+      {
+        const std::scoped_lock check(state.mutex);
+        still_pending = state.phase == tray_phase_e::running && state.command == tray_command_e::suspend;
+      }
+      if (still_pending) {
+        tray_initialized_state().store(false);
+        backend.exit();
+      }
     }
     state.cv.notify_all();
 
@@ -1212,7 +1264,7 @@ namespace system_tray {
       state.command = tray_command_e::none;
       return true;
     }
-    return state.cv.wait_for(lock, timeout, [&state]() {
+    return state.cv.wait_until(lock, deadline, [&state]() {
       return state.phase != tray_phase_e::running || state.ended;
     });
   #else
