@@ -58,6 +58,13 @@
  * - If the runner thread cannot be started (`std::system_error`): the request is answered from `machine.state()` only
  *   where the final answer is already known (`ended` gives `ENDED`, `rolling_back` gives `END_REJECTED`); otherwise it
  *   gets no reply. No early reply ever contradicts the machine's final answer.
+ * - Runner failure or stop: when the runner fails to start, fails, or is stopped by `stop()`, the `_end_all_running` flag
+ *   is cleared and its waiters are answered (per the fallback above) or dropped in the same critical section, so a later
+ *   round never answers a stale waiter.
+ * - The runner's exception path takes the waiter list in that same critical section (and clears the running flag)
+ *   before it answers every request of the round with `END_REJECTED`.
+ * - A request id registered twice (the peer reuses an id) gets two replies. This is harmless, because the tracker drops
+ *   the second; it is stated for the test writer.
  * - `CLOSE_CERT` during `END_ALL` (or the other way round): independent handler threads. The operations serialise
  *   inside the RTSP server (clear lock), so the `CLOSE_CERT` count is the number of sessions this request ended, which
  *   is 0 when `END_ALL` had ended that client's sessions first. Both are answered. `SESSIONS?` meanwhile lists the
