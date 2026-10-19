@@ -850,10 +850,8 @@ namespace config {
     500ms,  // key_repeat_delay
     std::chrono::duration<double> {1 / 24.9},  // key_repeat_period
 
-    {
-      platf::supported_gamepads(nullptr).front().name.data(),
-      platf::supported_gamepads(nullptr).front().name.size(),
-    },  // Default gamepad
+    // One call: each call reassigns the static list, so a second call frees the first call's buffer.
+    std::string(platf::supported_gamepads(nullptr).front().name),  // Default gamepad
     {},  // gamepad_driver remains unset until the user chooses a Windows driver policy
     true,  // back as touchpad click enabled for PlayStation-style gamepads
     true,  // client gamepads with motion events use PlayStation-style emulation
@@ -1569,15 +1567,20 @@ namespace config {
   /**
    * @brief Get supported gamepad options.
    *
+   * The list is rebuilt on each call, so it holds no entries from earlier calls. The views point into names this
+   * function keeps, and stay valid until the next call.
+   *
    * @return Platform-supported gamepad backend names accepted by configuration.
    */
   std::vector<std::string_view> &get_supported_gamepad_options() {
-    const auto options = platf::supported_gamepads(nullptr);
+    static std::vector<std::string> names {};
     static std::vector<std::string_view> opts {};
-    opts.reserve(options.size());
-    for (auto &opt : options) {
-      opts.emplace_back(opt.name);
+    opts.clear();
+    names.clear();
+    for (const auto &opt : platf::supported_gamepads(nullptr)) {
+      names.emplace_back(opt.name);
     }
+    opts.assign(names.begin(), names.end());
     return opts;
   }
 
