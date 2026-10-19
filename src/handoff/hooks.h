@@ -21,7 +21,7 @@
 #include <vector>
 
 // local includes
-#include "config.h"
+#include "src/config.h"
 #include "types.h"
 
 #ifdef __linux__

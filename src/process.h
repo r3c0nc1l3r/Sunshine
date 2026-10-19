@@ -241,8 +241,11 @@ namespace proc {
      *
      * Thread-safe for the placebo branch: it loads `placebo` and then `app_id` (both atomic) and returns the id when it
      * is above 0, else 0, so a concurrent `drop_released_app()` or `terminate()` makes it return the old id or 0, never
-     * -1 or a torn value. When `placebo` is false it behaves as before (the non-atomic `_process` and
-     * `_process_group` are read by the control-loop thread only; `drop_released_app()` never touches them).
+     * -1 or a torn value. When `placebo` is false and the app id is 0 or below while `_process` is still valid (an
+     * app dropped by `drop_released_app()`), it only resets `_process` and `_process_group` and returns 0: it never
+     * calls `terminate()`, so no gamepad, process group, tray or display function runs and the auto-detach check is
+     * not reached. Otherwise it behaves as before (the non-atomic `_process` and `_process_group` are read and written
+     * by the control-loop thread only; `drop_released_app()` never touches them).
      *
      * @return The app id if an app is running, otherwise `0`.
      */
@@ -280,7 +283,8 @@ namespace proc {
      *
      * When the app is released (`set_released(true)`), it only drops the app state: the released flag is cleared,
      * `placebo` is false, the prep iterators are set to `_app_prep_begin` (so no `undo` command can run), the output
-     * pipe is closed, the app id is set to -1 as an ordinary terminate does and the atomics are cleared. It neither
+     * pipe is closed, `_process` and `_process_group` are reset, the app id is set to -1 as an ordinary terminate
+     * does and the atomics are cleared, with the released flag cleared last. It neither
      * calls `terminate_process_group` (there is none: only adoptable apps are handed off), nor runs any `undo`
      * command, nor calls `input::terminate_gamepads`, `system_tray::update_tray_stopped` or
      * `display_device::revert_configuration`. Otherwise it behaves as before and also clears the atomics.
@@ -333,9 +337,9 @@ namespace proc {
      * @brief Drop a released app's state without running anything (a rollback after `ENDED`, and the exit of a
      * draining process).
      *
-     * If the app is released: clears the app (the atomic `app_id` set to -1, `applied`, `placebo`, `pgid`,
-     * then the released flag, in this order; the non-atomic prep iterators are set to `_app_prep_begin` and the output
-     * pipe is closed) and the released flag. It runs no `undo`
+     * If the app is released: first sets the non-atomic prep iterators to `_app_prep_begin` and closes the output pipe
+     * while `placebo` and the released flag are still set, then clears the atomics (`app_id` set to -1, `applied`,
+     * `pgid`, `placebo`) and clears the released flag last. It runs no `undo`
      * command, terminates no process group, calls no tray, gamepad or display function. It writes only the atomics above and
      * members that no other thread reads while the app is released (`_app_prep_it`, `_pipe`; `terminate()` is not
      * reached by `running()` in placebo mode), and never assigns `_process` or `_process_group`. The caller is the
