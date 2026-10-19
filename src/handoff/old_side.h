@@ -249,7 +249,8 @@ namespace handoff {
    *    state back to `draining`.
    *
    * Rollback (whatever the child does): `end_all.decide_rollback()` first; then `kill_and_reap(reap)` until the
-   * child is gone, and after the first `timeout` `set_state(kill_pending)` (and, if the helper was not yet answered,
+   * child is gone (`reaped` or `reaped_elsewhere`; an `error` counts as gone only when `exited()` is true, otherwise it
+   * is handled like `timeout`), and after the first `timeout` `set_state(kill_pending)` (and, if the helper was not yet answered,
    * answer it `kill_pending`); when gone, answer a still-waiting helper `failed <reason>`; then, only for the steps
    * that happened: `wait_in_flight(-1)` and then `reload_after_rollback()` and `unfreeze()` if frozen (the unbounded
    * wait only protects the reload and app-list swap, so a failure before the freeze does not wait),
@@ -280,8 +281,11 @@ namespace handoff {
     /**
      * @brief Run the handoff until the handover, a completed rollback, or a shutdown.
      *
-     * Messages other than `HELLO`, `READY`, `GO_ACK` and `PONG` that arrive (`END_ALL`, `SESSIONS?`, `CLOSE`,
-     * `CLOSE_CERT`) are passed to `on_drain_request` on another thread and never block this one.
+     * `END_ALL`, `SESSIONS?`, `CLOSE` and `CLOSE_CERT` are passed to `on_drain_request` on another thread and never
+     * block this one; other messages are dropped (their fds closed) with a Warning. At most 1024 messages wait for the
+     * handler and at most 1024 for this thread; beyond that the newest is dropped with a Warning. Handled messages
+     * never delay the `PING` and handover timers. `run()` returns only after the handler's current call has finished,
+     * so the handler must be bounded (the drain glue bounds `END_ALL` by the session join guard).
      *
      * @param on_drain_request Handler for drain requests; it replies on the channel itself.
      * @return Outcome.

@@ -93,7 +93,9 @@ namespace handoff {
     void lower();
 
     /**
-     * @brief Current number of admitted, unfinished requests.
+     * @brief Current value of the in-flight counter: admitted, unfinished requests, plus refused entries that have
+     * incremented and not yet backed out (increment-then-check), so it can be briefly non-zero while the gate is
+     * raised even though nobody is admitted.
      *
      * @return Count.
      */
