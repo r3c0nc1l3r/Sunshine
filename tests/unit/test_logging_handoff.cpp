@@ -82,7 +82,21 @@ protected:
     logging::set_process_tag("");
     std::error_code ignored;
     std::filesystem::remove_all(test_directory, ignored);
+    restore_environment_sink();
     BaseTest::TearDown();
+  }
+
+  /**
+   * @brief Re-establish the run-wide log sink that tests/tests_environment.h sets up.
+   *
+   * Calling logging::init in these tests replaces the global sink that SunshineEnvironment holds for the whole run.
+   * This re-creates it on the same file, at the same level, appending without rotation so earlier output is kept. The
+   * holder is a function-local static, so the sink stays alive for the rest of the run.
+   */
+  static void restore_environment_sink() {
+    static std::unique_ptr<logging::deinit_t> environment_sink;
+    environment_sink.reset();
+    environment_sink = logging::init(0, "test_sunshine.log", true);
   }
 
   /**
