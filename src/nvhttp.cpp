@@ -1254,11 +1254,11 @@ namespace nvhttp {
   /**
    * @brief Get codec mode flags.
    *
+   * @param probe_override Handoff probe override snapshot for this request; when it holds a value it replaces the probe
+   *                       globals. Defaults to a fresh read of `video::handoff_probe_override()`.
    * @return Moonlight codec capability bitmask for the currently probed encoders.
    */
-  uint32_t get_codec_mode_flags() {
-    // A handoff probe override, when installed, replaces the probe globals for this request only.
-    const auto probe_override = video::handoff_probe_override();
+  uint32_t get_codec_mode_flags(const std::optional<video::handoff_probe_override_t> &probe_override = video::handoff_probe_override()) {
     const int hevc_mode = probe_override ? probe_override->hevc_mode : video::active_hevc_mode;
     const int av1_mode = probe_override ? probe_override->av1_mode : video::active_av1_mode;
     const std::array<bool, 3> yuv444 = probe_override ? probe_override->yuv444 : video::last_encoder_probe_supported_yuv444_for_codec;
@@ -1305,6 +1305,9 @@ namespace nvhttp {
   void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
 
+    // Read the handoff probe override once per request, so every field below reports the same source.
+    const auto probe_override = video::handoff_probe_override();
+
     int pair_status = 0;
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
       auto args = request->parse_query_string();
@@ -1327,8 +1330,7 @@ namespace nvhttp {
     tree.put("root.uniqueid", http::unique_id);
     tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
     tree.put("root.ExternalPort", net::map_port(PORT_HTTP));
-    // Read the handoff probe override once for this request; fall back to the probe globals when it is not set.
-    const auto probe_override = video::handoff_probe_override();
+    // Uses the probe override snapshot taken at the start of this request; falls back to the probe globals when unset.
     const int hevc_mode = probe_override ? probe_override->hevc_mode : video::active_hevc_mode;
     tree.put("root.MaxLumaPixelsHEVC", hevc_mode > 1 ? "1869449984" : "0");
 
@@ -1355,7 +1357,7 @@ namespace nvhttp {
       tree.put("root.LocalIP", net::addr_to_normalized_string(local_endpoint.address()));
     }
 
-    const uint32_t codec_mode_flags = get_codec_mode_flags();
+    const uint32_t codec_mode_flags = get_codec_mode_flags(probe_override);
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
 
     if (!config::nvhttp.external_ip.empty()) {
