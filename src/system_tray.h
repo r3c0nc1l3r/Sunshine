@@ -220,10 +220,24 @@ namespace system_tray {
    * 2. If a start or resume command is pending and the phase is `not_started` or `suspended`: call the backend's
    *    `init` on this thread. Success: phase `running`, the "removed/shown" waiters are notified. Failure: log a
    *    Warning "Failed to create system tray", keep the phase, drop the command (the next `resume` may retry).
-   * 3. If the phase is `running`: call the backend's `loop` (blocking). When it returns 0, repeat from 1 (one event
-   *    was served). When it returns non-zero: if a suspend command is pending, execute it (phase `suspended`,
-   *    initialized flag cleared so `update_tray_*` skip, waiters notified) and repeat from 1; if `end_tray` ran, return;
-   *    otherwise (Quit chosen in the menu, or the backend failed) return, exactly as the old loop ended.
+   * 3. If the phase is `running` and a suspend command is pending, complete it without calling `loop` (this covers a
+   *    suspend that arrived between two iterations, or before this function was entered after `init_tray`; a backend's
+   *    `exit` has no memory, so the loop must look at the command itself): the teardown below, phase `suspended`,
+   *    waiters notified, repeat from 1. Otherwise, if the phase is `running`: call the backend's `loop` (blocking).
+   *    Production `process_tray_events` returns non-zero for every blocking call (`QtTrayMenu::loop(1)` runs
+   *    `QApplication::exec()` and returns -1 when it ends), and 0 only for a non-blocking call; so "returns non-zero"
+   *    means "the backend's loop ended", not an error. A fake `loop` may return 0 to model one served event, in which
+   *    case repeat from 1. When it returns non-zero: if a suspend command is pending, complete it (as above) and repeat
+   *    from 1; if `end_tray` ran, return; otherwise (Quit chosen in the menu, or the backend failed) return, exactly as
+   *    the old loop ended.
+   *
+   *    Suspend and the state mutex (no deadlock): `update_tray_*` hold `tray_state_mutex` while the backend's
+   *    `tray_update` is blocking-queued to this thread, so this thread must never wait for that mutex once `loop` has
+   *    ended. Therefore the removal is done by the caller of `suspend`, as `end_tray` does today: under
+   *    `tray_state_mutex` it exchanges the initialized flag to false, calls the backend's `exit`, and releases the
+   *    mutex. `update_tray_*` test the flag under the same mutex and never call the backend once it is false. This
+   *    thread only tears down what it owns, sets the phase and notifies, and takes no `tray_state_mutex` after `loop`
+   *    returned.
    * 4. Otherwise (`not_started` or `suspended` with no command): wait on the condition variable with a 500 ms timeout,
    *    and return when `shutdown_requested()` is true. The poll is only for the idle phases; it is how a process
    *    with no tray (a draining process, a new process before `COMMIT`) notices a shutdown that did not come through
@@ -243,8 +257,11 @@ namespace system_tray {
   /**
    * @brief Remove the tray icon, keeping the process and the option to bring it back (the old side's `remove_tray`).
    *
-   * Sets the pending command to suspend and, if the phase is `running`, calls the backend's `exit` to wake the loop;
-   * the loop removes the icon and acknowledges. Waits for that acknowledgement.
+   * Sets the pending command to suspend and, if the phase is `running`, does what `end_tray` does today: under
+   * `tray_state_mutex` it exchanges the initialized flag to false and calls the backend's `exit`, then releases the
+   * mutex (it never waits for the main thread while holding it). The loop then sets the phase and acknowledges, taking
+   * no `tray_state_mutex` (see `run_main_loop`). Waits for the acknowledgement, with no lock held. After the flag is
+   * cleared `update_tray_*` never call the backend.
    *
    * A start or resume command still pending (not yet executed) is replaced by the suspend command (last wins).
    *
@@ -293,6 +310,11 @@ namespace system_tray {
    *
    * @return `true` when accepted or already `running`; `false` when `ended`, when the tray is not enabled
    *         (`config::sunshine.system_tray` false or compiled out), or the platform has no main-thread tray.
+   *
+   * Requirement on the glue (P18): the new process's main thread must enter `run_main_loop` even when `init_tray` never
+   * ran (a handoff-started process before `COMMIT`), because this command is executed only there. A normal start whose
+   * `init_tray` fails now also idles in the loop, with the 500 ms poll, until shutdown; that is intended and
+   * equivalent to the old "wait for shutdown" branch.
    *
    * Thread-safety: any thread, including the main thread before `run_main_loop`; non-blocking.
    */

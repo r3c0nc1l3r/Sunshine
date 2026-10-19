@@ -34,6 +34,11 @@
  */
 #pragma once
 
+// Where the definitions live: the member functions of `adoptable_server_t` are templates, so their definitions go in
+// this header below the class (or in `listener_impl.h` included at its end). `SunshineHTTPSServer` is complete only in
+// `nvhttp.cpp`, which is the only file that instantiates `adoptable_server_t<SunshineHTTPSServer>`; the headers only
+// name the type (aliases in `nvhttp.h`).
+
 // standard includes
 #include <atomic>
 #include <chrono>
@@ -95,7 +100,9 @@ namespace handoff {
      *    call `start()` makes).
      * 5. Post `callback(port)` to the io thread (as `start()` does), so it runs once the loop runs. It is the
      *    "listening" signal for `READY`: for a paused start, accepting is armed only by `resume()`.
-     * 6. Run `io_service->run()` on the calling thread. It returns only after `stop()` (or an exception thrown from a
+     * 6. Release `start_stop_mutex`, then run `io_service->run()` on the calling thread, and retake the mutex after it
+     *    returns, as `start()` does (`server_http.hpp:471-497`); so `stop()`, `listener_fd()`, `pause` and the others
+     *    can take the mutex while the loop runs. The call returns only after `stop()` (or an exception thrown from a
      *    handler, as upstream), then the function returns.
      *
      * A start with `paused == true` accepts nothing and arms no accept; connections queue in the socket's backlog.
@@ -119,6 +126,9 @@ namespace handoff {
     /**
      * @brief Stop accepting new connections, and wait until that is true.
      *
+     * "Not running" means `!(acceptor && acceptor->is_open())`, tested under `start_stop_mutex`; "on the io thread"
+     * means `io_service->get_executor().running_in_this_thread()`. Both work for an unadopted `start()` too.
+     *
      * Posts to the io thread: take the work guard if none is held, set the paused flag, call `acceptor->cancel()`,
      * then fulfil a promise. The caller waits for the promise. Because everything runs on the one io thread:
      * - a pending accept is cancelled and its `operation_aborted` completion does not re-arm (the base handler
@@ -128,6 +138,11 @@ namespace handoff {
      *   cancels in the same posted handler; and a success that is handled after the flag is set finds it true in the
      *   overridden `accept()` and does not re-arm. Either way, when this function returns `true` no accept is armed.
      *   The connection of that last success is served as any other accepted connection.
+     *
+     * Limit: asio's accept is speculative, so a connection that was already queued in the listen backlog when the
+     * accept was cancelled can still be accepted, and (HTTPS) its TLS handshake started, by a handler that was already
+     * completed; it can be served after `pause` returned `true`. The handoff's 503 gate covers such a request; `pause`
+     * does not promise that no connection is accepted, only that no accept is armed.
      *
      * Idempotent: pausing a paused server returns `true` (it still waits for the io thread, so it is a barrier).
      *
@@ -146,7 +161,7 @@ namespace handoff {
     /**
      * @brief Resume accepting.
      *
-     * Posts to the io thread: clear the paused flag and call `accept()`. Connections that queued in the listen
+     * Posts to the io thread: clear the paused flag and, only if the acceptor is open, call `accept()`. Connections that queued in the listen
      * backlog while paused are accepted: asio's epoll reactor tries the `accept` system call as soon as the operation
      * is started, before it waits for readiness, so a queued connection is taken without a new arrival (to be verified
      * on the build host by the test "pause, connect, resume"). Idempotent: resuming a server that is not paused

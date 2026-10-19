@@ -80,7 +80,8 @@ namespace handoff {
   struct mdns_timing_t {
     /**
      * @brief Longest settle wait after a withdraw, a cap on the `timeout` argument (spec: wait up to 5 s for Avahi to
-     * drop the entry; the old side passes `old_side_timeouts_t::mdns_withdraw`).
+     * drop the entry; the old side passes `old_side_timeouts_t::mdns_withdraw`). The spec's 5 s is a cap, not a
+     * target: the holder waits `min(timeout, settle)`, never the full 5 s by default.
      *
      * There is no portable way to ask Avahi whether the entry is gone, so `withdraw(timeout)` waits
      * `min(timeout, settle)` through `ops.wait` after the destruction, once. The default of 1 s is enough for the
@@ -187,6 +188,11 @@ namespace handoff {
    * longer kept in `main`), by the old side's `withdraw_mdns`/`publish_mdns`, by the new side's `publish_mdns`, and by
    * shutdown (`stop()`, which replaces the destruction of the `mDNS` pointer in `main`). Created on first use, never
    * destroyed before exit handlers run: call `stop()` explicitly at shutdown.
+   *
+   * Requirement on the glue (P18): in a handoff-started process `main` takes no publisher handle (the new side's
+   * `publish_mdns` goes through the holder), so the shutdown path in P18 must call `mdns_holder().stop()` (the
+   * `hooks::mdns_start`/stop counterpart) in every process that may have published, including a draining one (which
+   * has withdrawn already, so it is a no-op).
    *
    * @return The holder.
    */
