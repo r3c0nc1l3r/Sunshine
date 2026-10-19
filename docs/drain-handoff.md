@@ -563,8 +563,8 @@ app: it has no process, and it is never executed again. The last session's end l
   Each entry has one more key, `draining` (bool), always present (`false` when the feature is off). The reply has one
   more top-level key, `handoff`, always present: `"none"` (no handoff state), `"draining"` (a draining process exists),
   `"handover_failed"` (the main-PID handover keeps failing, step 7), or `"kill_pending"` (a rollback waits for the new
-  process to be reaped, step 6). `docs/api.md` and the key-set test change with both. Ids are unique across both
-  processes.
+  process to be reaped, step 6; seen only while the web UI is reachable, the instance file is authoritative).
+  `docs/api.md` and the key-set test change with both. Ids are unique across both processes.
 - `POST /api/sessions/<id>/close` closes either kind; for a draining session the request goes over the channel. The
   audit line is unchanged and is written by the active process.
 - `/serverinfo` `currentgame` and `/cancel` refer to the active process's app only.
@@ -595,7 +595,7 @@ and writes only that file (a temporary file plus rename):
 | normal operation | `none` | (none) | `none` |
 | new process started, until `COMMIT` | `none` | role `pending`, `none` | `none` |
 | switch (`COMMIT`) | role `draining`, `draining` | role `active`, `draining` | `draining` |
-| rollback kill not yet complete | role `active`, `kill_pending` | unchanged (removed by the old process after the reap) | `kill_pending` |
+| rollback kill not yet complete | role `active`, `kill_pending` | unchanged (removed by the old process after the reap) | `kill_pending` (only while the web UI is reachable; the instance file is authoritative) |
 | handover attempt fails (step 7) | `handover_failed` (+ `HANDOFF_STATE handover_failed`) | `handover_failed` | `handover_failed` |
 | handover succeeds after failures | `draining` (+ `HANDOFF_STATE draining`) | `draining` | `draining` |
 | old process exits | file deleted | `none` | `none` |
@@ -610,10 +610,10 @@ or from the draining process's file when the channel is gone.
   process's file, except that the old process removes a dead new process's file on rollback.
 - Consumers read every file in the directory and ignore stale ones. A `pending` file never names the active ports, and
   it makes consumers treat Sunshine as busy (a handoff is in progress).
-- Fail-safe rule for consumers: treat Sunshine as busy when the directory is missing while a Sunshine process runs,
-  when a running Sunshine process has no file, when any file is unreadable, or when any instance has sessions above 0
-  or traffic on its base ports. Between `/launch` and the first media, `sessions` can still be 0, so consumers also
-  treat recent RTSP connections as busy.
+- Fail-safe rule for consumers: treat Sunshine as busy when the directory is missing while a Sunshine process runs, when
+  a running Sunshine process has no file, when any `pending` file exists, when any file is unreadable, or when any
+  instance has sessions above 0 or traffic on its base ports. Between `/launch` and the first media, `sessions` can
+  still be 0, so consumers also treat recent RTSP connections as busy.
 
 ## systemd unit
 Readiness: whenever `NOTIFY_SOCKET` is set, Sunshine sends `READY=1` once its servers run (TCP listeners bound or
