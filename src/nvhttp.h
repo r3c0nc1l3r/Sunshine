@@ -466,7 +466,8 @@ namespace nvhttp {
    * @brief Set the id the next launch will get (the new process, at `COMMIT`, from `GO`'s
    * `next_launch_session_id`). Sets unconditionally; call it before the server accepts.
    *
-   * @param next_id The id for the next allocation (the counter becomes `next_id - 1`, wrapping).
+   * @param next_id The id for the next allocation (the counter becomes `next_id - 1`). Ids start at 1, so 0 is
+   *        treated as 1.
    */
   void set_next_launch_session_id(std::uint32_t next_id);
 
