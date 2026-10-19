@@ -107,7 +107,8 @@ namespace rtsp_stream {
    * Callers must authenticate the requester first (admin web UI only).
    *
    * @param id Launch session id from `list_sessions()`.
-   * @return `true` when a session with this id exists and was asked to stop.
+   * @return `true` when the session is running and was asked to stop, or is already stopping; `false` for an unknown id
+   *         or a session that has not started yet.
    */
   bool request_session_close(std::uint32_t id);
 
