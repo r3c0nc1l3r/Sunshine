@@ -11,6 +11,8 @@
   #include <optional>
   #include <set>
   #include <string>
+  #include <utility>
+  #include <vector>
 
   // local includes
   #include "src/handoff/revocation.h"
@@ -166,5 +168,112 @@ TEST(HandoffRevocationTest, NamedDevicesNullReturnsNullopt) {
   const std::string json = R"({"root":{"named_devices":null}})";
   EXPECT_FALSE(handoff::disabled_client_certs(json).has_value())
     << "named_devices that is null must give nullopt.";
+}
+
+/**
+ * @brief The ptree string form `"enabled":"false"` is a disabled client.
+ */
+TEST(HandoffRevocationTest, StringFalseIsDisabled) {
+  const std::string json = R"({"root":{"named_devices":[{"cert":"cert-s","enabled":"false"}]}})";
+  const auto result = handoff::disabled_client_certs(json);
+  ASSERT_TRUE(result.has_value()) << "A valid state file must return a value.";
+  EXPECT_EQ(*result, (std::set<std::string> {"cert-s"}))
+    << "enabled as the string \"false\" (boost ptree form) must count as disabled and be returned.";
+}
+
+/**
+ * @brief The ptree string form `"enabled":"true"` is an enabled client and is not returned.
+ */
+TEST(HandoffRevocationTest, StringTrueIsEnabled) {
+  const std::string json = R"({"root":{"named_devices":[{"cert":"cert-s","enabled":"true"}]}})";
+  const auto result = handoff::disabled_client_certs(json);
+  ASSERT_TRUE(result.has_value()) << "A valid state file must return a value.";
+  EXPECT_TRUE(result->empty()) << "enabled as the string \"true\" must not be returned.";
+}
+
+/**
+ * @brief The ptree string form `"enabled":"0"` is disabled.
+ */
+TEST(HandoffRevocationTest, StringZeroIsDisabled) {
+  const std::string json = R"({"root":{"named_devices":[{"cert":"cert-z","enabled":"0"}]}})";
+  const auto result = handoff::disabled_client_certs(json);
+  ASSERT_TRUE(result.has_value()) << "A valid state file must return a value.";
+  EXPECT_EQ(*result, (std::set<std::string> {"cert-z"})) << "enabled as the string \"0\" must count as disabled.";
+}
+
+/**
+ * @brief The ptree string form `"enabled":"1"` is enabled and is not returned.
+ */
+TEST(HandoffRevocationTest, StringOneIsEnabled) {
+  const std::string json = R"({"root":{"named_devices":[{"cert":"cert-o","enabled":"1"}]}})";
+  const auto result = handoff::disabled_client_certs(json);
+  ASSERT_TRUE(result.has_value()) << "A valid state file must return a value.";
+  EXPECT_TRUE(result->empty()) << "enabled as the string \"1\" must not be returned.";
+}
+
+/**
+ * @brief `named_devices` written as the empty ptree string is an empty set, not nullopt.
+ */
+TEST(HandoffRevocationTest, EmptyStringNamedDevicesGivesEmptySet) {
+  const std::string json = R"({"root":{"uniqueid":"x","named_devices":""}})";
+  const auto result = handoff::disabled_client_certs(json);
+  ASSERT_TRUE(result.has_value()) << "named_devices written as \"\" must be read as an empty array, not nullopt.";
+  EXPECT_TRUE(result->empty()) << "An empty ptree named_devices must give an empty set.";
+}
+
+/**
+ * @brief Any `enabled` value other than the documented enabled forms fails closed: the client is returned.
+ */
+TEST(HandoffRevocationTest, UnrecognisedEnabledValuesFailClosed) {
+  const std::vector<std::pair<std::string, std::string>> cases = {
+    {R"("yes")", "string yes"},
+    {"0", "number 0"},
+    {"1", "number 1"},
+    {"null", "null"},
+    {"{}", "empty object"},
+    {"[]", "empty array"},
+  };
+  for (const auto &[value, label] : cases) {
+    SCOPED_TRACE(label);
+    const std::string json = R"({"root":{"named_devices":[{"cert":"cert-f","enabled":)" + value + R"(}]}})";
+    const auto result = handoff::disabled_client_certs(json);
+    ASSERT_TRUE(result.has_value()) << "A valid state file must return a value.";
+    EXPECT_EQ(result->count("cert-f"), 1U)
+      << "enabled = " << label << " is not an enabled form, so the client must fail closed and be returned.";
+  }
+}
+
+/**
+ * @brief An entry without a string `cert` is skipped; other disabled entries still count.
+ */
+TEST(HandoffRevocationTest, EntryWithoutStringCertIsSkipped) {
+  const std::string json = R"({"root":{"named_devices":[
+      {"cert":123,"enabled":"false"},
+      {"enabled":"false"},
+      {"cert":"cert-ok","enabled":"false"}
+    ]}})";
+  const auto result = handoff::disabled_client_certs(json);
+  ASSERT_TRUE(result.has_value()) << "A valid state file must return a value even when some entries lack a string cert.";
+  EXPECT_EQ(*result, (std::set<std::string> {"cert-ok"}))
+    << "Entries with a non-string or missing cert must be skipped, while the valid disabled entry is still returned.";
+}
+
+/**
+ * @brief Boolean and string forms of `enabled` can be mixed in one file.
+ */
+TEST(HandoffRevocationTest, MixedBooleanAndStringFormsInOneFile) {
+  const std::string json = R"({"root":{"named_devices":[
+      {"cert":"c-bool-false","enabled":false},
+      {"cert":"c-str-false","enabled":"false"},
+      {"cert":"c-str-zero","enabled":"0"},
+      {"cert":"c-bool-true","enabled":true},
+      {"cert":"c-str-true","enabled":"true"},
+      {"cert":"c-str-one","enabled":"1"},
+      {"cert":"c-missing"}
+    ]}})";
+  const auto result = handoff::disabled_client_certs(json);
+  ASSERT_TRUE(result.has_value()) << "A valid mixed-form state file must return a value.";
+  EXPECT_EQ(*result, (std::set<std::string> {"c-bool-false", "c-str-false", "c-str-zero"}))
+    << "Only the disabled forms (false, \"false\", \"0\") must be returned from a mixed file.";
 }
 #endif

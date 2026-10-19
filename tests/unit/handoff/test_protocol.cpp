@@ -1060,4 +1060,65 @@ TEST(HandoffProtocolTest, MalformedInputIsNotDecodedAsOtherTypes) {
   EXPECT_EQ(proto::decode("garbage", message), proto::decode_status_e::malformed)
     << "Garbage input must be malformed.";
 }
+
+// ---- App snapshot digest (carried by GO) -------------------------------------------------------------------------
+
+/**
+ * @brief Build a GO whose app snapshot carries the given digest value.
+ * @param digest Digest string to place in `app.digest`.
+ * @return GO payload.
+ */
+static std::string go_with_digest(const std::string &digest) {
+  return dump({{"type", "GO"}, {"app", {{"app_id", 3}, {"name", "n"}, {"applied_prep", 1}, {"digest", digest}, {"launch_env", nlohmann::json::array()}}}, {"host_audio", false}, {"next_launch_session_id", 0}});
+}
+
+/**
+ * @brief An empty snapshot digest (the value app_digest() returns on a hash failure) is malformed.
+ */
+TEST(HandoffProtocolTest, GoSnapshotEmptyDigestIsMalformed) {
+  expect_malformed(go_with_digest(""));
+}
+
+/**
+ * @brief A snapshot digest of 63 characters is malformed.
+ */
+TEST(HandoffProtocolTest, GoSnapshotDigestOneShortIsMalformed) {
+  expect_malformed(go_with_digest(kDigest.substr(0, 63)));
+}
+
+/**
+ * @brief A snapshot digest of 65 characters is malformed.
+ */
+TEST(HandoffProtocolTest, GoSnapshotDigestOneLongIsMalformed) {
+  expect_malformed(go_with_digest(kDigest + "0"));
+}
+
+/**
+ * @brief A snapshot digest with uppercase hex is malformed.
+ */
+TEST(HandoffProtocolTest, GoSnapshotDigestUppercaseIsMalformed) {
+  std::string upper = kDigest;
+  upper[1] = 'A';
+  expect_malformed(go_with_digest(upper));
+}
+
+/**
+ * @brief A snapshot digest with a non-hex character is malformed.
+ */
+TEST(HandoffProtocolTest, GoSnapshotDigestNonHexIsMalformed) {
+  std::string bad = kDigest;
+  bad[20] = 'z';
+  expect_malformed(go_with_digest(bad));
+}
+
+/**
+ * @brief A snapshot digest of 64 lowercase hex characters is accepted, and it decodes unchanged.
+ */
+TEST(HandoffProtocolTest, GoSnapshotDigestValidIsAccepted) {
+  const auto message = decode_ok(go_with_digest(kDigest));
+  const auto *go = std::get_if<proto::go_t>(&message);
+  ASSERT_NE(go, nullptr) << "A GO must decode to go_t.";
+  ASSERT_TRUE(go->app.has_value()) << "The GO carries an app snapshot.";
+  EXPECT_EQ(go->app->digest, kDigest) << "A 64-character lowercase digest must decode unchanged.";
+}
 #endif
