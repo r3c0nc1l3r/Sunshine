@@ -895,6 +895,54 @@ TEST_F(HandoffResponderTest, EndAllIsAnsweredWithin100msOfTheMachineWhileCloseCe
   EXPECT_EQ(8U, collect(8, 1000ms).size()) << "The CLOSE_CERT requests are answered once released.";
 }
 
+TEST_F(HandoffResponderTest, EighthCloseCertIsAcceptedWithSevenBlockedAndARunnerInFlight) {
+  make_responder();
+  cert_gate.close();
+  end_gate.close();
+  send_in(proto::end_all_t {100});
+  ASSERT_TRUE(end_gate.wait_entered(1, 1000ms)) << "The END_ALL runner must be in flight.";
+  for (int i = 1; i <= 7; ++i) {
+    send_in(proto::close_cert_request_t {static_cast<std::uint64_t>(i), hash_of(i)});
+  }
+  ASSERT_TRUE(cert_gate.wait_entered(7, 1000ms)) << "Seven CLOSE_CERT handlers must be blocked.";
+  send_in(proto::close_cert_request_t {8, hash_of(8)});
+  EXPECT_TRUE(cert_gate.wait_entered(8, 1000ms)) << "The runner must not count against the cap: with seven CLOSE_CERT handlers and a runner, the eighth CLOSE_CERT must be accepted.";
+  EXPECT_EQ(9U, responder->live_handlers_for_test()) << "Eight CLOSE_CERT threads plus the runner are alive.";
+}
+
+TEST_F(HandoffResponderTest, NinthCloseCertIsDroppedWithEightBlockedAndARunnerInFlight) {
+  make_responder();
+  cert_gate.close();
+  end_gate.close();
+  send_in(proto::end_all_t {100});
+  ASSERT_TRUE(end_gate.wait_entered(1, 1000ms)) << "The END_ALL runner must be in flight.";
+  for (int i = 1; i <= 8; ++i) {
+    send_in(proto::close_cert_request_t {static_cast<std::uint64_t>(i), hash_of(i)});
+  }
+  ASSERT_TRUE(cert_gate.wait_entered(8, 1000ms)) << "Eight CLOSE_CERT handlers must be blocked.";
+  const auto warnings = capture->count(sev_warning);
+  send_in(proto::close_cert_request_t {9, hash_of(9)});
+  EXPECT_GT(capture->count(sev_warning), warnings) << "The ninth CLOSE_CERT must be dropped with a Warning even with a runner in flight.";
+  std::this_thread::sleep_for(30ms);
+  EXPECT_EQ(8, cert_gate.entered_now()) << "close_cert must not be called for the dropped request.";
+  EXPECT_EQ(9U, responder->live_handlers_for_test()) << "No thread may start for the dropped request.";
+}
+
+TEST_F(HandoffResponderTest, AFailedReplySendDoesNotStopTheOtherEndAllWaitersFromBeingAnswered) {
+  make_responder();
+  end_gate.close();
+  send_in(proto::end_all_t {1});
+  ASSERT_TRUE(end_gate.wait_entered(1, 1000ms)) << "The runner must be inside end_and_join.";
+  send_in(proto::end_all_t {2});
+  send_in(proto::end_all_t {3});
+  peer->close();
+  const auto before = capture->count(sev_warning);
+  end_gate.release();
+  EXPECT_TRUE(wait_live(0, 1000ms)) << "The runner must finish although sends fail.";
+  EXPECT_GE(capture->count(sev_warning), before + 3) << "Each of the three waiters must be tried and each failed send logged as a Warning; a failed send must not skip the remaining waiters.";
+  EXPECT_EQ(handoff::end_state_e::ended, machine.state()) << "The machine must still reach ended.";
+}
+
 TEST_F(HandoffResponderTest, CloseCertLateReplyLogsWarningButStillReplies) {
   make_responder();
   cert_advance_ms = 600;

@@ -39,6 +39,7 @@
 
   // platform includes
   #include <stdlib.h>
+  #include <sys/stat.h>
   #include <unistd.h>
 
   // local includes
@@ -700,6 +701,53 @@ TEST_F(HandoffRevocationPollTest, APartialFileEndsNothingAndIsRetried) {
     },
     1000ms
   )) << "Once the file is complete it is read and the client is terminated.";
+}
+
+TEST_F(HandoffRevocationPollTest, AFifoAtTheStatePathIsAFailedPassAndNeverBlocks) {
+  make_poller();
+  ASSERT_EQ(0, ::mkfifo(state_file.c_str(), 0600)) << "mkfifo must work.";
+  ASSERT_TRUE(poller->start()) << "start() must succeed.";
+  ASSERT_TRUE(wait_passes(3, 1500ms)) << "Passes must keep completing: a FIFO must never block the poller.";
+  EXPECT_GE(poller->failed_passes_for_test(), 3U) << "A non-regular state file (FIFO) counts as unreadable: a failed pass.";
+  EXPECT_EQ(0U, total_calls()) << "It ends nothing.";
+  EXPECT_GE(capture->count(sev_warning), 1U) << "It is logged as a Warning.";
+  const auto begin = clock_type::now();
+  poller->stop();
+  EXPECT_LT(clock_type::now() - begin, 500ms) << "stop() must return promptly with a FIFO at the state path.";
+}
+
+TEST_F(HandoffRevocationPollTest, TwoQuickWritesAreCoalescedIntoOnePassThatSeesTheFinalContent) {
+  auto config = make_config();
+  config.cap = 5000ms;
+  make_poller(std::move(config));
+  write_devices({{"cert-a", "true"}, {"cert-x", "true"}});
+  ASSERT_TRUE(poller->start()) << "start() must succeed.";
+  ASSERT_TRUE(wait_passes(1)) << "The first pass runs at start.";
+  const auto before = poller->passes_for_test();
+  write_devices({{"cert-a", "true"}, {"cert-x", "false"}});
+  std::this_thread::sleep_for(5ms);
+  write_devices({{"cert-a", "false"}, {"cert-x", "true"}});
+  ASSERT_TRUE(wait_until(
+    [&] {
+      return count_of("cert-a") == 1;
+    },
+    800ms
+  )) << "The final content must be seen.";
+  std::this_thread::sleep_for(150ms);
+  EXPECT_EQ(before + 1, poller->passes_for_test()) << "Events that arrive close together must be coalesced into one pass.";
+  EXPECT_EQ(0U, count_of("cert-x")) << "The intermediate content must not be read: the pass runs after the writes settle.";
+}
+
+TEST_F(HandoffRevocationPollTest, RecoveryAfterAFailedEpisodeLogsOneInfoLine) {
+  make_poller();
+  ASSERT_TRUE(poller->start()) << "start() must succeed.";
+  ASSERT_TRUE(capture->wait_count(sev_warning, 1, 1000ms)) << "The failed episode starts with a Warning.";
+  ASSERT_TRUE(wait_more_passes(2)) << "More failed passes.";
+  const auto infos = capture->count(sev_info);
+  write_devices({{"cert-a", "true"}});
+  EXPECT_TRUE(capture->wait_count(sev_info, infos + 1, 1000ms)) << "The first successful pass after a failure must log an Info line.";
+  ASSERT_TRUE(wait_more_passes(4)) << "More successful passes.";
+  EXPECT_EQ(infos + 1, capture->count(sev_info)) << "Only the first successful pass logs the Info line.";
 }
 
 TEST_F(HandoffRevocationPollTest, AnEmptyFileIsAFailedPass) {
