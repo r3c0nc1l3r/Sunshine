@@ -44,6 +44,7 @@ namespace handoff {
      * @return Outcome.
      */
     read_status_e read_whole_file(const fs::path &path, std::string &content) {
+      constexpr std::size_t max_bytes = 64 * 1024;  // A larger file is treated as unreadable.
       content.clear();
       const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
       if (fd < 0) {
@@ -64,6 +65,10 @@ namespace handoff {
           break;
         }
         content.append(buffer, static_cast<std::size_t>(n));
+        if (content.size() > max_bytes) {
+          ::close(fd);
+          return read_status_e::failed;
+        }
       }
       ::close(fd);
       return read_status_e::ok;
@@ -93,6 +98,7 @@ namespace handoff {
      * @return `true` when the directory is usable; otherwise an Error is logged and `false` returned.
      */
     bool prepare_directory(const fs::path &dir) {
+      // The runtime directory is assumed to be user-owned and private (systemd RuntimeDirectory or XDG_RUNTIME_DIR).
       // Collect the missing directories from the leaf upwards; they are created from the top down.
       std::vector<fs::path> missing;
       for (fs::path current = dir; !current.empty(); current = current.parent_path()) {
@@ -468,16 +474,66 @@ namespace handoff {
     }
   }
 
+  namespace {
+    /**
+     * @brief Classify one directory entry for `scan_instances()`.
+     *
+     * @param path Entry path.
+     * @param result Scan result to update.
+     * @param start_time_of Returns a pid's current start time.
+     */
+    void scan_entry(const fs::path &path, scan_result_t &result, const std::function<std::optional<std::uint64_t>(pid_t)> &start_time_of) {
+      if (path.extension() != ".json") {
+        return;
+      }
+
+      std::string content;
+      const auto status = read_whole_file(path, content);
+      if (status == read_status_e::missing) {
+        // Removed by its process during the scan.
+        return;
+      }
+      if (status == read_status_e::failed) {
+        result.any_unreadable = true;
+        return;
+      }
+
+      // The file name must name the pid inside the file.
+      const auto instance = parse_instance(content);
+      if (!instance || path.filename() != fs::path(std::to_string(instance->pid) + ".json")) {
+        result.any_unreadable = true;
+        return;
+      }
+
+      const auto current = start_time_of(instance->pid);
+      if (current && *current == instance->start_time) {
+        result.live.push_back(*instance);
+      } else {
+        result.stale.push_back(instance->pid);
+      }
+    }
+  }  // namespace
+
   scan_result_t scan_instances(const fs::path &dir, const std::function<std::optional<std::uint64_t>(pid_t)> &start_time_of) {
     scan_result_t result;
 
     std::error_code ec;
+    // Only a directory that does not exist is "missing". Any other failure to inspect it, or a path that is not a
+    // directory, means the instances cannot be listed, so the scan fails closed.
     const auto status = fs::status(dir, ec);
+    if (ec) {
+      if (ec == std::errc::no_such_file_or_directory) {
+        result.dir_missing = true;
+      } else {
+        result.any_unreadable = true;
+      }
+      return result;
+    }
     if (status.type() == fs::file_type::not_found) {
       result.dir_missing = true;
       return result;
     }
-    if (ec || !fs::is_directory(status)) {
+    if (!fs::is_directory(status)) {
       result.any_unreadable = true;
       return result;
     }
@@ -488,40 +544,17 @@ namespace handoff {
       return result;
     }
 
-    for (const auto end = fs::directory_iterator(); it != end; it.increment(ec)) {
+    // Explicit increment, then check its error: a range-for or a for loop with `increment(ec)` in the step would
+    // silently end the scan (libstdc++ sets the iterator to end on error), so the error must be read after each step.
+    const fs::directory_iterator end;
+    while (it != end) {
+      const fs::path path = it->path();
+      scan_entry(path, result, start_time_of);
+
+      it.increment(ec);
       if (ec) {
         result.any_unreadable = true;
         break;
-      }
-
-      const auto &path = it->path();
-      if (path.extension() != ".json") {
-        continue;
-      }
-
-      std::string content;
-      const auto status = read_whole_file(path, content);
-      if (status == read_status_e::missing) {
-        // Removed by its process during the scan.
-        continue;
-      }
-      if (status == read_status_e::failed) {
-        result.any_unreadable = true;
-        continue;
-      }
-
-      // The file name must name the pid inside the file.
-      const auto instance = parse_instance(content);
-      if (!instance || path.filename() != fs::path(std::to_string(instance->pid) + ".json")) {
-        result.any_unreadable = true;
-        continue;
-      }
-
-      const auto current = start_time_of(instance->pid);
-      if (current && *current == instance->start_time) {
-        result.live.push_back(*instance);
-      } else {
-        result.stale.push_back(instance->pid);
       }
     }
     return result;
