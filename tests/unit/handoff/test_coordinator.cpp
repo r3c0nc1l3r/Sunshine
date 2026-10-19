@@ -3192,4 +3192,174 @@ TEST_F(HandoffCoordinatorTest, StartControlFailsAfterRequestShutdown) {
   EXPECT_FALSE(C().start_control(hf::control_socket_path(tmp, ::getpid()).string()));
 }
 
+// =====================================================================================================================
+// Scope after COMMIT, kill_pending, control server restart (lead rulings)
+// =====================================================================================================================
+
+namespace {
+  /**
+   * @brief Send the `handoff` verb to a control socket and parse the reply line.
+   *
+   * @param path Socket path.
+   * @return The reply, or nothing when connecting or parsing failed.
+   */
+  std::optional<handoff::control_reply_t> control_request(const std::string &path) {
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+      return std::nullopt;
+    }
+    sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+      ::close(fd);
+      return std::nullopt;
+    }
+    const std::string verb = "handoff\n";
+    if (::write(fd, verb.data(), verb.size()) != static_cast<ssize_t>(verb.size())) {
+      ::close(fd);
+      return std::nullopt;
+    }
+    std::string line;
+    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (line.find('\n') == std::string::npos && std::chrono::steady_clock::now() < deadline) {
+      pollfd p {fd, POLLIN, 0};
+      if (::poll(&p, 1, 100) > 0) {
+        char buf[256];
+        const auto n = ::read(fd, buf, sizeof(buf));
+        if (n <= 0) {
+          break;
+        }
+        line.append(buf, static_cast<std::size_t>(n));
+      }
+    }
+    ::close(fd);
+    return handoff::parse_reply(line);
+  }
+}  // namespace
+
+TEST_F(HandoffCoordinatorTest, ShutdownRightAfterCommitKeepsScopeAndTheSharedTcpMappings) {
+  install_igd_and_start(own_port, other_base);
+  const auto tcp_before = upnp::testing::fake_igd_mappings();
+  start_handle();
+  ASSERT_TRUE(attach_peer());
+  ASSERT_TRUE(peer_to_commit());
+  C().request_shutdown();  // the committed answer may not have been sent yet
+  ASSERT_TRUE(C().join_attempt(2000ms));
+  EXPECT_EQ(upnp::unmap_scope_e::udp_only, upnp::unmap_scope()) << "once COMMIT is written a shutdown must never restore all";
+  ASSERT_TRUE(upnp::testing::wait_idle_for_test(1500ms));
+  const auto store = upnp::testing::fake_igd_mappings();
+  for (const auto &m : old_store) {
+    EXPECT_EQ(1u, store.count(m)) << "the shared " << (m.tcp ? "TCP" : "UDP") << " mapping " << m.port << " must survive; got: " << describe(store);
+  }
+  EXPECT_EQ(tcp_before, store) << "a shutdown after COMMIT removes nothing";
+}
+
+TEST_F(HandoffCoordinatorTest, ShutdownAfterCommitWithEqualBasesKeepsScopeNone) {
+  own_base_override = other_base;
+  ASSERT_TRUE(run_to_commit());
+  C().request_shutdown();
+  ASSERT_TRUE(C().join_attempt(2000ms));
+  EXPECT_EQ(upnp::unmap_scope_e::none, upnp::unmap_scope()) << "equal bases: the scope stays none after COMMIT and a shutdown";
+}
+
+TEST_F(HandoffCoordinatorTest, ShutdownAfterCommitAndTheCommittedAnswerKeepsScope) {
+  ASSERT_TRUE(run_to_commit());
+  peer->start_pump();
+  const auto reply = get_reply();
+  ASSERT_TRUE(reply.has_value());
+  ASSERT_EQ(hf::reply_kind_e::committed, reply->kind);
+  C().request_shutdown();
+  ASSERT_TRUE(C().join_attempt(2000ms));
+  EXPECT_EQ(upnp::unmap_scope_e::udp_only, upnp::unmap_scope());
+  EXPECT_EQ(0, events.count("env_scope:all")) << "nothing may restore all after COMMIT";
+}
+
+TEST_F(HandoffCoordinatorTest, ChannelLostRightAfterCommitNeverLeavesTheScopeOnTheWayToAll) {
+  // SPEC-QUESTION: a send error after COMMIT was written is not reproducible through the public seams; the closest
+  // observable case is the peer vanishing as COMMIT arrives. A confirmed reap is a rollback and restores all, so this
+  // test only requires that a shutdown which wins the race keeps the scope.
+  ASSERT_TRUE(run_to_commit());
+  C().request_shutdown();
+  peer->channel.close();
+  ASSERT_TRUE(C().join_attempt(2000ms));
+  const auto scope = upnp::unmap_scope();
+  if (events.count("drain_cancel") == 0) {
+    EXPECT_EQ(upnp::unmap_scope_e::udp_only, scope) << "no confirmed rollback happened, so all must not be restored";
+  }
+}
+
+TEST_F(HandoffCoordinatorTest, ShutdownBeforeTheSwitchRestoresScopeAll) {
+  // Control for the tests above: a shutdown before any GO or COMMIT restores all.
+  start_handle();
+  ASSERT_TRUE(attach_peer());
+  ASSERT_TRUE(peer_handshake());
+  hf::runtime().request_shutdown();
+  const auto reply = get_reply();
+  ASSERT_TRUE(reply.has_value());
+  ASSERT_TRUE(wait_until([this]() {
+    return !C().attempt_running();
+  }));
+  EXPECT_EQ(upnp::unmap_scope_e::all, upnp::unmap_scope()) << "a shutdown before the switch started leaves the scope at all";
+}
+
+TEST_F(HandoffCoordinatorTest, KillPendingOutcomeNeverRestoresScopeAllAndNeverRemovesPorts) {
+  config::sunshine.flags[config::flag::UPNP] = true;
+  remove_ports_hook = [](std::set<std::uint16_t>) {
+  };
+  child_state->timeouts_left = 1000000;  // the kill is never confirmed
+  ASSERT_TRUE(run_to_commit());
+  ASSERT_TRUE(get_reply().has_value());
+  peer->channel.close();
+  ASSERT_TRUE(wait_until([]() {
+    const auto cur = hf::runtime().instance_current();
+    return cur && cur->handoff == hf::state_e::kill_pending;
+  }))
+    << "setup: the rollback must reach kill_pending";
+  std::this_thread::sleep_for(150ms);
+  EXPECT_EQ(upnp::unmap_scope_e::udp_only, upnp::unmap_scope()) << "an unconfirmed kill must keep the new process's mappings protected: no all";
+  EXPECT_EQ(0, events.count("remove_ports")) << "no removal while the new process may still be alive";
+  EXPECT_EQ(0, events.count("env_scope:all"));
+  child_state->timeouts_left = 0;
+}
+
+TEST_F(HandoffCoordinatorTest, ConfirmedRollbackRestoresScopeAllAndCallsTheRemoval) {
+  // Control for the kill_pending test: the same path with a confirmed reap.
+  config::sunshine.flags[config::flag::UPNP] = true;
+  remove_ports_hook = [](std::set<std::uint16_t>) {
+  };
+  ASSERT_TRUE(run_to_commit());
+  ASSERT_TRUE(get_reply().has_value());
+  peer->channel.close();
+  ASSERT_TRUE(wait_until([this]() {
+    return !C().attempt_running();
+  }));
+  EXPECT_EQ(upnp::unmap_scope_e::all, upnp::unmap_scope());
+  EXPECT_EQ(1, events.count("remove_ports"));
+}
+
+TEST_F(HandoffCoordinatorTest, StartControlTwiceStartsOneServerAndServesRequests) {
+  notify_value = "";
+  const auto path = hf::control_socket_path(tmp, ::getpid()).string();
+  ASSERT_TRUE(C().start_control(path));
+  ASSERT_TRUE(C().start_control(path)) << "a second start while running returns true";
+  const auto reply = control_request(path);
+  ASSERT_TRUE(reply.has_value()) << "the single server must answer";
+  EXPECT_EQ(std::string {hf::refusal_reason::no_notify_socket}, reply->reason);
+  EXPECT_EQ(1, cnt_notify.load()) << "one request reached one handler";
+}
+
+TEST_F(HandoffCoordinatorTest, StartControlWorksAgainAfterStopControl) {
+  notify_value = "";
+  const auto path = hf::control_socket_path(tmp, ::getpid()).string();
+  ASSERT_TRUE(C().start_control(path));
+  ASSERT_TRUE(control_request(path).has_value());
+  C().stop_control();
+  EXPECT_FALSE(control_request(path).has_value()) << "after stop_control() nothing listens";
+  ASSERT_TRUE(C().start_control(path)) << "stop_control() then start_control() starts the server again";
+  const auto reply = control_request(path);
+  ASSERT_TRUE(reply.has_value()) << "the restarted server must answer";
+  EXPECT_EQ(std::string {hf::refusal_reason::no_notify_socket}, reply->reason);
+}
+
 #endif  // __linux__
