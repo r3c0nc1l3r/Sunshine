@@ -79,13 +79,17 @@ answers the helper with the reason, keeps running unchanged) when:
 - an application with a running process is active, because the new process cannot adopt processes: the app is not in
   placebo mode, or it is in placebo mode but its process group still has running processes (an `auto-detach` app whose
   launcher exited while the processes it started keep running [C11]). This needs a new read accessor ("adoptable": the
-  `placebo` flag is set, and the process group is not valid or `kill(-pgid, 0)` finds no process in it). The accessor
-  reads the fields directly and never calls `running()`, which can itself terminate the app and run `undo` commands
+  `placebo` flag is set, and the process group is not valid or `kill(-pgid, 0)` with `pgid > 1` finds no process in it;
+  zombies count as present, and a reused pgid gives a false "present", which refuses safely). The accessor reads the
+  fields through atomics or a small mutex (the control loop writes them in `running()` and `terminate()`) and never
+  calls `running()`, which can itself terminate the app and run `undo` commands
   [C21]. `kill(-pgid, 0)` also sees processes that are no longer Sunshine's children, unlike `process_group_running`
   [C11]; `EPERM` counts as a process present. With no app running there is nothing to adopt (the snapshot says none). A
   process that moves into the adopted app's empty process group after the handoff (with `setpgid`) is not killed by the
   new process's terminate, which has no group; today `terminate_process_group` would kill it [C11]. This is an accepted
-  difference. A non-placebo app whose process has exited but has not been polled yet is refused; the next `running()`
+  difference. An auto-detach app can keep a live group only with `wait-all: false` (with the default `true`,
+  `running()` returns on the group branch first [C11]); the "not adoptable" test uses that setting. A non-placebo app
+  whose process has exited but has not been polled yet is refused; the next `running()`
   poll clears it and the helper can retry. A desktop-style app (placebo mode, no process group left) is adopted, see
   "App ownership and prep commands";
 - a pairing is in progress: after `expire_pair_sessions` [C14], the pairing session map is not empty (a
@@ -113,7 +117,9 @@ environment adds:
 
 The systemd `LISTEN_FDS`/`LISTEN_PID` convention is not used: the child's pid is not known before the spawn.
 
-The old process gets a pidfd for the child from the spawn itself (`pidfd_spawn`, glibc 2.39 or newer; or `clone3`
+The spawn resets the signal mask and dispositions in the child (`POSIX_SPAWN_SETSIGMASK` with an empty mask and
+`POSIX_SPAWN_SETSIGDEF`), so a blocked signal in the spawning thread is not inherited. The old process gets a pidfd
+for the child from the spawn itself (`pidfd_spawn`, glibc 2.39 or newer; or `clone3`
 with `CLONE_PIDFD`), so no pid lookup can race with pid reuse, and uses it to watch the child for the rest of the
 handoff. A dead child is reaped with `waitid(P_PIDFD, ...)`. Sunshine already reaps any child with
 `waitpid(-1, WNOHANG)` whenever it checks the app [C27], so that call can find the child already reaped (`ECHILD`):
@@ -129,9 +135,10 @@ the death is still seen through the pidfd (it becomes readable), and the exit st
   `READY`. The old process's `HELLO` carries its encoder probe results (the HEVC, AV1 and 4:4:4 capability flags that
   `/serverinfo` reports) with a probe identity (build id, GPU render node and vendor/device id, driver version). The new
   process uses them only when the identity matches its own, and only for `/serverinfo` (see "GPU"). The old process's
-  `HELLO` also carries its cooldown deadline, which the new process inherits, and its pid and start time: the new
-  process opens a pidfd for that pid with `pidfd_open` and checks the start time in `/proc/<pid>/stat`, so it holds
-  the right process even if the old one had already died. The app state is not sent here: the old
+  `HELLO` also carries its cooldown deadline, which the new process inherits, and a pidfd of the old process itself
+  (`pidfd_open(getpid())`, sent with `SCM_RIGHTS`), so the new process holds the right process without any pid lookup
+  (a pid number can be reused later; the pidfd still refers to the old process). A `HELLO` without it is a failed
+  `READY`. The app state is not sent here: the old
   process keeps serving until the switch, so it is sent in `GO`.
 - It adopts the sockets instead of binding them (this needs small patches: Simple-Web-Server `start()` must accept an
   existing listening socket, and the RTSP acceptor in `rtsp.cpp` must adopt one instead of `bind`/`listen`), starts its
@@ -140,8 +147,8 @@ the death is still seen through the pidfd (it becomes readable), and the exit st
 
 ### 4. Failed start
 The new process sends a failed `READY`, exits, closes the channel, or does not report within
-`drain_handoff_ready_timeout`: the old process kills it if it still runs (through the pidfd), reaps it, logs an Error,
-answers the helper with a non-zero result, and keeps serving. It never stopped accepting.
+`drain_handoff_ready_timeout`: the old process kills it and waits for it to be reaped (the kill-first rule, step 6),
+logs an Error, answers the helper with a non-zero result, and keeps serving. It never stopped accepting.
 
 ### 5. Switch
 On `READY` the old process, in this order:
@@ -162,15 +169,16 @@ On `READY` the old process, in this order:
    on separate threads: a handler first increments the counter, then checks the gate (and if it is set, decrements and
    answers 503); the switcher first sets the gate, then waits for zero (sequentially consistent atomics). Only these
    counters are waited on. A launch that answers during this wait raises a launch session (its `do` commands have run);
-   step 4 handles it. The wait is bounded (5 s). If it times out, the handoff fails: the old process lifts the 503 gate,
-   resumes accepting, kills and reaps the new process, removes the new process's instance file, and answers the helper
-   non-zero. Clients that got a 503 during the attempt retry;
+   step 4 handles it. The wait is bounded (5 s). If it times out, the handoff fails: the old process kills the new
+   process and waits for it to be reaped (the kill-first rule, step 6), removes the new process's instance file, lifts
+   the 503 gate, resumes accepting, and answers the helper non-zero. Clients that got a 503 during the attempt retry;
 4. repeats the step-1 checks that can have changed since then: an app that is not adoptable fails the handoff as in
-   step 3. A pairing session (the map holds it while it waits for the PIN, after `/pair` has answered [C14]) or a
-   pending launch [C5] can only end now, because the gate refuses new ones: the old process waits for them to finish
-   or expire, up to `ping_timeout`, and fails the handoff as in step 3 if one remains. With accepting paused, a
-   pending launch can only expire here (its client's RTSP connection waits in the shared accept queue and reaches the
-   new process, so the stream fails once and the client retries); the app it started is adopted like any other;
+   step 3. A pairing session (the map holds it while it waits for the PIN, after `/pair` has answered [C14]) can only
+   end now, because the gate refuses new ones: the old process waits for it to finish or expire, up to `ping_timeout`,
+   and fails the handoff as in step 3 if one remains. A pending launch [C5] is dropped at once (the launch event is
+   popped and its timer cancelled): with accepting paused it could only expire, its client's RTSP connection waits in
+   the shared accept queue and reaches the new process, so the stream fails once and the client retries; the app it
+   started is adopted like any other;
 5. writes `sunshine_state.json` once more (and `apps.json`, which only the web UI's app save writes, needs no extra
    write), under `client_auth_mutex`, so a pairing that completed
    just before the switch is on disk (`save_state` is called directly; `FRESH_STATE`, which skips it [C29], is refused
@@ -179,18 +187,28 @@ On `READY` the old process, in this order:
 7. withdraws its mDNS service (see "mDNS") and removes its tray icon;
 8. sends `GO` with a snapshot taken now: its running placebo app or none (see "App ownership and prep commands"), its
    current `host_audio` setting (the value `/resume` uses [C28]), and the next launch session id [C28];
-9. releases the app (see "App ownership and prep commands") as it sends `GO`, then waits for the new process's
-   `GO_ACK` (5 s). On `ok` it answers the helper: switched (exit 0). On a failed `GO_ACK` (with a reason), a timeout
-   or a dead new process, it rolls back as in step 6 (it is still the main process), which clears the release flag,
-   and answers the helper non-zero. Releasing before `GO_ACK` means that a stop of both processes in between can at
-   worst lose the `undo` commands, never run them twice.
+9. checks its shutdown flag (a `SIGTERM` that has arrived aborts the handoff with the kill-first rollback of step 6),
+   sets the release flag (see "App ownership and prep commands"), and only then sends `GO`. The handoff worker is
+   joined before the `proc` deinit guard runs `terminate()` [C10], so a shutdown never runs `undo` while the snapshot is
+   taken or `GO` is in flight;
+10. waits for the new process's `GO_ACK` (5 s). On `ok` it sends `COMMIT` and answers the helper: switched (exit 0).
+    On a failed `GO_ACK` (with a reason), a timeout, a failed `COMMIT` send, a channel error or a dead new process, it
+    rolls back with the kill-first rule of step 6 (it is still the main process), which clears the release flag, and
+    answers the helper non-zero. Releasing before `GO` means that a stop of both processes in between can at worst
+    lose the `undo` commands, never run them twice.
 
 The new process writes no state file before `GO`. On `GO` it reloads `sunshine_state.json` (`load_state` also rebuilds
-the trusted client certificate chain [C30]), the credentials file and `apps.json`, all under `client_auth_mutex`. Only
-after the `apps.json` reload does it adopt the app from the snapshot (a reload replaces the whole `proc_t` [C31]), and
-it takes `host_audio` and the session id counter. Then it sends `GO_ACK ok` (or a reason), resumes accepting,
-publishes mDNS and starts its tray icon. It sends nothing to systemd yet: the old process stays the unit's main process
-until the handover (step 7).
+the trusted client certificate chain [C30]), the credentials file and `apps.json`, all under `client_auth_mutex`. After
+the `apps.json` reload (a reload replaces the whole `proc_t` [C31]) it checks the snapshot against its own app list and
+prepares the adoption, but installs nothing yet. Then it sends `GO_ACK ok` (or a reason) and waits for `COMMIT`:
+
+- On `COMMIT` it installs the adoption (the app, `host_audio`, the session id counter), resumes accepting, publishes
+  mDNS and starts its tray icon. Only from here on can it run any `undo` command.
+- After a failed `GO_ACK`, or with no `COMMIT` within 5 s of its `GO_ACK`, or on a channel error before `COMMIT`, it
+  exits with status 1 by itself and has adopted nothing: no app, no accept, no mDNS, no tray. Its exit runs no `undo`
+  (it holds no app). The old process does not rely on this: every rollback still kills it first.
+
+It sends nothing to systemd yet: the old process stays the unit's main process until the handover (step 7).
 
 **Pausing accept.** Today the RTSP server treats every accept error as fatal: it logs an Error and calls `clear()`,
 which ends every session [C23]. Cancelling the acceptor completes the pending accept with `operation_aborted`, so the
@@ -220,9 +238,18 @@ re-arm its accept after `operation_aborted`, so resuming must start its accept a
   counts as a hung new process at once: the old process kills it and rolls back, so a new process never waits forever
   for `MAIN`.
 - **Rule:** whenever the old process is still the main process (inside the window, or later while the handover in
-  step 7 keeps failing), a dead or hung new process triggers a rollback.
+  step 7 keeps failing), a dead or hung new process triggers a rollback. No rollback happens after a successful
+  read-back (step 7).
+- **Kill-first rule.** Every rollback, on every path (a failed start in step 4, a failed step 3 or step 4 of the switch,
+  a failed or late `GO_ACK`, a failed `COMMIT` send, missed `PONG`s, a channel error, a dead new process, a failing
+  handover), starts the same way, whatever the new process does: the old process sends `SIGKILL` through the pidfd
+  (`pidfd_send_signal`; harmless if it is already dead), then waits until the pidfd is readable and the child is reaped
+  (`waitid(P_PIDFD)`; `ECHILD` because another `waitpid(-1)` reaped it also counts [C27]). The wait is bounded (5 s);
+  if the process is still not gone, the old process keeps the gate up and accepting paused, logs an Error, and sends
+  `SIGKILL` again every 5 s. Only once the new process is gone does it continue with the steps below, so a slow or
+  stuck new process can never accept, publish mDNS or hold the app next to the old one.
 - A death of the new process between `READY` and `GO` is handled as a full rollback too.
-- On a dead or hung new process, the old process, in this order: waits for the in-flight counters to reach zero (the
+- After the kill-first step, the old process, in this order: waits for the in-flight counters to reach zero (the
   gate is still up, so they only fall; it keeps the gate up and waits as long as needed, logging a Warning every 5 s,
   and never swaps while a counted request runs), reloads both state files and the credentials file and swaps in the app
   list (see "App ownership and prep commands"), takes the app back or drops it, then lifts the 503 gate, resumes
@@ -269,7 +296,9 @@ units) and a 5 s timeout.
 
 If the read-back times out although systemd has already applied `MAINPID=`, the old process still acts as the main
 process. A later death of the new process is then a main-process exit for systemd: the unit stops and `Restart=`
-applies, as in "the new process dies after the handover" below. No state is lost beyond that. The same holds for a
+applies, as in "the new process dies after the handover" below: the draining process drops its released app
+without `undo`. If the new process died abnormally, the adopted app's `undo` commands are lost, exactly as for any
+Sunshine crash today; no `do` or `undo` runs twice. The same holds for a
 death of the new process between the read-back and `MAIN`: systemd already tracks it as the main process. So once the
 read-back has succeeded the old process never rolls back (it has closed its socket copies): a channel error or a dead
 new process from then on is only logged, and systemd handles the main-process exit.
@@ -325,10 +354,10 @@ get reason `drain-deadline`.
 - Messages (requests carry a request id; replies echo it): `HELLO` (version, capabilities, probe results and identity,
   cooldown deadline), `READY` (ok or reason), `MAIN` (handover done), `PING`/`PONG`, `SESSIONS?`/`SESSIONS` (list),
   `CLOSE <id>`/`CLOSED <result>`, `CLOSE_CERT <hash>`/`CLOSED <count>`, `END_ALL`/`ENDED` or `END_REJECTED` (see "App
-  ownership and prep commands"), `GO` (with the snapshot)/`GO_ACK <ok|reason>`, and the draining process's unsolicited
-  `HANDOFF_STATE <state>`. Requests from the active process (`SESSIONS?`, `CLOSE`, `CLOSE_CERT`) time out after 500 ms
-  (late replies are dropped by request id), `END_ALL` after 15 s (it waits for session joins, which have a 10 s hang
-  guard); they are sent only from request handlers, never while holding a lock.
+  ownership and prep commands"), `GO` (with the snapshot)/`GO_ACK <ok|reason>`, `COMMIT`, and the draining process's
+  unsolicited `HANDOFF_STATE <state>`. Requests from the active process (`SESSIONS?`, `CLOSE`, `CLOSE_CERT`) time out
+  after 500 ms (late replies are dropped by request id), `END_ALL` after 15 s (it waits for session joins, which have a
+  10 s hang guard); they are sent only from request handlers, never while holding a lock.
 - When the channel closes after `MAIN`, neither side ends any session: the draining process keeps draining, the active
   process keeps serving. The active process then no longer lists or closes the draining sessions (it logs a Warning)
   and keeps refusing handoffs while the draining instance file exists.
@@ -353,8 +382,14 @@ get reason `drain-deadline`.
   today (the probe opens a capture and an encoder briefly).
 - NVENC hosts: the `/launch` probe needs a free encoder session while the draining process still holds its own; hosts
   with a session limit must allow for both processes.
-- Supported capture backends: wlr screencopy and KMS (no exclusive resources; KMS drops DRM master). Portal and X11
-  capture are not supported in handoff mode (the feature is refused with them).
+- Capture backends: the feature enables only with wlr screencopy, the backend it has been designed and tested for (no
+  exclusive resources, no display-state change), and only when `capture = wlr` is set explicitly: with `capture` empty,
+  Sunshine picks backends by what verifies at startup [C36], so the backend in use is not fixed in advance. Any other
+  setting (`kms`, `kwin`, `nvfbc`, `portal`, `x11`, or empty) makes the feature refuse to enable, fail closed, with an
+  Error naming the setting and saying that drain handoff is supported only with `capture = wlr`. A backend can be added
+  after it has been shown to work with two processes. Known reasons to check first: kwin keys its screencast permission
+  on the executable path [C34], so a `drain_handoff_binary` at another path can lose it; NvFBC has per-GPU session
+  limits; KMS needs DRM master handling.
 - The e2e checks the new process's DRM fds and memory before its first session, and peak VRAM during a handoff.
 
 ### Display configuration (no cross-process coordination needed on Linux)
@@ -400,10 +435,11 @@ app: it has no process, and it is never executed again. The last session's end l
   its group is handed off [C11].
 - The snapshot in `GO` (step 5) describes the old process's running placebo app, or none: the app id and name, the
   number of applied prep commands (`_app_prep_it - _app_prep_begin`), a digest of its merged prep list (each entry's
-  `do`, `undo` and `elevated`) and of the app's `working-dir`, `output` and `exit-timeout` (the undo commands use
-  them), and the launch environment the commands ran with (the `SUNSHINE_*` variables set by
-  `execute` [C18]). It is taken after the gate is up and the in-flight requests have finished, so no launch or
-  cancel can change it afterwards.
+  `do`, `undo` and `elevated`), of the app's `working-dir`, `output` and `exit-timeout`, and of the base environment the
+  commands run with (the process environment plus the `apps.json` `env` section [C35], without `SUNSHINE_HANDOFF_*`);
+  the digest is computed over an ordered, length-prefixed encoding, so `("a","bc")` and `("ab","c")` differ, and the
+  launch environment the commands ran with (the `SUNSHINE_*` variables set by `execute` [C18]). It is taken after the
+  gate is up and the in-flight requests have finished, so no launch or cancel can change it afterwards.
 - The new process adopts the app only when its freshly reloaded `apps.json` has the same id and name and its merged
   prep list has the same digest. Adoption is a new `proc_t` method (the fields are private): it sets the app id, the
   app (from its own `apps.json`, which also gives `get_last_run_app_name()`), `_app_prep_begin` and `_app_prep_it`
@@ -419,18 +455,19 @@ app: it has no process, and it is never executed again. The last session's end l
   control loop still sees the app and its sessions keep streaming [C22]. A `terminate()` of a released app, at a
   terminate or at its exit [C10], only drops the app state: it neither terminates a process group (there is none, as
   only adoptable apps are handed off; `terminate()` today always calls `terminate_process_group` [C12]) nor runs any
-  `undo` command. A draining process has no route that terminates apps (the 503 gate and no web UI).
+  `undo` command, and it sends no tray notification (the icon is removed). A draining process has no route that
+  terminates apps (the 503 gate and no web UI).
 - Before the active process terminates the app on any path [C21], it sends `END_ALL` over the channel when a draining
   process exists. The draining process ends all its sessions (reason `terminated`, as a terminate ends every
   session today [C22]), waits for them to be joined, gives up its claim on the app, and answers `ENDED`. Only then
   does the active process terminate the app (and run the `undo` commands).
   - **Terminate rule.** While a draining process exists, the active process terminates the app only after `ENDED`, or
-    after the draining process's pidfd shows it gone or a zombie (the new process opens and checks that pidfd at
-    `HELLO`, step 3). Nothing else counts: not the instance file (its session count can lag), and not a lost channel. If
-    neither arrives within 15 s, the active process does not terminate the app: `/cancel` and close-app answer 503 and
-    the app keeps running, unpair and unpair-all remove the clients but leave the app running; each logs a Warning. So
-    no `undo` ever runs while the other process may still stream, and an old process that never answered `ENDED` and is
-    still alive can roll back and take the app back without a second `undo`.
+    after the draining process's pidfd shows it gone or a zombie (received in `HELLO`, step 3). Nothing else counts: not
+    the instance file (its session count can lag), and not a lost channel. If neither arrives within 15 s, the active
+    process does not terminate the app: `/cancel` and close-app answer 503 and the app keeps running, unpair and
+    unpair-all remove the clients but leave the app running; each logs a Warning. So no `undo` ever runs while the other
+    process may still stream, and an old process that never answered `ENDED` and is still alive can roll back and take
+    the app back without a second `undo`.
   - `/cancel` sends `END_ALL` and gets `ENDED` (or the pidfd result) before it ends its own sessions; today it ends
     them first [C21]. If the terminate is refused, its own sessions are not ended either.
   - On the shutdown path (`systemctl stop`, Quit) the budget is 5 s, inside the 10 s forced-shutdown limit. With
@@ -439,7 +476,9 @@ app: it has no process, and it is never executed again. The last session's end l
     (logged), never run twice. The channel is closed only after the `proc` deinit guard [C10] has run.
   - In the draining process, `END_ALL` and `CLOSE_CERT` run on their own threads (they join sessions), so `SESSIONS?`
     and `CLOSE` are still answered while they wait. This relies on lb.2, where list and close do not wait for a join
-    [C16]. The active process's request handler waits up to 15 s (documented for `/cancel`).
+    [C16]. The active process's request handler waits up to 15 s (documented for `/cancel`). The client HTTPS server
+    handles one request at a time, so other HTTPS requests wait meanwhile; an implementation may answer `/cancel` with
+    503 early and finish the terminate on a worker, under the same rule.
 - The terminate rule applies on every terminate path, also when the active process has forgotten the adopted app after
   an `apps.json` save (below): `END_ALL` is still sent first while a draining process exists, which ends its sessions as
   a terminate does today. `/cancel` sends it even when no app runs any more (today it terminates only when `running() >
@@ -472,6 +511,7 @@ app: it has no process, and it is never executed again. The last session's end l
 | App state and prep commands | See "App ownership and prep commands". A draining process never runs `do` or `undo` commands and never terminates apps. |
 | `sunshine_state.json`, `apps.json` | Only the active process writes them (the old process stops at the switch, the new one reloads both after `GO`, the old one reloads both on rollback). Writes use a temporary file and rename. |
 | Session counts, instance file, `HANDOFF_STATE` | Updated from a separate notifier thread that reads an atomic session count (like `running_sessions` [C25]). Never from inside a session join or while holding the RTSP slots lock or the clear lock (lb.2): those paths would deadlock with `session_count()` or `clear()` [C16]. The new stop reasons need a reason parameter where the code hard-codes `terminated` today [C26]. |
+| Login limit | The failed-login table of the login limit is in memory per process, so a handoff clears lockouts. Accepted for the first version. |
 | Web UI CSRF tokens | Per process [C32]. After a switch the first web UI write from an already open page fails (403) until the page reloads; documented. |
 | Tray icon | Only the active process shows one (removed at the switch, restored on rollback). The tray updates at session start and end [C9] are skipped while the icon is removed. |
 | Log file | In handoff mode the new process appends to the log without rotating it. Every line of a draining process carries a `[drain]` tag. |
@@ -493,8 +533,9 @@ app: it has no process, and it is never executed again. The last session's end l
   also sends `CLOSE_CERT <SHA-256 of the client certificate>` over the channel, and the draining process ends that
   client's sessions (reason `terminated`). As a backstop that needs no channel, the draining process re-reads
   `sunshine_state.json` (read-only) whenever it changes (inotify on its directory, checked at least every 2 s) and
-  ends the sessions of any client that is disabled there or no longer paired (stricter than today, where unpairing
-  alone ends no session). An unreadable or partial file ends no session (logged as a Warning, retried). So a revoked
+  ends the sessions of any client that is disabled there (`enabled=false`, today's semantics [C24]). A client missing
+  from the file ends nothing, because a newer state schema could move the list. An unreadable or partial file, or one
+  without a parseable client list, ends no session (logged as a Warning, retried). So a revoked
   client cannot keep streaming on the draining process until the drain deadline.
 - Each process writes its own `Session ended: reason=<r>, active sessions=<N>` line; N counts that process's sessions.
 - New stop reasons: `drain-deadline` (ended at the drain deadline) and `stop` (a draining session ended because the
@@ -586,6 +627,10 @@ RuntimeDirectory=sunshine
   - `total_session_count()`, the `/launch` guard (503 while draining sessions exist or `SESSIONS?` times out), and
     update-client, unpair and unpair-all with draining sessions;
   - `END_ALL` on the shutdown path (5 s budget), with a zombie draining pid, and rejected during a rollback;
+  - kill-first: every rollback path sends `SIGKILL` through the pidfd and waits for the reap before resuming accept,
+    mDNS or the app; a new process that ignores `SIGTERM` or is stopped is still gone before the old one accepts;
+  - `COMMIT`: without it within 5 s, or after a failed `GO_ACK`, the new process exits and has adopted, accepted and
+    published nothing;
   - `systemctl stop` (both processes get `SIGTERM`) between `GO` and `GO_ACK`: the `undo` commands run at most once;
   - the `END_ALL` state machine: `END_REJECTED` while rolling back, a rollback during `ending` or after `ended` drops
     the app, the mutex is never held across a join or a send;
@@ -664,11 +709,11 @@ RuntimeDirectory=sunshine
   29. `PONG` latency stays under 2 s while the new process runs its first `/launch` probe; no false kill;
   30. a reload while a pairing waits for its PIN is refused; a reload whose in-flight wait times out lifts the gate,
       resumes accepting, and the 503s seen in between are retried by the client;
-  31. prep commands run once across a handoff: one global prep command and one app prep command, each with a `do`
-      and an `undo` that append a line (`<name> do|undo <pid>`) to a marker file. Client A launches and streams; a
-      handoff; client B resumes on the new process; A ends; `/cancel` from B. The marker file must hold exactly one
-      `do` and one `undo` line for each command, the `undo` lines in reverse order after both `do` lines, the
-      `undo` lines written by the new process's pid while no session of the old process streams, and no line from
+  31. prep commands run once across a handoff: one global prep command and one app prep command, each with a `do` and an
+      `undo` that append a line (`<name> do|undo $PPID`, the Sunshine pid) to a marker file. Client A launches and
+      streams; a handoff; client B resumes on the new process; A ends; `/cancel` from B. The marker file must hold
+      exactly one `do` and one `undo` line for each command, the `undo` lines in reverse order after both `do` lines,
+      the `undo` lines written by the new process's pid while no session of the old process streams, and no line from
       the old process's exit. A variant cancels while A still streams on the old process: A's session ends with
       `terminated` before the `undo` lines appear. A second variant has the global prep command with a `do` only (no
       `undo`): exactly one `do` line, no other line;
@@ -680,7 +725,11 @@ RuntimeDirectory=sunshine
       channel closed;
   35. the new process cancels the adopted app and then dies inside the window: the old process rolls back without
       taking the app back, and no `undo` line appears twice;
-  36. the RTSP loop of a draining process uses no measurable CPU while idle, and a rollback accepts RTSP again.
+  36. the RTSP loop of a draining process uses no measurable CPU while idle, and a rollback accepts RTSP again;
+  37. a new process that delays `GO_ACK` by more than 5 s (test hook): the old process kills it, waits for the reap,
+      rolls back, and is the only process accepting and publishing mDNS; the new process never accepted a connection;
+  38. with any `capture` setting other than `wlr` (for example `kms`, `kwin`, or empty), the feature refuses to enable
+      with an Error naming the setting, and a reload is refused.
 
 ## Out of scope
 - Moving a live session from one process to another (not possible without client support).
@@ -726,3 +775,6 @@ Base: fork branch `lanternbox` at `75612545`. Line numbers are for that commit.
 | C31 | `proc::refresh` replaces the whole `proc_t`; the web UI's app save and delete call it. | `src/process.cpp:801-807`; `src/confighttp.cpp:1169`, `:1245` |
 | C32 | CSRF tokens live in a per-process map. | `src/confighttp.cpp:199-200` |
 | C33 | `/applist` iterates the app list and `/appasset` searches it; `/serverinfo` calls `running()`, which reads the running app (`_app_id`, `placebo`, the process) and not the app list. | `src/nvhttp.cpp:1313`, `:1581`; `src/process.cpp:384-388`; `src/nvhttp.cpp:1264`; `src/process.cpp:287-318` |
+| C34 | KWin grants its screencast interface by a `.desktop` file that names the current executable. | `src/platform/linux/kwingrab.cpp:43-50` |
+| C35 | The base environment of app and prep commands is the process environment plus the `apps.json` `env` section, built when the apps are loaded. | `src/process.cpp:674-679`, `:787-788` |
+| C36 | Linux capture backends are enabled from the `capture` setting. When it is empty, the first of NvFBC, wlr and KMS that verifies is enabled, X11 and portal are added whenever they verify, and kwin only if nothing else was enabled. | `src/platform/linux/misc.cpp:1376-1406` |
