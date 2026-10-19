@@ -265,28 +265,34 @@ namespace handoff::protocol {
      * @brief Write a probe result set as a JSON object.
      *
      * @param value Probe results.
-     * @return JSON object with `hevc_mode`, `av1_mode` and `yuv444`.
+     * @return JSON object with `hevc_mode` and `av1_mode` (0 to 5) and the booleans `yuv444_h264`, `yuv444_hevc`
+     *         and `yuv444_av1`.
      */
     json to_json(const probe_results_t &value) {
       json object = json::object();
       object["hevc_mode"] = value.hevc_mode;
       object["av1_mode"] = value.av1_mode;
-      object["yuv444"] = value.yuv444;
+      object["yuv444_h264"] = value.yuv444_h264;
+      object["yuv444_hevc"] = value.yuv444_hevc;
+      object["yuv444_av1"] = value.yuv444_av1;
       return object;
     }
 
     /**
      * @brief Read a probe result set from a JSON object.
      *
-     * @param object JSON object with `hevc_mode` and `av1_mode` in 0 to 3 and `yuv444`.
+     * @param object JSON object with `hevc_mode` and `av1_mode` integers in 0 to 5 and the booleans `yuv444_h264`,
+     *               `yuv444_hevc` and `yuv444_av1`; all are required.
      * @param out Receives the probe results.
      * @return `true` when every member is present and valid.
      */
     bool read(const json &object, probe_results_t &out) {
       return object.is_object() &&
-             int_field(object, "hevc_mode", 0, 3, out.hevc_mode) &&
-             int_field(object, "av1_mode", 0, 3, out.av1_mode) &&
-             field(object, "yuv444", out.yuv444);
+             int_field(object, "hevc_mode", 0, 5, out.hevc_mode) &&
+             int_field(object, "av1_mode", 0, 5, out.av1_mode) &&
+             field(object, "yuv444_h264", out.yuv444_h264) &&
+             field(object, "yuv444_hevc", out.yuv444_hevc) &&
+             field(object, "yuv444_av1", out.yuv444_av1);
     }
 
     /**
