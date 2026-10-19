@@ -28,6 +28,7 @@ extern "C" {
 // local includes
 #include "config.h"
 #include "globals.h"
+#include "handoff/hooks.h"
 #include "input.h"
 #include "logging.h"
 #include "network.h"
@@ -1527,14 +1528,14 @@ namespace rtsp_stream {
         server.iterate();
 
         if (broadcast_shutdown_event->peek()) {
-          server.clear();
+          server.clear(true, to_stop_reason(handoff::hooks::shutdown_reason()));
         } else {
           // cleanup all stopped sessions
           server.clear(false);
         }
       }
 
-      server.clear();
+      server.clear(true, to_stop_reason(handoff::hooks::shutdown_reason()));
     }};
 
     // Wait for shutdown
