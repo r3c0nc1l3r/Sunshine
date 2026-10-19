@@ -6,9 +6,44 @@
 #include <nlohmann/json.hpp>
 
 // local includes
+#include "../logging.h"
 #include "revocation.h"
 
 namespace handoff {
+  /**
+   * @brief Interpret the `enabled` value of one named device.
+   *
+   * Missing, `true`, `"true"` or `"1"` mean enabled. `false`, `"false"` or `"0"` mean disabled. Any other value is
+   * treated as disabled (fail closed) and logged as a Warning that names only the JSON type.
+   *
+   * @param device The named device object (already known to hold a string `cert`).
+   * @return `true` when the client is enabled.
+   */
+  static bool is_enabled(const nlohmann::json &device) {
+    const auto enabled_it = device.find("enabled");
+    if (enabled_it == device.end()) {
+      return true;
+    }
+
+    const auto &value = *enabled_it;
+    if (value.is_boolean()) {
+      return value.get<bool>();
+    }
+    if (value.is_string()) {
+      const auto text = value.get<std::string>();
+      if (text == "true" || text == "1") {
+        return true;
+      }
+      if (text == "false" || text == "0") {
+        return false;
+      }
+    }
+
+    // Fail closed: an unknown value disables the client. Log the type only, never the certificate.
+    BOOST_LOG(warning) << "Drain handoff: client enabled value of JSON type " << value.type_name() << " treated as disabled";
+    return false;
+  }
+
   std::optional<std::set<std::string>> disabled_client_certs(std::string_view state_json) {
     // The parser must never throw out of this function, so every failure becomes std::nullopt.
     try {
@@ -24,26 +59,28 @@ namespace handoff {
       }
 
       const auto devices_it = root_it->find("named_devices");
-      if (devices_it == root_it->end() || !devices_it->is_array()) {
+      if (devices_it == root_it->end()) {
+        return std::nullopt;
+      }
+
+      // boost ptree::write_json writes an empty array as the empty string, which is an empty list.
+      if (devices_it->is_string() && devices_it->get<std::string>().empty()) {
+        return std::set<std::string> {};
+      }
+      if (!devices_it->is_array()) {
         return std::nullopt;
       }
 
       std::set<std::string> disabled;
       for (const auto &device : *devices_it) {
-        // Entries that are not objects, or have no string certificate, cannot be matched and are skipped.
-        if (!device.is_object()) {
-          continue;
-        }
-
-        const auto cert_it = device.find("cert");
+        // An entry without a string certificate cannot be matched; skip it. Log the type only.
+        const auto cert_it = device.is_object() ? device.find("cert") : device.end();
         if (cert_it == device.end() || !cert_it->is_string()) {
+          BOOST_LOG(warning) << "Drain handoff: skipped a named device without a string certificate";
           continue;
         }
 
-        // A missing `enabled` means enabled; only an explicit `false` disables the client.
-        const auto enabled_it = device.find("enabled");
-        const bool enabled = enabled_it == device.end() || !enabled_it->is_boolean() || enabled_it->get<bool>();
-        if (!enabled) {
+        if (!is_enabled(device)) {
           disabled.insert(cert_it->get<std::string>());
         }
       }

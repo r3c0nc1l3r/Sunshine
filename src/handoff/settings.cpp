@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <cstdint>
 #include <iterator>
 #include <string>
 
@@ -29,10 +30,10 @@ namespace handoff {
   /**
    * @brief Whether a port number is inside the UDP range the feature may use.
    *
-   * @param port Port number, computed as a wide integer so overflow is caught.
+   * @param port Port number, computed as a 64-bit integer so overflow is caught.
    * @return `true` when the port is between 1024 and 65535.
    */
-  static bool udp_port_in_range(int port) {
+  static bool udp_port_in_range(std::int64_t port) {
     return port >= MIN_UDP_PORT && port <= MAX_UDP_PORT;
   }
 
@@ -97,28 +98,35 @@ namespace handoff {
       return "drain_handoff_udp_offset must not be 0, or both UDP bases would be the same";
     }
 
-    // Both bases: the configured port and port + offset. Computed in int so an overflowing offset is caught by the range check.
-    const int bases[] = {port, port + settings.udp_offset};
-    // The TCP ports as wide integers, so a small configured port cannot wrap into a valid UDP port.
-    const int tcp[] = {port - 5, port, port + 1, port + 21};
+    // Both bases: the configured port and port + offset. Computed in 64-bit so a huge offset cannot overflow.
+    const std::int64_t bases[] = {static_cast<std::int64_t>(port), static_cast<std::int64_t>(port) + settings.udp_offset};
+    const std::int64_t tcp[] = {port - 5, port, port + 1, port + 21};
 
+    // Every UDP port of both bases must be inside the range before any other port rule is checked.
     for (auto base : bases) {
-      // The three UDP ports of each base must be inside the range and must not collide with a TCP port.
-      for (int offset : {9, 10, 11}) {
-        const int udp_port = base + offset;
-        if (!udp_port_in_range(udp_port)) {
-          return "drain_handoff_udp_offset puts UDP port " + std::to_string(udp_port) + " outside 1024-65535";
+      for (std::int64_t offset : {9, 10, 11}) {
+        if (!udp_port_in_range(base + offset)) {
+          return "drain_handoff_udp_offset puts UDP port " + std::to_string(base + offset) + " outside 1024-65535";
         }
+      }
+    }
+
+    // Then no UDP port may equal a TCP port of the server.
+    for (auto base : bases) {
+      for (std::int64_t offset : {9, 10, 11}) {
+        const std::int64_t udp_port = base + offset;
         if (std::find(std::begin(tcp), std::end(tcp), udp_port) != std::end(tcp)) {
           return "drain_handoff_udp_offset puts UDP port " + std::to_string(udp_port) + " on a TCP port of the server";
         }
       }
     }
 
-    // The two bases must not share a UDP port. Only the offset decides this, since the bases differ by it.
-    for (auto udp_a : udp_ports(bases[0])) {
-      if (udp_ports(bases[1]).count(udp_a)) {
-        return "drain_handoff_udp_offset makes the two UDP bases share UDP port " + std::to_string(udp_a);
+    // Last, the two bases must not share a UDP port.
+    for (std::int64_t offset_a : {9, 10, 11}) {
+      for (std::int64_t offset_b : {9, 10, 11}) {
+        if (bases[0] + offset_a == bases[1] + offset_b) {
+          return "drain_handoff_udp_offset makes the two UDP bases share UDP port " + std::to_string(bases[0] + offset_a);
+        }
       }
     }
 
