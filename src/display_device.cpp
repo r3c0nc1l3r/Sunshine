@@ -922,6 +922,11 @@ namespace display_device {
     });
   }
 
+  bool has_settings_manager() {
+    // Lock-free by design: this is read once at startup on the main thread, after init() and before any display thread.
+    return DD_DATA.sm_instance != nullptr;
+  }
+
   std::variant<failed_to_parse_tag_t, configuration_disabled_tag_t, SingleDisplayConfiguration> parse_configuration(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
     const auto device_prep {parse_device_prep_option(video_config)};
     if (!device_prep) {
