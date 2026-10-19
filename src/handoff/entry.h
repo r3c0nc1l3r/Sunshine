@@ -26,7 +26,7 @@
  * | 7 | `task_pool.start(1)` and the signal handlers | In the SIGTERM lambda the first statement is `handoff::hooks::on_sigterm()` (before `force_shutdown` is armed and before `shutdown_event->raise`). The SIGINT lambda is unchanged. `main` does not scrub or unset `NOTIFY_SOCKET` anywhere (the refusal gatherer reads it at call time). |
  * | 8 | after the signal handlers | `handoff_process` (section 6) is constructed here, before `proc_deinit_guard` (destruction order, section 7). Starts the shutdown watcher. |
  * | 8b | when `runtime().enabled()`, right after step 8 (so `handoff_process` is declared first and destroyed last, section 7) and before any `READY=1` can be sent (step 15 on) | N only (an H process starts it in `on_main()`): construct `std::optional<handoff::coordinator_t> coordinator` and `control_server_t control` as section 7 orders them (both `std::optional`, emplaced only when the feature is enabled; every later `coordinator` call in this table is guarded by `has_value()`), then `handoff::set_new_ops_coordinator(&*coordinator)` (`new_ops.h`) and `coordinator->start_control(control_socket_path(runtime_dir, getpid()).string())`. The path is `$RUNTIME_DIRECTORY/control/<pid>.sock` when `RUNTIME_DIRECTORY` is set (system unit, `RuntimeDirectory=sunshine`), else `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock` (user unit). In H the same `coordinator_t` is constructed here, but `start_control` is called by `sunshine_new_ops_t`'s `start_control_server` in `on_main()`. |
- * | 9 | `proc::refresh`, `platf::init`, `proc::init`, `reed_solomon_init`, `input::init` | unchanged; after `input::init` call `handoff::register_device_release(...)` (section 7). |
+ * | 9 | `proc::refresh`, `platf::init`, `proc::init`, `reed_solomon_init`, `input::init` | unchanged; declare `handoff::entry::device_release_t input_deinit_guard {input::init()};` (section 7). |
  * | 10 H | after the gamepad probe | `handoff_process.start_new_side(...)` (section 4): the new-side thread starts and exchanges `HELLO`. |
  * | 11 | the startup encoder probe | In H first `handoff_process.new_ops()->wait_probe_decision(<hello timeout> + 2 s)` (it returns early on a shutdown request; a timeout lets the probe run). Then, in both modes, the probe is wrapped: `if (!handoff::hooks::startup_probe_skipped()) { if (video::probe_encoders()) { ...the existing Error... } }`. So the accepted override is installed before `main` reaches this gate, or the probe runs. In N the `if` is the only change. |
  * | 12 | `http::init()` | unchanged; on failure in H call `handoff_process.new_ops()->servers_failed("HTTP interface failed to initialize")` before `return -1`. |
@@ -166,9 +166,10 @@
  *   `proc` guard; its late teardown (`stop()`: revocation poller, channel reader, responder, channel) is in `coordinator.h`; it runs after the `proc` guard
  *   and before `~handoff_process_t`. In a draining process the drain exit has already ended the sessions (`drain.h`) before
  *   `exit_graceful()` starts this order, so `stop()` finds no session to wait for.
- * - `register_device_release(f)` is called right after `input::init()` with a closure that resets `input_deinit_guard`
- *   once (a `std::once_flag`), so the drain exit may release the devices earlier (`drain.h`) and the local destructor
- *   becomes a no-op.
+ * - `device_release_t` (declared below) replaces the plain `input_deinit_guard` local on Linux: its constructor registers
+ *   the release with `register_device_release()` (`drain.h`), so the drain exit may release the devices earlier. Its
+ *   destructor releases them at upstream's place in the destruction order, and a later call of the registered closure
+ *   does nothing.
  *
  * ## 8. Overlap rules (binding)
  *
@@ -221,6 +222,43 @@
 #include "src/platform/common.h"
 
 namespace handoff::entry {
+  /**
+   * @brief Owns the input devices' deinit guard for `main()` and lets the drain exit release the devices early.
+   *
+   * The constructor keeps the guard in shared state and calls `register_device_release()` (`drain.h`) with a closure
+   * that holds that state by value, so the closure stays safe to call after this object is gone. `release()` destroys
+   * the guard exactly once: a concurrent second caller blocks until the first has finished, and later calls do
+   * nothing. The destructor calls `release()` (so `main()` releases the devices at upstream's place in its
+   * destruction order) and then `register_device_release({})`; a copy of the closure that is still called afterwards
+   * does nothing and touches no destroyed object. Thread-safe.
+   */
+  class device_release_t {
+  public:
+    /**
+     * @brief Take the guard and register the release closure.
+     *
+     * @param guard The guard that `input::init()` returned; may be null (`release()` then only marks it released).
+     */
+    explicit device_release_t(std::unique_ptr<platf::deinit_t> guard);
+
+    /**
+     * @brief Release the devices (once) and register an empty release function.
+     */
+    ~device_release_t();
+
+    device_release_t(const device_release_t &) = delete;
+    device_release_t &operator=(const device_release_t &) = delete;
+
+    /**
+     * @brief Destroy the guard exactly once; a concurrent caller waits for the first to finish.
+     */
+    void release();
+
+  private:
+    struct state_t;
+    std::shared_ptr<state_t> _state;  ///< Shared with the registered closure.
+  };
+
   /**
    * @brief What the helper dispatch reads and calls; tests pass fakes.
    */
