@@ -382,4 +382,17 @@ TEST_F(HandoffSdNotifyTest, ParseMainPidGarbageIsNullopt) {
   EXPECT_FALSE(sd::parse_mainpid("12x\n").has_value()) << "a pid with trailing junk must give nullopt";
 }
 
+TEST_F(HandoffSdNotifyTest, UnitFromCgroupScopeUnderUserManagerIsNullopt) {
+  EXPECT_FALSE(
+    sd::unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n").has_value()
+  )
+    << "a scope under the user manager has no .service unit, so unit_from_cgroup must give nullopt";
+}
+
+TEST_F(HandoffSdNotifyTest, UnitFromCgroupServiceUnderUserManagerIsSunshine) {
+  auto unit = sd::unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/sunshine.service\n");
+  ASSERT_TRUE(unit.has_value()) << "a service under the user manager must yield its unit name";
+  EXPECT_EQ(*unit, "sunshine.service") << "the unit must be sunshine.service, not user@1000.service";
+}
+
 #endif  // __linux__
