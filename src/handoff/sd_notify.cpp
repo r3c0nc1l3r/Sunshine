@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -19,10 +20,10 @@
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -36,6 +37,148 @@ extern char **environ;
 namespace handoff::sd {
   namespace {
     using clock_t_ = std::chrono::steady_clock;
+
+    /**
+     * @brief Owns a file descriptor and closes it on destruction, so every return path closes it.
+     */
+    class fd_guard {
+    public:
+      /**
+       * @brief Take ownership of a descriptor.
+       *
+       * @param fd Descriptor, or -1 for none.
+       */
+      explicit fd_guard(int fd = -1) noexcept:
+          fd_ {fd} {}
+
+      /**
+       * @brief Close the descriptor, if any.
+       */
+      ~fd_guard() {
+        reset();
+      }
+
+      fd_guard(const fd_guard &) = delete;
+      fd_guard &operator=(const fd_guard &) = delete;
+
+      /**
+       * @brief The owned descriptor.
+       *
+       * @return The descriptor, or -1.
+       */
+      int get() const noexcept {
+        return fd_;
+      }
+
+      /**
+       * @brief Close the current descriptor and take ownership of another.
+       *
+       * @param fd New descriptor, or -1.
+       */
+      void reset(int fd = -1) noexcept {
+        if (fd_ >= 0) {
+          close(fd_);
+        }
+        fd_ = fd;
+      }
+
+    private:
+      int fd_;  ///< Owned descriptor, or -1.
+    };
+
+    /**
+     * @brief Owns a `posix_spawn_file_actions_t` and destroys it on destruction.
+     */
+    class spawn_actions {
+    public:
+      /**
+       * @brief Initialise the actions object.
+       */
+      spawn_actions() noexcept {
+        ok_ = posix_spawn_file_actions_init(&actions_) == 0;
+      }
+
+      /**
+       * @brief Destroy the actions object, if it was initialised.
+       */
+      ~spawn_actions() {
+        if (ok_) {
+          posix_spawn_file_actions_destroy(&actions_);
+        }
+      }
+
+      spawn_actions(const spawn_actions &) = delete;
+      spawn_actions &operator=(const spawn_actions &) = delete;
+
+      /**
+       * @brief Whether the object was initialised.
+       *
+       * @return `true` when usable.
+       */
+      bool ok() const noexcept {
+        return ok_;
+      }
+
+      /**
+       * @brief The underlying object.
+       *
+       * @return Pointer to the actions.
+       */
+      posix_spawn_file_actions_t *get() noexcept {
+        return &actions_;
+      }
+
+    private:
+      posix_spawn_file_actions_t actions_ {};  ///< Wrapped actions.
+      bool ok_ {false};  ///< Whether initialisation succeeded.
+    };
+
+    /**
+     * @brief Owns a `posix_spawnattr_t` and destroys it on destruction.
+     */
+    class spawn_attr {
+    public:
+      /**
+       * @brief Initialise the attributes object.
+       */
+      spawn_attr() noexcept {
+        ok_ = posix_spawnattr_init(&attr_) == 0;
+      }
+
+      /**
+       * @brief Destroy the attributes object, if it was initialised.
+       */
+      ~spawn_attr() {
+        if (ok_) {
+          posix_spawnattr_destroy(&attr_);
+        }
+      }
+
+      spawn_attr(const spawn_attr &) = delete;
+      spawn_attr &operator=(const spawn_attr &) = delete;
+
+      /**
+       * @brief Whether the object was initialised.
+       *
+       * @return `true` when usable.
+       */
+      bool ok() const noexcept {
+        return ok_;
+      }
+
+      /**
+       * @brief The underlying object.
+       *
+       * @return Pointer to the attributes.
+       */
+      posix_spawnattr_t *get() noexcept {
+        return &attr_;
+      }
+
+    private:
+      posix_spawnattr_t attr_ {};  ///< Wrapped attributes.
+      bool ok_ {false};  ///< Whether initialisation succeeded.
+    };
 
     /**
      * @brief Split a string on a separator, skipping empty pieces.
@@ -142,6 +285,8 @@ namespace handoff::sd {
     /**
      * @brief Send one datagram to a notify socket, optionally with an fd attached.
      *
+     * The send is non-blocking (`MSG_DONTWAIT`), so a full socket buffer fails instead of blocking forever.
+     *
      * @param notify_socket The `NOTIFY_SOCKET` value.
      * @param payload Datagram payload.
      * @param attach_fd Fd to pass with `SCM_RIGHTS`, or -1.
@@ -159,8 +304,8 @@ namespace handoff::sd {
         return false;
       }
 
-      const int sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-      if (sock < 0) {
+      const fd_guard sock {socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+      if (sock.get() < 0) {
         BOOST_LOG(error) << "Drain handoff: socket for NOTIFY_SOCKET failed: " << std::strerror(errno);
         return false;
       }
@@ -191,10 +336,9 @@ namespace handoff::sd {
 
       ssize_t sent;
       do {
-        sent = sendmsg(sock, &msg, MSG_NOSIGNAL);
+        sent = sendmsg(sock.get(), &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
       } while (sent < 0 && errno == EINTR);
       const int send_errno = errno;
-      close(sock);
 
       if (sent < 0 || static_cast<std::size_t>(sent) != payload.size()) {
         BOOST_LOG(error) << "Drain handoff: sending to NOTIFY_SOCKET failed: " << std::strerror(send_errno);
@@ -254,13 +398,24 @@ namespace handoff::sd {
     }
 
     /**
-     * @brief Kill a child by its pid and reap it.
+     * @brief Kill a spawned child through its pidfd and reap it, with a bounded wait.
      *
-     * @param pid Child pid.
+     * Signals and waits only through the pidfd, never by pid, so a reused pid cannot be hit. If the child is still not
+     * gone after the bounded wait (uninterruptible sleep), it is left for the caller to log; the pidfd is closed anyway.
+     *
+     * @param pidfd Pidfd of the child.
      */
-    void kill_and_reap(pid_t pid) {
-      kill(pid, SIGKILL);
-      while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+    void kill_and_reap(int pidfd) {
+      syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, nullptr, 0);  // no glibc wrapper on every target
+
+      pollfd pfd {};
+      pfd.fd = pidfd;
+      pfd.events = POLLIN;
+      while (poll(&pfd, 1, 5000) < 0 && errno == EINTR) {
+      }
+
+      siginfo_t info {};
+      while (waitid(P_PIDFD, static_cast<id_t>(pidfd), &info, WEXITED | WNOHANG) < 0 && errno == EINTR) {
       }
     }
   }  // namespace
@@ -292,20 +447,18 @@ namespace handoff::sd {
         BOOST_LOG(error) << "Drain handoff: pipe for the barrier failed: " << std::strerror(errno);
         return false;
       }
-      const int read_fd = fds[0];
-      const int write_fd = fds[1];
+      const fd_guard read_fd {fds[0]};
+      fd_guard write_fd {fds[1]};
 
       // systemd gets its own copy of the write end through SCM_RIGHTS; ours is closed right after the send so the
       // read end sees end-of-file once systemd drops its copy.
-      const bool sent = send_datagram(notify_socket, "BARRIER=1", write_fd);
-      close(write_fd);
+      const bool sent = send_datagram(notify_socket, "BARRIER=1", write_fd.get());
+      write_fd.reset();
       if (!sent) {
-        close(read_fd);
         return false;
       }
 
-      const bool done = wait_for_eof(read_fd, timeout);
-      close(read_fd);
+      const bool done = wait_for_eof(read_fd.get(), timeout);
       if (!done) {
         BOOST_LOG(error) << "Drain handoff: systemd did not complete the barrier in time";
       }
@@ -322,10 +475,11 @@ namespace handoff::sd {
         return std::nullopt;
       }
 
-      // The innermost (last) service component is this process's unit.
+      // The innermost (last) service component is this process's unit. The user manager's own user@<uid>.service is
+      // not a candidate: a process in a scope or app slice under it has no service unit of its own.
       const auto components = split_nonempty(*path, '/');
       for (auto it = components.rbegin(); it != components.rend(); ++it) {
-        if (is_service_component(*it)) {
+        if (is_service_component(*it) && !it->starts_with("user@")) {
           return std::string(*it);
         }
       }
@@ -419,12 +573,12 @@ namespace handoff::sd {
         return std::nullopt;
       }
 
-      // argv: systemctl [--user] show -p MainPID --value <unit>; the unit is one element, no shell involved.
+      // argv: /usr/bin/systemctl [--user] show -p MainPID --value -- <unit>. Absolute path, no PATH search, no shell.
       std::vector<std::string> args {"systemctl"};
       if (user_unit) {
         args.emplace_back("--user");
       }
-      for (const char *arg : {"show", "-p", "MainPID", "--value"}) {
+      for (const char *arg : {"show", "-p", "MainPID", "--value", "--"}) {
         args.emplace_back(arg);
       }
       args.push_back(unit);
@@ -436,17 +590,24 @@ namespace handoff::sd {
       }
       argv.push_back(nullptr);
 
-      // The environment is the parent's, with XDG_RUNTIME_DIR pointing at the user manager for user units.
-      const std::string runtime_dir = "XDG_RUNTIME_DIR=/run/user/" + std::to_string(getuid());
+      // The environment is the parent's. For a user unit, a non-empty XDG_RUNTIME_DIR is kept; it is set to
+      // /run/user/<uid> only when it is unset or empty.
+      constexpr std::string_view runtime_key = "XDG_RUNTIME_DIR=";
       std::vector<std::string> env_strings;
+      bool has_runtime_dir = false;
       for (char **entry = environ; entry && *entry; ++entry) {
-        if (user_unit && std::string_view(*entry).starts_with("XDG_RUNTIME_DIR=")) {
+        const std::string_view text(*entry);
+        if (user_unit && text.starts_with(runtime_key)) {
+          if (text.size() > runtime_key.size()) {
+            has_runtime_dir = true;
+            env_strings.emplace_back(text);
+          }
           continue;
         }
-        env_strings.emplace_back(*entry);
+        env_strings.emplace_back(text);
       }
-      if (user_unit) {
-        env_strings.push_back(runtime_dir);
+      if (user_unit && !has_runtime_dir) {
+        env_strings.push_back(std::string(runtime_key) + "/run/user/" + std::to_string(getuid()));
       }
       std::vector<char *> envp;
       envp.reserve(env_strings.size() + 1);
@@ -460,25 +621,42 @@ namespace handoff::sd {
         BOOST_LOG(error) << "Drain handoff: pipe for systemctl failed: " << std::strerror(errno);
         return std::nullopt;
       }
-      const int read_fd = out_fds[0];
-      const int write_fd = out_fds[1];
+      const fd_guard read_fd {out_fds[0]};
+      fd_guard write_fd {out_fds[1]};
 
-      posix_spawn_file_actions_t actions;
-      if (posix_spawn_file_actions_init(&actions) != 0) {
-        close(read_fd);
-        close(write_fd);
+      // File actions, in order: stdout to the pipe (dup2 clears FD_CLOEXEC on the copy), stdin from /dev/null, then
+      // close every fd from 3 up so nothing of the parent leaks into the child.
+      spawn_actions actions;
+      if (!actions.ok()) {
+        BOOST_LOG(error) << "Drain handoff: could not set up the systemctl spawn";
         return std::nullopt;
       }
-      // stdout goes to the pipe (dup2 clears FD_CLOEXEC on the copy); stdin is /dev/null; stderr stays the journal.
-      posix_spawn_file_actions_adddup2(&actions, write_fd, STDOUT_FILENO);
-      posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+      posix_spawn_file_actions_adddup2(actions.get(), write_fd.get(), STDOUT_FILENO);
+      posix_spawn_file_actions_addopen(actions.get(), STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+      posix_spawn_file_actions_addclosefrom_np(actions.get(), 3);
 
-      pid_t pid = -1;
-      const int spawn_rc = posix_spawnp(&pid, "systemctl", &actions, nullptr, argv.data(), envp.data());
-      posix_spawn_file_actions_destroy(&actions);
-      close(write_fd);
+      // Default signal mask (empty) and default dispositions for every signal except the uncatchable two.
+      spawn_attr attr;
+      if (!attr.ok()) {
+        BOOST_LOG(error) << "Drain handoff: could not set up the systemctl spawn";
+        return std::nullopt;
+      }
+      sigset_t empty_mask;
+      sigset_t all_signals;
+      sigemptyset(&empty_mask);
+      sigfillset(&all_signals);
+      sigdelset(&all_signals, SIGKILL);
+      sigdelset(&all_signals, SIGSTOP);
+      posix_spawnattr_setsigmask(attr.get(), &empty_mask);
+      posix_spawnattr_setsigdefault(attr.get(), &all_signals);
+      posix_spawnattr_setflags(attr.get(), POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+
+      // Spawn with a pidfd: the child is tracked by it only, never by pid (the control loop reaps children elsewhere).
+      int raw_pidfd = -1;
+      const int spawn_rc = pidfd_spawn(&raw_pidfd, "/usr/bin/systemctl", actions.get(), attr.get(), argv.data(), envp.data());
+      write_fd.reset();
+      const fd_guard pidfd {spawn_rc == 0 ? raw_pidfd : -1};
       if (spawn_rc != 0) {
-        close(read_fd);
         BOOST_LOG(error) << "Drain handoff: could not start systemctl: " << std::strerror(spawn_rc);
         return std::nullopt;
       }
@@ -486,75 +664,94 @@ namespace handoff::sd {
       const auto deadline = clock_t_::now() + timeout;
       std::string output;
       bool eof = false;
-      bool failed = false;
       char buf[512];
 
-      // Read stdout until end-of-file or the deadline.
+      // Read stdout until end-of-file, within the deadline.
       while (!eof) {
         const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock_t_::now()).count();
         if (left <= 0) {
-          failed = true;
           break;
         }
 
         pollfd pfd {};
-        pfd.fd = read_fd;
+        pfd.fd = read_fd.get();
         pfd.events = POLLIN;
         const int rc = poll(&pfd, 1, static_cast<int>(std::min<long long>(left, INT_MAX)));
         if (rc < 0) {
           if (errno == EINTR) {
             continue;
           }
-          failed = true;
           break;
         }
         if (rc == 0) {
           continue;
         }
 
-        const ssize_t n = read(read_fd, buf, sizeof(buf));
+        const ssize_t n = read(read_fd.get(), buf, sizeof(buf));
         if (n == 0) {
           eof = true;
         } else if (n > 0) {
           output.append(buf, static_cast<std::size_t>(n));
           // A MainPID answer is a few bytes; anything much larger is not systemctl's answer.
           if (output.size() > 4096) {
-            failed = true;
             break;
           }
         } else if (errno != EINTR && errno != EAGAIN) {
-          failed = true;
           break;
         }
       }
-      close(read_fd);
 
-      if (failed || !eof) {
+      if (!eof) {
         BOOST_LOG(error) << "Drain handoff: reading the main PID with systemctl timed out or failed";
-        kill_and_reap(pid);
+        kill_and_reap(pidfd.get());
         return std::nullopt;
       }
 
-      // The child closed stdout; wait for it to exit within the same deadline, then kill it if it does not.
-      int status = 0;
-      while (true) {
-        const pid_t reaped = waitpid(pid, &status, WNOHANG);
-        if (reaped == pid) {
+      // Output reached end-of-file, so the child closed stdout. Wait for its pidfd to become readable (it exited)
+      // within the same deadline.
+      bool exited = false;
+      while (!exited) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock_t_::now()).count();
+        if (left <= 0) {
           break;
         }
-        if (reaped < 0 && errno != EINTR) {
-          BOOST_LOG(error) << "Drain handoff: waiting for systemctl failed: " << std::strerror(errno);
-          return std::nullopt;
+
+        pollfd pfd {};
+        pfd.fd = pidfd.get();
+        pfd.events = POLLIN;
+        const int rc = poll(&pfd, 1, static_cast<int>(std::min<long long>(left, INT_MAX)));
+        if (rc < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          break;
         }
-        if (clock_t_::now() >= deadline) {
-          BOOST_LOG(error) << "Drain handoff: systemctl did not exit in time";
-          kill_and_reap(pid);
-          return std::nullopt;
+        if (rc > 0) {
+          exited = true;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
 
-      if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      if (!exited) {
+        BOOST_LOG(error) << "Drain handoff: systemctl did not exit in time";
+        kill_and_reap(pidfd.get());
+        return std::nullopt;
+      }
+
+      // Reap through the pidfd. ECHILD means another waiter reaped it after its output was read; the exit status is
+      // then unknown, so the parsed output is used.
+      siginfo_t info {};
+      while (waitid(P_PIDFD, static_cast<id_t>(pidfd.get()), &info, WEXITED) < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        if (errno == ECHILD) {
+          return parse_mainpid(output);
+        }
+        BOOST_LOG(error) << "Drain handoff: waiting for systemctl failed: " << std::strerror(errno);
+        return std::nullopt;
+      }
+
+      if (info.si_code != CLD_EXITED || info.si_status != 0) {
         BOOST_LOG(error) << "Drain handoff: systemctl show MainPID failed";
         return std::nullopt;
       }
