@@ -101,6 +101,14 @@ namespace {
     }
 
     /**
+     * @brief Remove all events.
+     */
+    void clear() {
+      std::lock_guard lock {_mutex};
+      _entries.clear();
+    }
+
+    /**
      * @brief Number of events equal to `name`.
      *
      * @param name Event.
@@ -1015,7 +1023,7 @@ namespace {
       e.adjust_timeouts = [this](hf::old_side_timeouts_t &t) {
         t = timeouts;
       };
-      e.host_sink = [this]() {
+      e.host_sink = [this]() -> std::string {
         return host_sink_value;
       };
       e.argv = []() {
@@ -1286,7 +1294,7 @@ namespace {
     bool spawn_fail {false}, channel_fail {false}, use_real_child {false}, keep_channel_dups {false};  ///< Failure modes.
     std::string spawn_fail_reason {"exec failed"};  ///< Spawn failure reason.
     std::optional<std::uint64_t> start_time_result {child_start_value};  ///< Child start time.
-    std::optional<std::string> host_sink_value;  ///< Recorded host sink.
+    std::string host_sink_value;  ///< Recorded host sink (empty: none).
     std::optional<int> own_base_override;  ///< Own UDP base given to the operations.
     std::function<void()> on_spawn, on_channel, on_sleep;  ///< Hooks.
     std::function<void(std::set<std::uint16_t>)> remove_ports_hook;  ///< Replaces the removal when set.
@@ -1297,7 +1305,7 @@ namespace {
     tp_t cooldown_at_spawn {};  ///< Cooldown seen by the spawn seam.
     hf::end_state_e end_all_at_spawn {hf::end_state_e::rolling_back};  ///< END_ALL state seen by the spawn seam.
     std::atomic<bool> in_progress_at_spawn {false}, channel_set_at_spawn {false};  ///< State seen by the spawn seam.
-    int last_new_base {0};  ///< Base given to `make_ops`.
+    std::atomic<int> last_new_base {0};  ///< Base given to `make_ops`.
     tp_t last_cooldown_arg {};  ///< Cooldown given to `make_ops`.
     protocol::hello_t last_hello;  ///< Last `HELLO` received by the peer.
     hf::revocation_poller_t *poller_raw {nullptr};  ///< Poller made by the seam (valid until the coordinator stops it).
@@ -1634,7 +1642,7 @@ TEST_F(HandoffCoordinatorTest, OpsPauseAcceptPausesInOrderWithABoundedTimeoutAnd
 TEST_F(HandoffCoordinatorTest, OpsPauseAcceptNamesTheFirstServerThatDoesNotConfirmAndStops) {
   for (std::size_t failing = 0; failing < kinds.size(); ++failing) {
     SCOPED_TRACE(std::string {"failing server: "} + std::string {hf::to_string(kinds[failing])});
-    events = {};
+    events.clear();
     for (auto &l : lf) {
       l.pause_ok = true;
       l.pauses = 0;
@@ -1843,7 +1851,7 @@ TEST_F(HandoffCoordinatorTest, OpsHandoverStopsAtTheFirstFailedStep) {
   EXPECT_EQ(0, events.count("barrier")) << "a failed MAINPID notify must not go on to the barrier";
   notify_ok = true;
   barrier_ok = false;
-  events = {};
+  events.clear();
   EXPECT_FALSE(ops->handover(child_pid_value));
   EXPECT_EQ(0, events.count_prefix("read_back")) << "a failed barrier must not go on to the read-back";
 }
@@ -2301,7 +2309,7 @@ TEST_F(HandoffCoordinatorTest, SpawnRequestCarriesBinaryArgvEnvironmentAndFds) {
   EXPECT_EQ(33, req.fds.webui);
   EXPECT_EQ(34, req.fds.rtsp);
   EXPECT_GE(req.fds.channel, 0) << "the child's end of the channel is passed";
-  EXPECT_EQ(other_base, last_new_base.load() ? last_new_base : other_base);
+  EXPECT_EQ(other_base, last_new_base.load()) << "the old side is built for the child's UDP base (port + udp_offset)";
 }
 
 TEST_F(HandoffCoordinatorTest, SpawnRequestUsesTheConfiguredBinary) {
@@ -2350,7 +2358,7 @@ TEST_F(HandoffCoordinatorTest, SpawnRequestOmitsAnEmptyOrSunshineHostSink) {
 }
 
 TEST_F(HandoffCoordinatorTest, SpawnRequestWithoutAHostSinkOptionalLeavesTheVariableOut) {
-  host_sink_value = std::nullopt;
+  host_sink_value.clear();
   start_handle();
   ASSERT_TRUE(attach_peer());
   std::lock_guard lock {spawn_mutex};
