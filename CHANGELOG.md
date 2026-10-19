@@ -3,6 +3,12 @@
 Fork changes on top of the upstream base. Upstream's own changelog is at
 https://github.com/LizardByte/Sunshine/releases.
 
+## Unreleased
+
+### Fixed
+- The default gamepad setting is copied from one gamepad list call; it was read from a list buffer freed during static
+  initialization (#42).
+
 ## v2026.914.233613-lb.2
 Upstream base: `63d35f702ee9` (nightly `2026.914.233613`). Arch package `sunshine 2026.914.233613.2-1` (CUDA off).
 
