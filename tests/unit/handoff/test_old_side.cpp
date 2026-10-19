@@ -832,9 +832,9 @@ namespace {
       return {"answer:failed", "remove_new_instance_file"};
     }
 
-    /// Expected tail when the gate was raised but nothing was frozen.
+    /// Expected tail when the gate was raised but nothing was frozen (no wait_in_flight(-1): it only runs when frozen).
     static std::vector<std::string> gate_tail() {
-      return {"answer:failed", "wait_in_flight:-1", "remove_new_instance_file", "lower_gate", "resume_accept"};
+      return {"answer:failed", "remove_new_instance_file", "lower_gate", "resume_accept"};
     }
 
     /// Expected tail when the state was frozen and mDNS withdrawn but the app was not released.
@@ -1224,7 +1224,7 @@ TEST_F(HandoffOldSideTest, WaitInFlightTimeoutRollsBackAfterGate) {
   const auto outcome = finish();
   ASSERT_TRUE(outcome.has_value());
   EXPECT_EQ(old_outcome_e::rolled_back, *outcome);
-  // SPEC-QUESTION: switch substep 3 does not list the unbounded wait_in_flight(-1) of a rollback, the header does.
+  EXPECT_EQ(0, count_of(log.all(), "wait_in_flight:-1")) << "wait_in_flight(-1) in a rollback runs only when the state was frozen";
   verify_rollback(3, false, gate_tail(), {"answer:failed"});
   EXPECT_EQ(0, count_of(log.all(), "reload_after_rollback")) << "a failure before the freeze reloads nothing";
   EXPECT_EQ(0, count_of(log.all(), "unfreeze")) << "a failure before the freeze does not unfreeze";
@@ -1240,6 +1240,7 @@ TEST_F(HandoffOldSideTest, RecheckReasonRollsBackAfterGate) {
   ASSERT_TRUE(outcome.has_value());
   EXPECT_EQ(old_outcome_e::rolled_back, *outcome);
   verify_rollback(4, false, gate_tail(), {"answer:failed"});
+  EXPECT_EQ(0, count_of(log.all(), "wait_in_flight:-1")) << "wait_in_flight(-1) in a rollback runs only when the state was frozen";
   EXPECT_EQ(0, count_of(log.all(), "reload_after_rollback")) << "a failure before the freeze reloads nothing";
   EXPECT_EQ(0, count_of(log.all(), "unfreeze"));
 }
@@ -1252,6 +1253,7 @@ TEST_F(HandoffOldSideTest, SaveStateFailureRollsBackBeforeFreeze) {
   ASSERT_TRUE(outcome.has_value());
   EXPECT_EQ(old_outcome_e::rolled_back, *outcome);
   verify_rollback(5, false, gate_tail(), {"answer:failed"});
+  EXPECT_EQ(0, count_of(log.all(), "wait_in_flight:-1")) << "wait_in_flight(-1) in a rollback runs only when the state was frozen";
   EXPECT_EQ(0, count_of(log.all(), "freeze")) << "save_state failure comes before freeze()";
   EXPECT_EQ(0, count_of(log.all(), "unfreeze"));
   EXPECT_EQ(0, count_of(log.all(), "reload_after_rollback"));
