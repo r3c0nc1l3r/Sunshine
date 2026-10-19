@@ -356,7 +356,7 @@ namespace handoff {
         case reply_kind_e::failed:
           return "failed";
         case reply_kind_e::kill_pending:
-          return "kill pending";
+          return "kill_pending";
         case reply_kind_e::committed:
           return "committed";
       }
@@ -587,13 +587,10 @@ namespace handoff {
       return fail(std::string("socket: ") + std::strerror(errno));
     }
 
-    // umask 0177 makes the socket file 0600 at bind time; the chmod below makes it explicit.
-    const auto old_umask = ::umask(0177);
-    const int bind_rc = ::bind(listener.get(), reinterpret_cast<const sockaddr *>(&addr), sizeof(addr));
-    const int bind_errno = errno;
-    ::umask(old_umask);
-    if (bind_rc != 0) {
-      return fail(std::string("bind: ") + std::strerror(bind_errno));
+    // The socket file is created inside the 0700 control directory and made 0600 right after bind. The process
+    // umask is not touched: it is process-wide and would race other threads.
+    if (::bind(listener.get(), reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0) {
+      return fail(std::string("bind: ") + std::strerror(errno));
     }
     if (::chmod(path.c_str(), 0600) != 0 || ::listen(listener.get(), 8) != 0) {
       const auto message = std::string("listen or chmod: ") + std::strerror(errno);
