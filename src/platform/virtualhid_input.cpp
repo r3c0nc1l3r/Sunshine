@@ -20,6 +20,8 @@
 
 // local includes
 #include "src/config.h"
+#include "src/handoff/hooks.h"
+#include "src/input.h"
 #include "src/logging.h"
 #include "virtualhid_input.h"
 
@@ -159,14 +161,14 @@ namespace platf::virtualhid {
 
     std::string gamepad_stable_id(const gamepad_id_t &id, const lvh::DeviceProfile &profile) {
       if (profile.gamepad_kind != lvh::GamepadProfileKind::dualshock4 && profile.gamepad_kind != lvh::GamepadProfileKind::dualsense) {
-        return std::format("sunshine-gamepad-{}", id.globalIndex);
+        return ::input::device_ids::gamepad(handoff::hooks::generation(), id.globalIndex);
       }
 
       if (config::input.virtualhid_randomize_mac || id.globalIndex < 0 || id.globalIndex > 255) {
         return random_private_mac();
       }
 
-      return std::format("02:00:00:00:00:{:02x}", id.globalIndex);
+      return ::input::device_ids::gamepad_mac(handoff::hooks::generation(), id.globalIndex);
     }
 
     lvh::GamepadMetadata gamepad_metadata(const gamepad_id_t &id, const gamepad_arrival_t &metadata, const lvh::DeviceProfile &profile) {
@@ -465,7 +467,7 @@ namespace platf::virtualhid {
 
     lvh::CreateKeyboardOptions options;
     options.profile = lvh::profiles::keyboard();
-    options.stable_id = "sunshine-keyboard";
+    options.stable_id = ::input::device_ids::keyboard(handoff::hooks::generation());
     auto created = runtime->create_keyboard(options);
     if (created) {
       keyboard = std::move(created.keyboard);
@@ -482,7 +484,7 @@ namespace platf::virtualhid {
 
     lvh::CreateMouseOptions options;
     options.profile = lvh::profiles::mouse();
-    options.stable_id = "sunshine-mouse";
+    options.stable_id = ::input::device_ids::mouse(handoff::hooks::generation());
     auto created = runtime->create_mouse(options);
     if (created) {
       mouse = std::move(created.mouse);
@@ -501,7 +503,7 @@ namespace platf::virtualhid {
     if (capabilities.supports_touchscreen) {
       lvh::CreateTouchscreenOptions options;
       options.profile = lvh::profiles::touchscreen();
-      options.stable_id = "sunshine-touchscreen";
+      options.stable_id = ::input::device_ids::touchscreen(handoff::hooks::generation());
       auto created = global->runtime->create_touchscreen(options);
       if (created) {
         touch = std::move(created.touchscreen);
@@ -512,7 +514,7 @@ namespace platf::virtualhid {
     if (capabilities.supports_pen_tablet) {
       lvh::CreatePenTabletOptions options;
       options.profile = lvh::profiles::pen_tablet();
-      options.stable_id = "sunshine-pen-tablet";
+      options.stable_id = ::input::device_ids::pen_tablet(handoff::hooks::generation());
       auto created = global->runtime->create_pen_tablet(options);
       if (created) {
         pen = std::move(created.pen_tablet);

@@ -14,6 +14,7 @@ extern "C" {
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <format>
 #include <functional>
 #include <list>
 #include <memory>
@@ -30,6 +31,7 @@ extern "C" {
 // local includes
 #include "config.h"
 #include "globals.h"
+#include "handoff/hooks.h"
 #include "input.h"
 #include "logging.h"
 #include "platform/common.h"
@@ -45,6 +47,56 @@ constexpr int WHEEL_DELTA = 120;  ///< Standard Windows wheel delta used to norm
 using namespace std::literals;
 
 namespace input {
+  namespace device_ids {
+    namespace {
+      /**
+       * @brief Append the handoff generation to a base id.
+       *
+       * @param base Upstream id, for example `sunshine-keyboard`.
+       * @param generation Handoff generation; 0 returns `base` unchanged.
+       * @return `base` for generation 0, otherwise `base-g<generation>`.
+       */
+      std::string with_generation(std::string_view base, unsigned generation) {
+        if (generation == 0) {
+          return std::string {base};
+        }
+        return std::format("{}-g{}", base, generation);
+      }
+    }  // namespace
+
+    std::string keyboard(unsigned generation) {
+      return with_generation("sunshine-keyboard"sv, generation);
+    }
+
+    std::string mouse(unsigned generation) {
+      return with_generation("sunshine-mouse"sv, generation);
+    }
+
+    std::string touchscreen(unsigned generation) {
+      return with_generation("sunshine-touchscreen"sv, generation);
+    }
+
+    std::string pen_tablet(unsigned generation) {
+      return with_generation("sunshine-pen-tablet"sv, generation);
+    }
+
+    std::string gamepad(unsigned generation, int global_index) {
+      if (generation == 0) {
+        return std::format("sunshine-gamepad-{}", global_index);
+      }
+      return std::format("sunshine-gamepad-{}-{}", generation, global_index);
+    }
+
+    std::string gamepad_mac(unsigned generation, int global_index) {
+      // Generation 0 yields the upstream "02:00:00:00:00:<idx>"; the two generation bytes sit in the 3rd and 4th octets.
+      return std::format(
+        "02:00:{:02x}:{:02x}:00:{:02x}",
+        (generation >> 8) & 0xFFu,
+        generation & 0xFFu,
+        static_cast<unsigned>(global_index) & 0xFFu
+      );
+    }
+  }  // namespace device_ids
 
   constexpr auto MAX_GAMEPADS = std::min((std::size_t) platf::MAX_GAMEPADS, sizeof(std::int16_t) * 8);  ///< Maximum gamepads representable by the active gamepad mask.
 /**
@@ -167,6 +219,28 @@ namespace input {
   static std::array<std::uint8_t, 5> mouse_press {};
 
   static platf::input_t platf_input;
+
+  /**
+   * @brief Once-flag guarding the creation of `platf_input` by `ensure_platform_input()`.
+   *
+   * Held by pointer so a test can rearm it by replacing the object (`set_platform_input_factory_for_test`).
+   *
+   * @return Mutable reference to the current once-flag.
+   */
+  std::unique_ptr<std::once_flag> &platform_input_once() {
+    static auto flag = std::make_unique<std::once_flag>();
+    return flag;
+  }
+
+  /**
+   * @brief Factory that creates the platform input backend; empty means `platf::input()`.
+   *
+   * @return Mutable reference to the factory slot.
+   */
+  std::function<platf::input_t()> &platform_input_factory() {
+    static std::function<platf::input_t()> factory;
+    return factory;
+  }
 #ifdef SUNSHINE_TESTS
   /**
    * @brief Recorder that unit tests install in place of the platform keyboard.
@@ -2270,11 +2344,22 @@ namespace input {
     }
   };
 
+  void ensure_platform_input() {
+    std::call_once(*platform_input_once(), []() {
+      auto &factory = platform_input_factory();
+      platf_input = factory ? factory() : platf::input();
+    });
+  }
+
   /**
    * @brief Initialize the platform input backend.
+   *
+   * A normal start creates the backend now. A handoff start defers it to the first `ensure_platform_input()` call.
    */
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init() {
-    platf_input = platf::input();
+    if (!handoff::hooks::started_by_handoff()) {
+      ensure_platform_input();
+    }
 
     return std::make_unique<deinit_t>();
   }
@@ -2307,6 +2392,9 @@ namespace input {
    * @brief Allocate and initialize platform input state for a stream.
    */
   std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id) {
+    // Creating the backend can be slow, so it happens before the retained-input lock is taken.
+    ensure_platform_input();
+
     std::shared_ptr<input_t> input;
     bool resumed = false;
     {
@@ -2347,6 +2435,21 @@ namespace input {
       terminate_gamepads();
       platf_input = std::move(input);
       gamepadMask.reset();
+      // Counts as the once-created backend: ensure_platform_input() must not call the factory afterwards.
+      std::call_once(*platform_input_once(), []() {
+      });
+    }
+
+    void set_platform_input_factory_for_test(std::function<platf::input_t()> factory) {
+      terminate_gamepads();
+      platf_input.reset();
+      gamepadMask.reset();
+      platform_input_factory() = std::move(factory);
+      platform_input_once() = std::make_unique<std::once_flag>();
+    }
+
+    bool platform_input_created_for_test() {
+      return static_cast<bool>(platf_input);
     }
 
     int alloc_gamepad(std::shared_ptr<input_t> &input, std::uint8_t client_index, const platf::gamepad_arrival_t &metadata) {

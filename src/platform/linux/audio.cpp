@@ -5,6 +5,8 @@
 // standard includes
 #include <bitset>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <thread>
 
 // lib includes
@@ -15,6 +17,7 @@
 
 // local includes
 #include "src/config.h"
+#include "src/handoff/hooks.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/thread_safe.h"
@@ -279,6 +282,38 @@ namespace platf {
     }
 
     /**
+     * @brief Whether a sink name is one of the virtual sinks Sunshine creates.
+     *
+     * @param name PulseAudio sink name.
+     * @return `true` for a `sink-sunshine-*` name; otherwise `false`.
+     */
+    bool is_sunshine_virtual_sink(std::string_view name) {
+      return name.starts_with("sink-sunshine-");
+    }
+
+    /**
+     * @brief Choose the host playback sink that the stream's end restores.
+     *
+     * A handoff start first uses `SUNSHINE_HANDOFF_HOST_SINK`, which the draining process recorded before the switch.
+     * Otherwise the default sink is used. A `sink-sunshine-*` name is never the host: such a handoff value is skipped,
+     * and a default sink with that name yields an empty host.
+     *
+     * @param default_sink PulseAudio name of the current default sink, or empty.
+     * @return Host sink name, or an empty string when there is no host sink.
+     */
+    std::string host_sink_name(const std::string &default_sink) {
+      if (auto handoff_host = handoff::hooks::host_sink(); handoff_host && !handoff_host->empty() && !is_sunshine_virtual_sink(*handoff_host)) {
+        return *handoff_host;
+      }
+
+      if (is_sunshine_virtual_sink(default_sink)) {
+        return {};
+      }
+
+      return default_sink;
+    }
+
+    /**
      * @brief PulseAudio server controller that creates and removes Sunshine sinks.
      */
     class server_t: public audio_control_t {
@@ -478,7 +513,7 @@ namespace platf {
         }
 
         auto sink_name = get_default_sink_name();
-        sink.host = sink_name;
+        sink.host = host_sink_name(sink_name);
 
         if (index.stereo == PA_INVALID_INDEX) {
           index.stereo = load_null(stereo, speaker::map_stereo.data(), static_cast<int>(speaker::map_stereo.size()));
@@ -654,9 +689,12 @@ namespace platf {
       }
 
       ~server_t() override {
-        unload_null(index.stereo);
-        unload_null(index.surround51);
-        unload_null(index.surround71);
+        // A draining process leaves the virtual sinks loaded: the process that takes over owns them.
+        if (!handoff::hooks::draining()) {
+          unload_null(index.stereo);
+          unload_null(index.surround51);
+          unload_null(index.surround71);
+        }
 
         if (worker.joinable()) {
           pa_context_disconnect(ctx.get());
