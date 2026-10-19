@@ -110,7 +110,8 @@ namespace handoff {
 
       const auto id = tracker.begin();
       if (closed.load() || !channel || !channel->send(make(id))) {
-        // Nothing was sent (or nobody will answer): forget the id at once.
+        // Nothing was sent (or nobody will answer): forget the id at once. The tracker has no "forget" call; a
+        // zero-timeout `wait` erases the pending entry and returns immediately.
         tracker.wait(id, std::chrono::milliseconds::zero());
         return std::nullopt;
       }
