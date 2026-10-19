@@ -10,6 +10,10 @@
 #include "utility.h"
 
 #include <bitset>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
 
 namespace audio {
   /**
@@ -75,6 +79,11 @@ namespace audio {
 
   /**
    * @brief Shared audio device state used while streams are active.
+   *
+   * Handoff rules (see `docs/drain-handoff.md`, "Other resources", audio sinks): the virtual sinks are owned by the
+   * active process. A draining process never restores the default sink when its sessions end (`stop_audio_control`
+   * skips the restore) and never unloads the virtual sink modules when it exits (the PulseAudio `server_t` destructor
+   * skips `unload_null`). Both checks read `handoff::hooks::draining()`; nothing else changes for a normal start.
    */
   struct audio_ctx_t {
     // We want to change the sink for the first stream only
@@ -84,6 +93,9 @@ namespace audio {
 
     bool restore_sink;  ///< Whether Sunshine should restore the original sink when capture ends.
     platf::sink_t sink;  ///< Original sink captured before Sunshine switched devices.
+
+    std::mutex sink_mutex;  ///< Guards `virtual_sink` and the default-sink switch that `reassert_virtual_sink` makes.
+    std::string virtual_sink;  ///< Virtual sink the first session switched to; empty until then and when none was used.
   };
 
   /**
@@ -136,4 +148,60 @@ namespace audio {
    * @param ctx Native context object used by the operation or callback.
    */
   bool is_audio_ctx_sink_available(const audio_ctx_t &ctx);
+
+  /**
+   * @brief Make this process's own virtual sink the default sink again, when this process has sessions.
+   *
+   * Used after a rollback: the draining process had changed the default sink, and the process that keeps serving
+   * must select its virtual sink again so its streams are heard there. Nothing else is changed: `sink_flag` and
+   * `restore_sink` keep their values, so the restore that ends the sessions still runs as usual.
+   *
+   * Rules, in order:
+   * - `sessions <= 0`: returns `false` and does nothing;
+   * - no `control`, or `virtual_sink` is empty (no session has switched to a virtual sink): `false`, nothing done;
+   * - otherwise calls `control->set_sink(virtual_sink)` under `sink_mutex`; returns `true` when it returns 0, `false`
+   *   when it fails (logged by the backend; the caller treats it as best effort).
+   *
+   * Thread-safety: takes `sink_mutex` for the duration of the switch. It may be called from any thread except one that
+   * holds `sink_mutex` already. It must not be called under the slots lock or the clear lock (it talks to the
+   * PulseAudio mainloop and can wait).
+   *
+   * @param ctx Audio context to act on: the process-wide one, dereferenced from `get_audio_ctx_ref()`.
+   * @param sessions This process's own session count (`rtsp_stream::session_count()`), not the total.
+   * @return `true` when the default sink was switched back to the virtual sink; otherwise `false`.
+   */
+  bool reassert_virtual_sink(audio_ctx_t &ctx, int sessions);
+
+#ifdef SUNSHINE_TESTS
+  namespace testing {
+    /**
+     * @brief Replace the factory that `start_audio_control` calls to create the platform audio controller.
+     *
+     * Tests install a fake `platf::audio_control_t` that records `set_sink` calls. An empty function restores
+     * `platf::audio_control()`. Not thread-safe: call it when no stream runs.
+     *
+     * @param factory Fake factory, or empty for the platform default.
+     */
+    void set_audio_control_factory_for_test(std::function<std::unique_ptr<platf::audio_control_t>()> factory);
+
+    /**
+     * @brief Run `stop_audio_control` on a context a test built, without the process-wide context.
+     *
+     * When `handoff::hooks::draining()` is false, a context with `restore_sink` true and a host sink set calls
+     * `set_sink(host)` once. When it is true (the test puts `handoff::runtime()` into mode `draining` first), it calls
+     * nothing.
+     *
+     * @param ctx Test-owned audio context.
+     */
+    void stop_audio_control_for_test(audio_ctx_t &ctx);
+
+    /**
+     * @brief Run `start_audio_control` on a context a test built.
+     *
+     * @param ctx Test-owned audio context.
+     * @return `0` (the value `start_audio_control` returns; a missing controller is not an error here).
+     */
+    int start_audio_control_for_test(audio_ctx_t &ctx);
+  }  // namespace testing
+#endif
 }  // namespace audio
