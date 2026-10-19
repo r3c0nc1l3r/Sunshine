@@ -201,14 +201,16 @@ On `READY` the old process, in this order:
    taken or `GO` is in flight;
 10. waits for the new process's `GO_ACK` (5 s, on the monotonic clock from the `GO` send; a `GO_ACK` read after that
     deadline, for example because the old process was stopped, counts as a timeout and gets no `COMMIT`). On `ok` it
-    re-checks the deadline right before sending `COMMIT` (a miss is a timeout), sends `COMMIT` and answers the helper:
-    switched (exit 0). If the old process then stalls so long that the new process reads `COMMIT` after its own bound,
-    the new process exits and the old process rolls back as for any dead new process before `MAIN` (logged as an Error);
-    accepted, because it needs a stall of more than 5 s on a local socket. On a failed `GO_ACK` (with a reason), a
-    timeout, a failed `COMMIT` send, a channel error or a dead new process, it rolls back with the kill-first rule of
-    step 6 (it is still the main process), which clears the release flag, and answers the helper non-zero. Releasing
-    before `GO` means that a stop of both processes in between can at worst lose the `undo` commands, never run them
-    twice.
+    re-checks the deadline right before sending `COMMIT` (a miss is a timeout), sends `COMMIT` and answers the helper
+    `committed <new pid> <new start_time>`. The helper does not report success yet: it waits up to 10 s for the new
+    process's instance file (that pid with that start time) to show role `active`, and only then exits 0. If the old
+    process stalls so long that the new process reads `COMMIT` after its own bound, the new process exits without
+    writing role `active` and the old process rolls back as for any dead new process before `MAIN` (logged as an Error);
+    the helper then sees no `active` file and exits 4 (`unconfirmed`), so its exit code never reports a switch that did
+    not happen. On a failed `GO_ACK` (with a reason), a timeout, a failed `COMMIT` send, a channel error or a dead new
+    process, it rolls back with the kill-first rule of step 6 (it is still the main process), which clears the release
+    flag, and answers the helper non-zero. Releasing before `GO` means that a stop of both processes in between can at
+    worst lose the `undo` commands, never run them twice.
 
 The new process writes no state file before `GO`. On `GO` it reloads `sunshine_state.json` (`load_state` also rebuilds
 the trusted client certificate chain [C30]), the credentials file and `apps.json`, all under `client_auth_mutex`. Each
@@ -273,7 +275,11 @@ re-arm its accept after `operation_aborted`, so resuming must start its accept a
 - A kill that does not complete within its 5 s wait is visible: the old process answers a waiting helper non-zero with
   the reason `kill_pending`, shows `handoff` `kill_pending` in its instance file (authoritative) and in `/api/sessions`
   responses (only when its web UI is reachable; after the switch has begun it is gated), and logs an Error every 5 s
-  until the reap, after which it continues the rollback and returns to `none`.
+  until the reap, after which it continues the rollback and returns to `none`. The state can last indefinitely (a
+  process in uninterruptible sleep cannot be reaped); no timeout resumes serving beside it. Once the switch has begun,
+  no process accepts on the web UI port, so `/api/sessions` cannot answer; the instance file (and the helper's exit code
+  3) is then where tooling reads it. Tooling treats `kill_pending` as busy, alerts, and never retries a reload while it
+  is set; a new reload is refused in this state anyway (exit 1).
 - The helper is answered non-zero as soon as the kill-first step completes (or with `kill_pending` when it does not
   complete in 5 s), before the in-flight wait, the reload and the swap; the rest of the rollback runs without it, so the
   `ExecReload` bound (see "systemd unit") holds.
@@ -409,8 +415,8 @@ get reason `drain-deadline`.
   socket; a draining process has none (the old process closes it at the switch).
 - The helper connects to the socket of `$MAINPID`. Until the handover (step 7) the main PID is the old, draining
   process, which has no socket; the helper then reads that pid's instance file and fails with "a drain is in progress"
-  (or "handover failing" in the `handover_failed` state). After the handover the new process is the main PID and its
-  socket answers (refusing while a draining instance exists).
+  (or "handover failing" in the `handover_failed` state, "kill pending" in the `kill_pending` state; exit 1). After the
+  handover the new process is the main PID and its socket answers (refusing while a draining instance exists).
 
 ## Shared resources while two processes run
 ### GPU
@@ -554,7 +560,7 @@ app: it has no process, and it is never executed again. The last session's end l
 | Tray icon | Only the active process shows one (removed at the switch, restored on rollback). The tray updates at session start and end [C9] are skipped while the icon is removed. |
 | Log file | In handoff mode the new process appends to the log without rotating it. Every line of a draining process carries a `[drain]` tag. |
 | mDNS | Only the active process publishes. `publish.cpp` has only start and deinit today; the change adds withdraw and republish. The old process withdraws at the switch and waits up to 5 s for Avahi to drop the entry. If Avahi still renames the new process's service on a collision (for example to "name #2"), the new process resets it to the configured name once the old entry is gone. On rollback the old process republishes. |
-| UPnP | Only the active process maps ports. A draining process never unmaps the shared TCP ports, and unmaps only its own UDP base when it exits and the active process does not use that base. A new process maps ports only at `COMMIT`; after a rollback that killed it, the old process removes the new process's UDP-base mapping, best effort, on a background task after the reap (skipped when UPnP is off); it never delays accept, mDNS or the helper's answer. |
+| UPnP | Only the active process maps ports. A draining process never unmaps the shared TCP ports, and unmaps only its own UDP base when it exits and the active process does not use that base. A new process maps ports only at `COMMIT`; after a rollback that killed it, the old process removes the new process's UDP-base mapping, best effort, on a background task after the reap (skipped when UPnP is off); it never delays accept, mDNS or the helper's answer. The ports it removes are the new base's UDP ports minus every port the old process itself maps (its own UDP base and the shared TCP ports), so it can never remove a mapping the old process uses, even with a misconfigured offset. |
 | File descriptors | Sunshine's sockets are not close-on-exec today (Boost.Asio and ENet create them without `SOCK_CLOEXEC`), but apps and commands are launched with Boost.Process `limit_handles`, which closes every non-stdio fd in the child, and the in-place restart closes all fds above stderr before `execv`. So launched apps inherit no sockets today. The handoff keeps that true: the spawn closes every fd except 0-2 and 3-7 in the child, the new process sets `FD_CLOEXEC` on 3-7 and on the channel, and every new launch path must use `limit_handles` or close fds the same way. `NOTIFY_SOCKET` stays in app environments (harmless with `NotifyAccess=main`). |
 
 ## Visibility and control (session API and logs)
@@ -633,14 +639,15 @@ RuntimeDirectory=sunshine
 ```
 - `NotifyAccess=main`: only the main process can notify, so apps and commands that Sunshine launches cannot spoof
   `READY` or `MAINPID`.
-- `ExecReload` exits 0 when the switch happened (step 5), and non-zero, with the reason on stderr (so it lands in the
-  journal and in `systemctl reload`'s failure), when the handoff was refused or failed. Its wait is bounded by
-  `drain_handoff_ready_timeout` plus `ping_timeout` plus 25 s (the `ping_timeout` term covers the switch substep 4 wait;
-  the 25 s are four 5 s waits, namely the in-flight wait, the mDNS withdraw, `GO_ACK` and one kill-first wait, plus 5 s
-  margin; 65 s with the defaults of 30 s and 10 s). When the kill is still pending at the end of that wait, the helper
-  exits non-zero with `kill_pending`. systemd applies `TimeoutStartSec` to `ExecReload`; the default 90 s is enough for
-  the default timeouts (verify on the target version). With larger `drain_handoff_ready_timeout` or `ping_timeout`
-  values, set `TimeoutStartSec` to at least the bound plus 10 s.
+- `ExecReload` exits 0 only when the switch happened and the new process's instance file shows role `active` (step 5),
+  and non-zero otherwise (see "Helper exit codes" below), with the reason on stderr (so it lands in the journal and in
+  `systemctl reload`'s failure). Its wait is bounded by `drain_handoff_ready_timeout` plus `ping_timeout` plus 35 s (the
+  `ping_timeout` term covers the switch substep 4 wait; the 35 s are four 5 s waits, namely the in-flight wait, the mDNS
+  withdraw, `GO_ACK` and one kill-first wait, the helper's 10 s wait for role `active`, and 5 s margin; 75 s with the
+  defaults of 30 s and 10 s). When the kill is still pending at the end of that wait, the helper exits non-zero with
+  `kill_pending`. systemd applies `TimeoutStartSec` to `ExecReload`; the default 90 s is enough for the default timeouts
+  (verify on the target version). With larger `drain_handoff_ready_timeout` or `ping_timeout` values, set
+  `TimeoutStartSec` to at least the bound plus 10 s.
 - Minimum systemd: 254 (tracking a main PID that is not the manager's child through a pidfd). The active process checks
   the version before a handoff (step 1), and the read-back in step 7 guards against a refused `MAINPID`.
 - The default `KillMode=control-group` stays.
@@ -648,6 +655,17 @@ RuntimeDirectory=sunshine
   with an Error that names the settings above.
 - Feature disabled but the unit is `Type=notify`: Sunshine starts normally and sends `READY=1`; the helper fails
   because there is no control socket.
+
+Helper exit codes:
+
+| Code | Meaning | What tooling does |
+|------|---------|-------------------|
+| 0 | Switched: `COMMIT` sent and the new process's instance file shows role `active`. | Verify the active instance as usual. |
+| 1 | Refused before anything started (feature off or no control socket, drain in progress, handover failing, `kill_pending`, cooldown, app process running, pairing, pending launch, not a systemd notify unit). Nothing changed. | Retry later if the reason is transient; never while `kill_pending`. |
+| 2 | Failed and rolled back: the new process was killed and reaped; the old process serves alone. | Retry after the cooldown. |
+| 3 | `kill_pending`: the rollback could not reap the new process (for example a process in uninterruptible sleep). The old process leaves the gate and accepting as they are and keeps killing. | Treat as busy, alert, never retry automatically. |
+| 4 | `unconfirmed`: `COMMIT` was sent but the new process's file did not show `active` within 10 s. | Read the instance files; do not retry until they show one `active` instance and no `kill_pending`. |
+| 5 | Usage or internal error of the helper (bad arguments, its own timeout). | Alert. |
 
 ## Tests
 - **Unit (blind):**
@@ -686,7 +704,11 @@ RuntimeDirectory=sunshine
   - a `COMMIT` read after the new process's bound (test hook delaying the old process after its deadline re-check):
     the new process exits, the old process logs an Error and rolls back cleanly;
   - after a rollback that killed a new process past `COMMIT`, the old process removes the new process's UDP-base UPnP
-    mapping without delaying accept or the helper's answer;
+    mapping without delaying accept or the helper's answer; the set of ports it removes never contains a port the old
+    process maps (its own UDP base, the TCP ports), also when the two bases overlap;
+  - the helper's exit codes 0-5: 0 only after the new process's file shows `active` (pid and start time match), 4 when
+    it does not within 10 s; `kill_pending` shown in the instance file, and a new reload refused (exit 1) while it is
+    set;
   - `systemctl stop` (both processes get `SIGTERM`) between `GO` and `GO_ACK`: the `undo` commands run at most once;
   - the `END_ALL` state machine: `END_REJECTED` while rolling back, a rollback during `ending` or after `ended` drops
     the app, the mutex is never held across a join or a send;
