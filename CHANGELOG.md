@@ -3,7 +3,8 @@
 Fork changes on top of the upstream base. Upstream's own changelog is at
 https://github.com/LizardByte/Sunshine/releases.
 
-## Unreleased (lb.2)
+## v2026.914.233613-lb.2
+Upstream base: `63d35f702ee9` (nightly `2026.914.233613`). Arch package `sunshine 2026.914.233613.2-1` (CUDA off).
 
 ### Changed
 - Session close API: a close that finds the session already stopping (or loses the stop race) is answered 200 and
