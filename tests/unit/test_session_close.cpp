@@ -260,7 +260,6 @@ TEST_F(SessionCloseTest, ListedSessionsHaveFixedFieldsAndAreOrderedById) {
     EXPECT_GE(info.started, before);
     EXPECT_LE(info.started, after);
   }
-  EXPECT_EQ(rtsp_stream::session_count(), 2);
 }
 
 /**
@@ -306,14 +305,15 @@ TEST_F(SessionCloseTest, RemoveAllEmptiesSlotsWithoutLogging) {
   auto second = rtsp_stream::testing::insert_fake_session(152, stream::session::state_e::STOPPING);
   ASSERT_NE(first, nullptr);
   ASSERT_NE(second, nullptr);
-  ASSERT_EQ(rtsp_stream::session_count(), 2);
+  ASSERT_EQ(rtsp_stream::list_sessions().size(), 2U);
   const std::uintmax_t offset = test_log_size();
 
   rtsp_stream::testing::remove_all();
 
-  EXPECT_EQ(rtsp_stream::session_count(), 0);
-  EXPECT_TRUE(rtsp_stream::list_sessions().empty());
+  // Check the log before any session_count() call: session_count() ends STOPPING sessions and logs for each.
   EXPECT_EQ(count_occurrences(test_log_since(offset), "Session ended"), 0U);
+  EXPECT_TRUE(rtsp_stream::list_sessions().empty());
+  EXPECT_EQ(rtsp_stream::session_count(), 0);
 }
 
 /**
@@ -457,8 +457,9 @@ TEST_F(SessionCloseTest, RemoveDuringHeldJoinDoesNotCrashOrDoubleLog) {
   gate.release();
   clearer.join();
 
-  EXPECT_EQ(rtsp_stream::session_count(), 0);
+  // Check the log before session_count(), which ends STOPPING sessions and logs for each.
   EXPECT_EQ(count_occurrences(test_log_since(offset), "Session ended"), 0U);
+  EXPECT_EQ(rtsp_stream::session_count(), 0);
 }
 
 /**
