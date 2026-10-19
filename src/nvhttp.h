@@ -370,7 +370,9 @@ namespace nvhttp {
     loaded,  ///< The file was read, had `root.uniqueid`, and the in-memory state was replaced from it.
     no_file,  ///< The state file does not exist. Nothing was changed.
     no_uniqueid,  ///< The file exists and parses but has no `root.uniqueid` (not Sunshine credentials). Nothing was changed.
-    unreadable,  ///< The file exists but cannot be read, parsed, or has a malformed client list. Nothing was changed.
+    unreadable,  ///< The file exists but cannot be read or parsed, or has a malformed client list: `root.named_devices`
+                 ///< present with a non-empty scalar value (the empty string is ptree's empty array and is an empty
+                 ///< list), or an entry the startup parser would reject. Nothing was changed.
   };
 
   /**
