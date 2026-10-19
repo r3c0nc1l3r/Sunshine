@@ -12,6 +12,7 @@
 #include "audio.h"
 #include "config.h"
 #include "globals.h"
+#include "handoff/hooks.h"
 #include "logging.h"
 #include "platform/common.h"
 #include "thread_safe.h"
@@ -40,6 +41,16 @@ namespace audio {
    * @return Index into `stream_configs` for the requested layout.
    */
   int map_stream(int channels, bool quality);
+
+  /**
+   * @brief Factory that creates the platform audio controller; empty means `platf::audio_control()`.
+   *
+   * @return Mutable reference to the factory slot, so tests can replace it.
+   */
+  std::function<std::unique_ptr<platf::audio_control_t>()> &audio_control_factory() {
+    static std::function<std::unique_ptr<platf::audio_control_t>()> factory;
+    return factory;
+  }
 
   constexpr auto SAMPLE_RATE = 48000;  ///< Audio sample rate in hertz required by Opus.
 
@@ -193,25 +204,34 @@ namespace audio {
     }
 
     // Prefer the virtual sink if host playback is disabled or there's no other sink
+    bool virtual_selected = false;
     if (ref->sink.null && (!config.flags[config_t::HOST_AUDIO] || sink->empty())) {
       auto &null = *ref->sink.null;
       switch (stream.channelCount) {
         case 2:
           sink = &null.stereo;
+          virtual_selected = true;
           break;
         case 6:
           sink = &null.surround51;
+          virtual_selected = true;
           break;
         case 8:
           sink = &null.surround71;
+          virtual_selected = true;
           break;
       }
     }
 
     // Only the first to start a session may change the default sink
     if (!ref->sink_flag->exchange(true, std::memory_order_acquire)) {
+      std::lock_guard sink_lock {ref->sink_mutex};
+
       // If the selected sink is different than the current one, change sinks.
       ref->restore_sink = ref->sink.host != *sink;
+      if (virtual_selected) {
+        ref->virtual_sink = *sink;
+      }
       if (ref->restore_sink) {
         if (control->set_sink(*sink)) {
           return;
@@ -314,10 +334,12 @@ namespace audio {
 
     ctx.sink_flag = std::make_unique<std::atomic_bool>(false);
 
-    // The default sink has not been replaced yet.
+    // The default sink has not been replaced yet, and no virtual sink has been selected.
     ctx.restore_sink = false;
+    ctx.virtual_sink.clear();
 
-    if (!(ctx.control = platf::audio_control())) {
+    auto &factory = audio_control_factory();
+    if (!(ctx.control = factory ? factory() : platf::audio_control())) {
       return 0;
     }
 
@@ -335,6 +357,11 @@ namespace audio {
   }
 
   void stop_audio_control(audio_ctx_t &ctx) {
+    // A draining process leaves the default sink alone: the process that takes over owns the sinks.
+    if (handoff::hooks::draining()) {
+      return;
+    }
+
     // restore audio-sink if applicable
     if (!ctx.restore_sink) {
       return;
@@ -348,10 +375,40 @@ namespace audio {
     }
   }
 
+  bool reassert_virtual_sink(audio_ctx_t &ctx, int sessions) {
+    if (sessions <= 0) {
+      return false;
+    }
+
+    std::lock_guard sink_lock {ctx.sink_mutex};
+    if (!ctx.control || ctx.virtual_sink.empty()) {
+      return false;
+    }
+
+    // Best effort: the backend logs a failure.
+    return ctx.control->set_sink(ctx.virtual_sink) == 0;
+  }
+
   void apply_surround_params(opus_stream_config_t &stream, const stream_params_t &params) {
     stream.channelCount = params.channelCount;
     stream.streams = params.streams;
     stream.coupledStreams = params.coupledStreams;
     stream.mapping = params.mapping;
   }
+
+#ifdef SUNSHINE_TESTS
+  namespace testing {
+    void set_audio_control_factory_for_test(std::function<std::unique_ptr<platf::audio_control_t>()> factory) {
+      audio_control_factory() = std::move(factory);
+    }
+
+    void stop_audio_control_for_test(audio_ctx_t &ctx) {
+      stop_audio_control(ctx);
+    }
+
+    int start_audio_control_for_test(audio_ctx_t &ctx) {
+      return start_audio_control(ctx);
+    }
+  }  // namespace testing
+#endif
 }  // namespace audio
