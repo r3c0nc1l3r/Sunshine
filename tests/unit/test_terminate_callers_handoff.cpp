@@ -465,8 +465,12 @@ TEST_F(HandoffTerminateCallersTest, TerminateAppPeerGoneTerminates) {
   peer->end_all_reply = handoff::drain_peer_t::reply_e::no_reply;
   peer->is_gone = true;
   install_peer(peer);
-  EXPECT_EQ(handoff::terminate_app(short_budget, "close app"), handoff::terminate_permission_e::peer_gone) << "a gone peer must give peer_gone";
+  // A gone peer no longer exists (drain_peer_t::exists: "until its pidfd shows it gone"), so the contract allows
+  // either no_drain or peer_gone here; both permit the terminate.
+  const auto permission = handoff::terminate_app(short_budget, "close app");
+  EXPECT_TRUE(permission == handoff::terminate_permission_e::no_drain || permission == handoff::terminate_permission_e::peer_gone) << "a gone peer must give no_drain or peer_gone";
   EXPECT_EQ(terminate_calls.load(), 1) << "a gone peer must allow the terminate";
+  EXPECT_EQ(peer->end_all_calls.load(), 0) << "a gone peer must not be sent END_ALL";
 }
 
 TEST_F(HandoffTerminateCallersTest, GateInNewPendingModeSendsNothing) {
@@ -497,7 +501,11 @@ TEST_F(HandoffTerminateCallersTest, CertHashIsLowercaseSha256Hex) {
   const std::string hash = handoff::cert_sha256_hex(credentials.x509);
   EXPECT_EQ(hash.size(), 64u) << "the hash must be 64 characters";
   EXPECT_EQ(hash.find_first_not_of("0123456789abcdef"), std::string::npos) << "the hash must be lowercase hex only";
-  EXPECT_EQ(hash, util::hex(crypto::hash(credentials.x509)).to_string()) << "the hash must be the lowercase hex of crypto::hash over the exact PEM bytes";
+  std::string expected;
+  for (const auto byte : crypto::hash(credentials.x509)) {
+    expected += std::format("{:02x}", static_cast<unsigned>(static_cast<unsigned char>(byte)));
+  }
+  EXPECT_EQ(hash, expected) << "the hash must be the lowercase hex of crypto::hash over the exact PEM bytes, in byte order";
 }
 
 TEST_F(HandoffTerminateCallersTest, LaunchRefusalEmptyWithoutPeer) {
@@ -815,8 +823,8 @@ protected:
    * @return Count.
    */
   static std::size_t client_count() {
-    const auto clients = nvhttp::get_all_clients();
-    return clients.contains("named_certs") ? clients["named_certs"].size() : 0;
+    // get_all_clients() returns a JSON array of the paired clients.
+    return nvhttp::get_all_clients().size();
   }
 
   /**

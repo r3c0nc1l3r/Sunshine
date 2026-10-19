@@ -619,7 +619,19 @@ TEST_F(HandoffRevocationPollTest, AThrowingCallbackIsRetriedAtTheNextPass) {
   )) << "A certificate whose callback threw stays new and must be retried at the next wake.";
   ASSERT_TRUE(wait_more_passes(4)) << "More passes must run.";
   EXPECT_EQ(3U, count_of("cert-a")) << "After a successful call the certificate is handled and must not be called again.";
-  EXPECT_GE(capture->count(sev_error), 2U) << "A throwing callback must be logged as an Error.";
+  EXPECT_EQ(capture->count(sev_error), 1U) << "A throwing callback logs one Error per certificate within 60 s (injected clock).";
+}
+
+TEST_F(HandoffRevocationPollTest, AThrowingCallbackLogsAgainAfterTheErrorInterval) {
+  make_poller();
+  throws_remaining = 1000;
+  write_devices({{"cert-a", "false"}});
+  ASSERT_TRUE(poller->start()) << "start() must succeed.";
+  ASSERT_TRUE(capture->wait_count(sev_error, 1, 1000ms)) << "The first throw must log an Error.";
+  ASSERT_TRUE(wait_more_passes(3)) << "More passes must run.";
+  EXPECT_EQ(capture->count(sev_error), 1U) << "Further throws within 60 s must not log another Error.";
+  clock_ms += 61'000;
+  EXPECT_TRUE(capture->wait_count(sev_error, 2, 1000ms)) << "A throw 60 s or more after the last Error must log one again.";
 }
 
 TEST_F(HandoffRevocationPollTest, AThrowingCallbackDoesNotStopTheOtherCerts) {
