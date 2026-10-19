@@ -587,10 +587,9 @@ namespace handoff {
         }
         answer(control_reply_t {reply_kind_e::failed, reason, 0, 0});
 
-        if (_gate) {
-          _ops.wait_in_flight(std::chrono::milliseconds {-1});
-        }
         if (_frozen) {
+          // The unbounded wait only protects the reload and the app-list swap.
+          _ops.wait_in_flight(std::chrono::milliseconds {-1});
           if (!_ops.reload_after_rollback()) {
             BOOST_LOG(error) << "Drain handoff: reload after the rollback failed; keeping the frozen state";
           }
