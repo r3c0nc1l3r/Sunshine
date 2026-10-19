@@ -345,16 +345,21 @@ namespace {
     std::atomic<bool> exited_flag {false};  ///< Result of `exited()`.
     std::function<void()> on_kill;  ///< Called inside every `kill_and_reap`.
 
-    handoff::reap_result_e kill_and_reap(std::chrono::milliseconds) override {
+    handoff::reap_result_e pending_result {handoff::reap_result_e::timeout};  ///< Result while `timeouts_left` > 0.
+    handoff::reap_result_e final_result {handoff::reap_result_e::reaped};  ///< Result once `timeouts_left` is used up.
+    std::vector<std::chrono::milliseconds> kill_args;  ///< Arguments of `kill_and_reap` (run thread only).
+
+    handoff::reap_result_e kill_and_reap(std::chrono::milliseconds timeout) override {
+      kill_args.push_back(timeout);
       log.add("kill_and_reap");
       if (on_kill) {
         on_kill();
       }
       if (timeouts_left.load() > 0) {
         --timeouts_left;
-        return handoff::reap_result_e::timeout;
+        return pending_result;
       }
-      return handoff::reap_result_e::reaped;
+      return final_result;
     }
 
     bool exited() override {
@@ -1666,9 +1671,7 @@ TEST_F(HandoffOldSideTest, RequestShutdownWhileWaitingForReadyRollsBackKillFirst
   side->request_shutdown();
   const auto outcome = finish(1000ms);
   ASSERT_TRUE(outcome.has_value());
-  // SPEC-QUESTION: outcome after a shutdown before GO: `shutdown` ("a shutdown arrived") or `rolled_back`.
-  EXPECT_TRUE(*outcome == old_outcome_e::shutdown || *outcome == old_outcome_e::rolled_back);
-  EXPECT_NE(old_outcome_e::handed_over, *outcome);
+  EXPECT_EQ(old_outcome_e::shutdown, *outcome) << "a shutdown request while waiting for READY ends with the shutdown outcome";
   verify_rollback(0, false, start_tail(), {"answer:failed"});
 }
 
@@ -1714,6 +1717,242 @@ TEST_F(HandoffOldSideTest, ExitedChildAfterGoWhileShuttingDownStartsNoRollback) 
   for (const auto *effect : {"resume_accept", "publish_mdns", "restore_tray", "lower_gate", "set_released:0", "drop_app"}) {
     EXPECT_EQ(0, count_of(v, effect)) << effect << " must not run while shutting down";
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review additions: reap results, drain routing and floods, shutdown in the window, kill_pending details
+// ---------------------------------------------------------------------------------------------------------------
+
+TEST_F(HandoffOldSideTest, ReapErrorWithLiveChildIsTreatedLikeTimeout) {
+  child.pending_result = handoff::reap_result_e::error;
+  child.timeouts_left = 2;
+  child.exited_flag = false;
+  start();
+  ASSERT_TRUE(to_go().has_value());
+  ASSERT_TRUE(peer->send(protocol::go_ack_t {false, "x"}));
+  const auto outcome = finish();
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::rolled_back, *outcome);
+  const auto v = log.all();
+  EXPECT_EQ(3, count_of(v, "kill_and_reap")) << "a reap error with exited()==false must be retried like a timeout";
+  const int first = index_of(v, "kill_and_reap");
+  const int last = last_index_of(v, "kill_and_reap");
+  const int pending = index_of(v, "set_state:kill_pending");
+  ASSERT_GE(pending, 0) << "a reap error with a live child shows kill_pending";
+  EXPECT_GT(pending, first);
+  EXPECT_LT(pending, last);
+  EXPECT_EQ(std::vector<std::string> {"answer:kill_pending"}, answers_of(v));
+  verify_rollback(10, false, {"remove_new_instance_file", "wait_in_flight:-1", "reload_after_rollback", "unfreeze", "lower_gate", "resume_accept", "publish_mdns", "restore_tray", "set_released:0"}, {"answer:kill_pending"});
+}
+
+TEST_F(HandoffOldSideTest, ReapErrorWithExitedChildCountsAsGone) {
+  child.final_result = handoff::reap_result_e::error;
+  child.exited_flag = true;
+  start();
+  ASSERT_TRUE(handshake());
+  ASSERT_TRUE(peer->send(protocol::ready_t {false, "x"}));
+  const auto outcome = finish();
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::rolled_back, *outcome);
+  const auto v = log.all();
+  EXPECT_EQ(1, count_of(v, "kill_and_reap")) << "a reap error with exited()==true means the child is gone: no retry";
+  EXPECT_EQ(0, count_of(v, "set_state:kill_pending"));
+  verify_rollback(0, false, start_tail(), {"answer:failed"});
+}
+
+TEST_F(HandoffOldSideTest, ReapedElsewhereCountsAsGone) {
+  child.final_result = handoff::reap_result_e::reaped_elsewhere;
+  start();
+  ASSERT_TRUE(handshake());
+  ASSERT_TRUE(peer->send(protocol::ready_t {false, "x"}));
+  const auto outcome = finish();
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::rolled_back, *outcome);
+  const auto v = log.all();
+  EXPECT_EQ(1, count_of(v, "kill_and_reap"));
+  EXPECT_EQ(0, count_of(v, "set_state:kill_pending"));
+  verify_rollback(0, false, start_tail(), {"answer:failed"});
+}
+
+TEST_F(HandoffOldSideTest, KillPendingResendsKillEveryReapIntervalAndAnswersHelperOnce) {
+  child.timeouts_left = 3;
+  start();
+  ASSERT_TRUE(handshake());
+  ASSERT_TRUE(peer->send(protocol::ready_t {false, "x"}));
+  const auto outcome = finish();
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::rolled_back, *outcome);
+  const auto v = log.all();
+  EXPECT_EQ(4, count_of(v, "kill_and_reap")) << "kill_and_reap must be repeated for as long as it times out";
+  ASSERT_EQ(4U, child.kill_args.size());
+  for (const auto &arg : child.kill_args) {
+    EXPECT_EQ(timeouts.reap, arg) << "every kill attempt waits one reap interval";
+  }
+  EXPECT_EQ(std::vector<std::string> {"answer:kill_pending"}, answers_of(v)) << "after kill_pending the helper must not be answered again with failed";
+  EXPECT_EQ(1, count_of(v, "set_state:kill_pending")) << "kill_pending is set once";
+  EXPECT_EQ("set_state:none", v.back());
+}
+
+TEST_F(HandoffOldSideTest, OnlyDrainRequestsReachTheHandlerAndOtherFdsAreClosed) {
+  timeouts.rollback_window = 400ms;
+  start();
+  ASSERT_TRUE(to_committed());
+  int fds[2];
+  ASSERT_EQ(0, ::pipe2(fds, O_CLOEXEC));
+  ASSERT_TRUE(peer->send(protocol::ended_t {1}, fds[1])) << "sending an fd with ENDED";
+  ::close(fds[1]);
+  ASSERT_TRUE(peer->send(protocol::ping_t {99}));
+  ASSERT_TRUE(peer->send(protocol::go_t {}));
+  ASSERT_TRUE(peer->send(protocol::commit_t {}));
+  ASSERT_TRUE(peer->send(protocol::main_t {}));
+  ASSERT_TRUE(peer->send(protocol::end_rejected_t {2}));
+  ASSERT_TRUE(peer->send(protocol::sessions_request_t {3}));
+  pollfd pfd {fds[0], POLLIN, 0};
+  // keep answering pings while we wait
+  const auto deadline = std::chrono::steady_clock::now() + 300ms;
+  int rc = 0;
+  while (rc == 0 && std::chrono::steady_clock::now() < deadline) {
+    peer->pump(10ms);
+    rc = ::poll(&pfd, 1, 0);
+  }
+  EXPECT_EQ(1, rc) << "the fd attached to a dropped message must be closed";
+  ::close(fds[0]);
+  if (peer->mains == 0) {
+    peer->pump(1500ms);
+  }
+  const auto outcome = finish();
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::handed_over, *outcome) << "stray PING/GO/COMMIT/MAIN/ENDED/END_REJECTED from the child must not disturb the window";
+  std::lock_guard lock {handler_mutex};
+  EXPECT_EQ(std::vector<std::string> {"SESSIONS?"}, handled) << "only END_ALL, SESSIONS?, CLOSE and CLOSE_CERT may reach on_drain_request";
+}
+
+TEST_F(HandoffOldSideTest, FloodOfDrainRequestsWithBlockedHandlerDoesNotDelayHandoverAndIsBounded) {
+  timeouts.rollback_window = 200ms;
+  handler_blocks = true;
+  start();
+  ASSERT_TRUE(to_committed());
+  const auto committed_at = std::chrono::steady_clock::now();
+  for (int i = 0; i < 2000; ++i) {
+    peer->send(protocol::sessions_request_t {static_cast<std::uint64_t>(i + 1)});  // may fail with EAGAIN once the socket is full
+    if (i % 40 == 0 && peer->mains == 0) {
+      peer->pump(2ms);
+    }
+  }
+  if (peer->mains == 0) {
+    peer->pump(1500ms);
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - committed_at;
+  EXPECT_EQ(1, peer->mains) << "MAIN must still arrive while the drain handler is blocked and requests flood in";
+  EXPECT_LT(elapsed, 650ms) << "the handover must not wait for the blocked drain handler (it would take until the handler's 700 ms cap)";
+  {
+    std::lock_guard lock {handler_mutex};
+    handler_release = true;
+    handler_cv.notify_all();
+  }
+  const auto outcome = finish();
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::handed_over, *outcome);
+  std::lock_guard lock {handler_mutex};
+  EXPECT_LE(handled.size(), 1025U) << "the number of requests waiting for the handler is bounded";
+}
+
+TEST_F(HandoffOldSideTest, FloodOfPongsDoesNotDelayPingsOrHandover) {
+  timeouts.rollback_window = 200ms;
+  start();
+  ASSERT_TRUE(to_committed());
+  const auto committed_at = std::chrono::steady_clock::now();
+  for (int i = 0; i < 2000; ++i) {
+    peer->send(protocol::pong_t {100000});
+    if (i % 40 == 0 && peer->mains == 0) {
+      peer->pump(2ms);
+    }
+  }
+  if (peer->mains == 0) {
+    peer->pump(1500ms);
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - committed_at;
+  EXPECT_EQ(1, peer->mains) << "MAIN must arrive after a flood of PONGs";
+  EXPECT_LT(elapsed, 900ms) << "the handover must happen about rollback_window after COMMIT despite the flood";
+  EXPECT_GE(peer->pings.size(), 2U) << "PINGs keep being sent during the flood";
+  const auto outcome = finish();
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::handed_over, *outcome);
+  std::lock_guard lock {handler_mutex};
+  EXPECT_TRUE(handled.empty()) << "PONGs never reach on_drain_request";
+}
+
+TEST_F(HandoffOldSideTest, RequestShutdownInRollbackWindowEndsWithShutdownAndNoHandover) {
+  timeouts.rollback_window = 600ms;
+  start();
+  ASSERT_TRUE(to_committed());
+  side->request_shutdown();
+  peer->pump(100ms);
+  // SPEC-QUESTION: the spec only defines a child death during shutdown; a shutdown with a live child in the window
+  // is assumed to end the run with `shutdown`, no handover and no rollback.
+  const auto outcome = finish(1000ms);
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::shutdown, *outcome);
+  const auto v = log.all();
+  EXPECT_EQ(0, count_of(v, "close_socket_copies")) << "no handover once a shutdown arrived";
+  for (const auto *effect : {"resume_accept", "publish_mdns", "restore_tray", "lower_gate", "set_released:0", "drop_app"}) {
+    EXPECT_EQ(0, count_of(v, effect)) << effect << " must not run: a shutdown starts no rollback";
+  }
+}
+
+TEST_F(HandoffOldSideTest, RequestShutdownDuringHandoverRetriesEndsWithShutdown) {
+  timeouts.rollback_window = 60ms;
+  timeouts.handover_retry = 40ms;
+  ops.handover_default = false;
+  std::atomic<bool> failed_seen {false};
+  ops.hook = [&](const std::string &name) {
+    if (name == "set_state:handover_failed") {
+      failed_seen = true;
+    }
+  };
+  start();
+  ASSERT_TRUE(to_committed());
+  for (int i = 0; i < 40 && !failed_seen; ++i) {
+    peer->pump(20ms);
+  }
+  ASSERT_TRUE(failed_seen) << "the handover must have failed once before the shutdown";
+  side->request_shutdown();
+  peer->pump(100ms);
+  const auto outcome = finish(1000ms);
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::shutdown, *outcome) << "a shutdown during handover retries ends the run with shutdown";
+  const auto v = log.all();
+  EXPECT_EQ(0, count_of(v, "close_socket_copies"));
+  EXPECT_EQ(0, peer->mains);
+  for (const auto *effect : {"resume_accept", "publish_mdns", "restore_tray", "lower_gate", "set_released:0", "drop_app"}) {
+    EXPECT_EQ(0, count_of(v, effect)) << effect << " must not run: a shutdown starts no rollback";
+  }
+}
+
+TEST_F(HandoffOldSideTest, ChildDeathDuringHandoverRetriesWhileShuttingDownStartsNoRollback) {
+  timeouts.rollback_window = 60ms;
+  timeouts.handover_retry = 40ms;
+  ops.handover_default = false;
+  std::atomic<bool> failed_seen {false};
+  ops.hook = [&](const std::string &name) {
+    if (name == "set_state:handover_failed") {
+      failed_seen = true;
+    }
+  };
+  start();
+  ASSERT_TRUE(to_committed());
+  for (int i = 0; i < 40 && !failed_seen; ++i) {
+    peer->pump(20ms);
+  }
+  ASSERT_TRUE(failed_seen);
+  side->request_shutdown();
+  child.exited_flag = true;
+  peer->channel.close();
+  const auto outcome = finish(1000ms);
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(old_outcome_e::shutdown, *outcome);
+  EXPECT_EQ(0, count_of(log.all(), "resume_accept")) << "no rollback while shutting down";
+  EXPECT_EQ(0, count_of(log.all(), "publish_mdns"));
 }
 
 #endif  // __linux__
