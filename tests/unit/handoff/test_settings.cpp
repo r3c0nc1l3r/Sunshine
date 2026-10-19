@@ -9,6 +9,7 @@
 
   // standard includes
   #include <cstdint>
+  #include <limits>
   #include <set>
   #include <string>
 
@@ -517,4 +518,47 @@ TEST(HandoffSettingsTest, CheckEnableOrderDisplayManagerBeforeRuntimeDirectory) 
   EXPECT_EQ(handoff::check_enable(both), handoff::check_enable(manager_only))
     << "With a display settings manager and no runtime dir, the manager reason must be returned.";
 }
+
+/**
+ * @brief An offset near INT_MAX is rejected with the range error, without overflow.
+ */
+TEST(HandoffSettingsTest, HugeOffsetGivesRangeErrorWithoutOverflow) {
+  auto settings = default_settings();
+  settings.udp_offset = std::numeric_limits<int>::max();
+  const auto reason = handoff::validate(settings, 47989);
+  EXPECT_NE(reason.find("drain_handoff_udp_offset"), std::string::npos)
+    << "An offset of INT_MAX puts the second base far outside 1024-65535; it must be rejected naming drain_handoff_udp_offset, got: "
+    << reason;
+}
+
+/**
+ * @brief A large negative offset is rejected with the range error, without overflow.
+ */
+TEST(HandoffSettingsTest, HugeNegativeOffsetGivesRangeErrorWithoutOverflow) {
+  auto settings = default_settings();
+  settings.udp_offset = std::numeric_limits<int>::min();
+  const auto reason = handoff::validate(settings, 47989);
+  EXPECT_NE(reason.find("drain_handoff_udp_offset"), std::string::npos)
+    << "An offset of INT_MIN puts the second base far below 1024; it must be rejected naming drain_handoff_udp_offset, got: "
+    << reason;
+}
+
+/**
+ * @brief With an out-of-range UDP port in the second base and a TCP collision in the same base, the range rule
+ * decides first.
+ *
+ * The configured port's own base can never collide with its TCP ports (P+9..P+11 against P-5, P, P+1, P+21), so
+ * the collision is put in the second base here: port 1030 with offset -16 gives base 1014, whose UDP ports
+ * 1023, 1024, 1025 include 1023 (outside 1024-65535) and 1025 (RTSP TCP of port 1030 is 1051, HTTP 1030, web UI 1031,
+ * HTTPS 1025 which collides).
+ */
+TEST(HandoffSettingsTest, RangeRuleWinsOverTcpCollisionInSameBase) {
+  auto settings = default_settings();
+  settings.udp_offset = 1014 - 1030;
+  const auto reason = handoff::validate(settings, 1030);
+  EXPECT_NE(reason.find("drain_handoff_udp_offset"), std::string::npos)
+    << "The range rule comes before the TCP collision rule; the reason must name drain_handoff_udp_offset, got: " << reason;
+  EXPECT_FALSE(reason.empty()) << "The configuration must be rejected.";
+}
+
 #endif
