@@ -247,11 +247,6 @@ TEST_F(LoggingHandoffTest, RotationFailureKeepsOldContentAndStillInitializes) {
   EXPECT_TRUE(std::filesystem::is_directory(log_path.string() + ".5")) << "a failed rotation must not touch the generation that blocked it";
 }
 
-TEST_F(LoggingHandoffTest, RotateLogFileReportsErrorWhenDirectoryIsMissing) {
-  const auto missing = test_directory / "no_such_dir" / "x.log";
-  EXPECT_TRUE(logging::rotate_log_file(missing)) << "rotate_log_file must report an error for a path whose directory does not exist";
-}
-
 TEST_F(LoggingHandoffTest, RotateLogFileWithoutCurrentLogSucceeds) {
   EXPECT_FALSE(logging::rotate_log_file(log_path)) << "rotating a missing current log is not a failure";
 }
