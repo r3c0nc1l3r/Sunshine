@@ -1422,10 +1422,25 @@ namespace confighttp {
   }
 
   /**
+   * @brief Reduce a session id from the request path to a short string that is safe to log.
+   * @param id_text Session id as captured from the request path.
+   * @return The first 32 characters of `id_text`, keeping only the decimal digits.
+   */
+  std::string sanitise_session_id_for_log(std::string_view id_text) {
+    std::string logged_id;
+    for (const char c : id_text.substr(0, 32)) {
+      if (c >= '0' && c <= '9') {
+        logged_id += c;
+      }
+    }
+    return logged_id;
+  }
+
+  /**
    * @brief Log one session close request made through the API.
-   * @param id Session id as logged; for `bad-id`, the sanitised input.
+   * @param id Session id as logged; for `bad-id` and `csrf-rejected`, the sanitised path id.
    * @param source Normalized address of the client that made the request.
-   * @param result `closed`, `not-found` or `bad-id`.
+   * @param result `closed`, `not-found`, `csrf-rejected` or `bad-id`.
    */
   void log_session_close(const std::string &id, const std::string &source, std::string_view result) {
     BOOST_LOG(info) << "Session close requested via API: id="sv << id << ", user="sv << config::sunshine.username << ", source="sv << source << ", result="sv << result;
@@ -1463,9 +1478,9 @@ namespace confighttp {
   /**
    * @brief Close one streaming session through the normal stop path.
    *
-   * Requires admin authentication and, for cross-origin requests, a valid CSRF token. Every accepted request is
-   * logged at Info with the admin user, the client address and the result (`closed`, `not-found` or `bad-id`).
-   * The log line never contains credentials or the CSRF token.
+   * Requires admin authentication and, for cross-origin requests, a valid CSRF token. Every request that passes
+   * authentication is logged at Info with the admin user, the client address and the result (`closed`,
+   * `not-found`, `csrf-rejected` or `bad-id`). The log line never contains credentials or the CSRF token.
    *
    * @param response The HTTP response object.
    * @param request The HTTP request object; `path_match[1]` is the session id.
@@ -1477,26 +1492,21 @@ namespace confighttp {
       return;
     }
 
+    const auto source = net::addr_to_normalized_string(request->remote_endpoint().address());
+    const std::string id_text = request->path_match[1];
+
     std::string client_id = get_client_id(request);
     if (!validate_csrf_token(response, request, client_id)) {
+      log_session_close(sanitise_session_id_for_log(id_text), source, "csrf-rejected"sv);
       return;
     }
 
     print_req(request);
 
-    const auto source = net::addr_to_normalized_string(request->remote_endpoint().address());
-    const std::string id_text = request->path_match[1];
     std::uint32_t session_id = 0;
     const auto [end, ec] = std::from_chars(id_text.data(), id_text.data() + id_text.size(), session_id);
     if (ec != std::errc {} || end != id_text.data() + id_text.size()) {
-      // Keep the logged id short and free of anything but digits.
-      std::string logged_id;
-      for (const char c : id_text.substr(0, 32)) {
-        if (c >= '0' && c <= '9') {
-          logged_id += c;
-        }
-      }
-      log_session_close(logged_id, source, "bad-id"sv);
+      log_session_close(sanitise_session_id_for_log(id_text), source, "bad-id"sv);
       bad_request(response, request, "Session id must be a 32-bit unsigned number");
       return;
     }
@@ -1511,6 +1521,19 @@ namespace confighttp {
     nlohmann::json output_tree;
     output_tree["status"] = true;
     send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Register the session API routes on the admin web UI server.
+   *
+   * Registers exactly `GET /api/sessions` (getSessions) and `POST /api/sessions/<id>/close` (closeSession).
+   * `start()` calls this, so tests can exercise the production route table.
+   *
+   * @param server Admin web UI HTTPS server.
+   */
+  void register_session_routes(https_server_t &server) {
+    server.resource["^/api/sessions$"]["GET"] = getSessions;
+    server.resource["^/api/sessions/([0-9]+)/close$"]["POST"] = closeSession;
   }
 
   /**
@@ -2484,8 +2507,7 @@ namespace confighttp {
     server.resource["^/api/reset-display-device-persistence$"]["POST"] = resetDisplayDevicePersistence;
     server.resource["^/api/reset-portal-token$"]["POST"] = resetPortalToken;
     server.resource["^/api/restart$"]["POST"] = restart;
-    server.resource["^/api/sessions$"]["GET"] = getSessions;
-    server.resource["^/api/sessions/([0-9]+)/close$"]["POST"] = closeSession;
+    register_session_routes(server);
     server.resource["^/api/virtual-input/license$"]["GET"] = getVirtualInputLicense;
     server.resource["^/api/virtual-input/license$"]["POST"] = updateVirtualInputLicense;
     server.resource["^/api/virtual-input/status$"]["GET"] = getVirtualInputStatus;

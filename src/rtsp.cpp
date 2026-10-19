@@ -687,8 +687,11 @@ namespace rtsp_stream {
     }
 
     /**
-     * @brief Describe all tracked sessions.
-     * @return One entry per session, ordered by id.
+     * @brief Describe the sessions that are running or stopping.
+     *
+     * Sessions that have not started yet are skipped.
+     *
+     * @return One entry per running or stopping session, ordered by id.
      */
     std::vector<session_info_t> list() {
       std::vector<session_info_t> sessions;
@@ -696,6 +699,10 @@ namespace rtsp_stream {
         auto lg = _session_slots.lock();
         sessions.reserve(_session_slots->size());
         for (const auto &slot : *_session_slots) {
+          const auto state = stream::session::state(*slot);
+          if (state != stream::session::state_e::RUNNING && state != stream::session::state_e::STOPPING) {
+            continue;
+          }
           sessions.push_back(stream::session::describe(*slot));
         }
       }
