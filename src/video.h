@@ -5,7 +5,9 @@
 #pragma once
 
 // standard includes
+#include <array>
 #include <chrono>
+#include <optional>
 #include <string_view>
 
 // local includes
@@ -684,6 +686,42 @@ namespace video {
   extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
 
   /**
+   * @brief Encoder probe results received from the draining process in `HELLO`, used by `/serverinfo` only.
+   *
+   * Set by a handoff child whose probe identity matched (see `handoff::accepted_probe`). The values have the same
+   * meaning as the globals they replace: `hevc_mode`/`av1_mode` for `active_hevc_mode`/`active_av1_mode`, and `yuv444`
+   * for `last_encoder_probe_supported_yuv444_for_codec` (index 0 H.264, 1 HEVC, 2 AV1).
+   */
+  struct handoff_probe_override_t {
+    int hevc_mode {0};  ///< HEVC mode (0 to 5) that `/serverinfo` reports in place of `active_hevc_mode`.
+    int av1_mode {0};  ///< AV1 mode (0 to 5) that `/serverinfo` reports in place of `active_av1_mode`.
+    std::array<bool, 3> yuv444 {};  ///< Per-codec 4:4:4 support in place of `last_encoder_probe_supported_yuv444_for_codec`.
+  };
+
+  /**
+   * @brief Set or clear the `/serverinfo` probe override.
+   *
+   * The override never changes encoder state: `active_hevc_mode`, `active_av1_mode`, the 4:4:4 array and the other
+   * probe globals are untouched. Thread-safe: the value is guarded by a mutex, so `handoff_probe_override()` on an
+   * HTTP thread and the set or clear on another thread never tear. Clearing is also done by `probe_encoders()` itself
+   * (see there), so a caller that sets a value needs to clear it only to cancel it early.
+   *
+   * @param value Override to install, or `std::nullopt` to clear it. Setting `std::nullopt` on a process that never
+   *              had an override changes nothing.
+   */
+  void set_handoff_probe_override(std::optional<handoff_probe_override_t> value);
+
+  /**
+   * @brief The current `/serverinfo` probe override.
+   *
+   * Thread-safe; returns a copy, so the caller holds no lock afterwards.
+   *
+   * @return The override installed by `set_handoff_probe_override`, or `std::nullopt`. A normal start (no handoff) and
+   *         every process after its first successful probe return `std::nullopt`.
+   */
+  std::optional<handoff_probe_override_t> handoff_probe_override();
+
+  /**
    * @brief Resolve a client-requested dynamic range against probed encoder capabilities.
    *
    * @param encoder Selected encoder and its probed codec capabilities.
@@ -719,6 +757,10 @@ namespace video {
    * This is called once at startup and each time a stream is launched to
    * ensure the best encoder is selected. Encoder availability can change
    * at runtime due to all sorts of things from driver updates to eGPUs.
+   *
+   * On a successful run (return 0) it also clears the `/serverinfo` override (`set_handoff_probe_override`
+   * with `std::nullopt`), so from then on `/serverinfo` reports this process's own probe. A failed run leaves the
+   * override in place. The probe itself never reads the override. A normal start has no override, so nothing changes.
    *
    * @warning This is only safe to call when there is no client actively streaming.
    * @return 0 when a usable encoder is selected; nonzero when probing fails.

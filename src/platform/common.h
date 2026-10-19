@@ -549,6 +549,15 @@ namespace platf {
    */
   struct sink_t {
     // Play on host PC
+    /**
+     * @brief Host playback sink: the sink the user hears on the machine, to restore when a stream ends.
+     *
+     * Never a Sunshine virtual sink (a name starting with `sink-sunshine-`). The Linux backend's `sink_info()` takes
+     * the host sink in this order: `handoff::hooks::host_sink()` when a handoff start supplied one
+     * (`SUNSHINE_HANDOFF_HOST_SINK`, which the draining process recorded before the switch); otherwise the current
+     * default sink, unless that is a Sunshine virtual sink, in which case the host is empty. Empty means "no host sink";
+     * the caller then falls back to `config::audio.sink`. Other platforms are unchanged.
+     */
     std::string host;  ///< Host playback sink name.
 
     // On macOS and Windows, it is not possible to create a virtual sink
@@ -1124,6 +1133,10 @@ namespace platf {
 
   /**
    * @brief Create the platform input backend for a stream.
+   *
+   * Called by `input::ensure_platform_input()` only: once per process at a normal start, and at the first session of a
+   * handoff start (lazy, so a new process creates no virtual devices before it has a session). The Linux virtualhid
+   * backend builds its device stable ids with `input::device_ids::*` from `handoff::hooks::generation()`.
    *
    * @return Platform-specific input backend for the active stream.
    */

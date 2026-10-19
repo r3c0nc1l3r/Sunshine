@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -19,6 +20,80 @@
 
 namespace input {
   struct input_t;
+
+  /**
+   * @brief Stable identifiers of the virtual input devices, with the handoff generation folded in.
+   *
+   * The two processes of a drain handoff must never create a device with the same stable id, so every id carries the
+   * generation (`hooks::generation()`, which is 0 for a process that was never started by a handoff). Generation 0 gives
+   * exactly the upstream strings, so a normal start is unchanged. These are pure functions: they touch no device and no
+   * state, are safe from any thread, and are the single place where the format is defined. The platform backend
+   * (`src/platform/virtualhid_input.cpp`) calls them.
+   *
+   * Formats (the generation is written in decimal in the id and in the MAC; `g` is a literal letter):
+   * - keyboard: `sunshine-keyboard` at generation 0, `sunshine-keyboard-g<gen>` above;
+   * - mouse: `sunshine-mouse` at 0, `sunshine-mouse-g<gen>` above;
+   * - touchscreen: `sunshine-touchscreen` at 0, `sunshine-touchscreen-g<gen>` above;
+   * - pen tablet: `sunshine-pen-tablet` at 0, `sunshine-pen-tablet-g<gen>` above;
+   * - gamepad (non-MAC profiles): `sunshine-gamepad-<idx>` at 0, `sunshine-gamepad-<gen>-<idx>` above;
+   * - gamepad MAC (DualShock 4 and DualSense profiles): `02:00:00:00:00:<idx>` (two-digit lowercase hex) at 0, and
+   *   `02:00:<gen_hi>:<gen_lo>:00:<idx>` above, where `gen_hi` and `gen_lo` are the two bytes of the generation (both
+   *   two-digit lowercase hex). The two bytes keep the MAC unique for every generation up to 65535.
+   */
+  namespace device_ids {
+    /**
+     * @brief Stable id of the virtual keyboard.
+     *
+     * @param generation Handoff generation; generation 0 gives the upstream id.
+     * @return The id, in the format above.
+     */
+    std::string keyboard(unsigned generation);
+
+    /**
+     * @brief Stable id of the virtual mouse.
+     *
+     * @param generation Handoff generation; generation 0 gives the upstream id.
+     * @return The id, in the format above.
+     */
+    std::string mouse(unsigned generation);
+
+    /**
+     * @brief Stable id of the virtual touchscreen (per client).
+     *
+     * @param generation Handoff generation; generation 0 gives the upstream id.
+     * @return The id, in the format above.
+     */
+    std::string touchscreen(unsigned generation);
+
+    /**
+     * @brief Stable id of the virtual pen tablet (per client).
+     *
+     * @param generation Handoff generation; generation 0 gives the upstream id.
+     * @return The id, in the format above.
+     */
+    std::string pen_tablet(unsigned generation);
+
+    /**
+     * @brief Stable id of a virtual gamepad whose profile is not a MAC-addressed one.
+     *
+     * @param generation Handoff generation.
+     * @param global_index Global gamepad slot (`gamepad_id_t::globalIndex`); the caller passes it as given.
+     * @return The id, in the format above. For generation 0 and index 3 this is `sunshine-gamepad-3`.
+     */
+    std::string gamepad(unsigned generation, int global_index);
+
+    /**
+     * @brief MAC address of a virtual gamepad whose profile is MAC-addressed (DualShock 4 and DualSense).
+     *
+     * The caller keeps its own rules: a random MAC (the `virtualhid_randomize_mac` option) or a slot outside 0 to 255
+     * is handled before this function is called. This function formats only.
+     *
+     * @param generation Handoff generation. Only its low 16 bits are used.
+     * @param global_index Global gamepad slot, 0 to 255; the low byte is written.
+     * @return The MAC string, in the format above.
+     */
+    std::string gamepad_mac(unsigned generation, int global_index);
+  }  // namespace device_ids
 
   /**
    * @brief Write a debug log representation of the input packet.
@@ -56,9 +131,35 @@ namespace input {
   /**
    * @brief Initialize global input resources and platform backends.
    *
-   * @return Cleanup handle for initialized input resources, or null if none are required.
+   * Normal start (`hooks::started_by_handoff()` is false): creates the platform input backend now, exactly as before
+   * (through `ensure_platform_input()`), so the virtual devices exist from startup.
+   *
+   * Handoff start: creates nothing. The platform backend, and with it the keyboard and mouse devices, is created by
+   * the first `ensure_platform_input()` call, which `alloc()` makes. The returned guard still destroys the backend at
+   * process exit (a draining process therefore destroys its devices before it exits, as the spec requires).
+   *
+   * Thread-safety: call once, from `main()`, before any stream starts. Probing gamepads never needs the backend (see
+   * `platf::supported_gamepads`, which accepts a null input).
+   *
+   * @return Cleanup handle for initialized input resources; never null (the guard is also returned in handoff mode).
    */
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init();
+
+  /**
+   * @brief Create the platform input backend if it does not exist yet, exactly once for the process.
+   *
+   * Guarded by a `std::call_once`: the platform factory (`platf::input()`, or the test factory) runs at most once,
+   * even when several threads call this at the same time. The first caller creates the backend and every later call
+   * returns at once.
+   *
+   * Lock order: `alloc()` calls this before it takes the retained-input lock, because creating the backend can take a
+   * long time (the libvirtualhid runtime). This function never takes the retained-input lock, the slots lock or the
+   * clear lock. Callers must not hold any of those when they call it.
+   *
+   * After the backend exists, a later `init()` or `ensure_platform_input()` call does nothing. The deinit guard of
+   * `init()` resets the backend at exit and does not reset the once-flag, so the backend is not recreated after exit.
+   */
+  void ensure_platform_input();
 
   /**
    * @brief Probe whether the platform can create virtual gamepads.
@@ -89,9 +190,30 @@ namespace input {
     /**
      * @brief Replace the global platform input backend for a unit test.
      *
+     * Counts as the once-created backend: afterwards `ensure_platform_input()` does not call the factory.
+     *
      * @param input Test-owned platform input backend.
      */
     void set_platform_input(platf::input_t input);
+
+    /**
+     * @brief Replace the factory that `ensure_platform_input()` calls, and rearm its once-flag.
+     *
+     * A test passes a fake whose call count it can read. Installing a factory drops any existing backend and makes the
+     * next `ensure_platform_input()` call the first one again. Passing an empty function restores `platf::input()`.
+     * Not thread-safe: call it when no other thread uses input.
+     *
+     * @param factory Fake factory, or empty for the platform default.
+     */
+    void set_platform_input_factory_for_test(std::function<platf::input_t()> factory);
+
+    /**
+     * @brief Whether the platform input backend has been created (by the factory, or by `set_platform_input`).
+     *
+     * @return `true` when `ensure_platform_input()` or `set_platform_input()` has produced a backend and it is not
+     *         reset.
+     */
+    bool platform_input_created_for_test();
 
     /**
      * @brief Allocate a gamepad directly in retained input state for a unit test.
