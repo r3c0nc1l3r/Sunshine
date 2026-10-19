@@ -196,10 +196,12 @@ namespace handoff {
   }
 
   bool runtime_t::disable() {
+    // Hold the settings mutex across the mode change, so a settings() reader never sees enabled == true with the
+    // mode already disabled.
+    std::lock_guard lock {_mutex};
     auto current = _mode.load();
     while (current == mode_e::normal || current == mode_e::disabled) {
       if (_mode.compare_exchange_weak(current, mode_e::disabled)) {
-        std::lock_guard lock {_mutex};
         _settings.enabled = false;
         return true;
       }
