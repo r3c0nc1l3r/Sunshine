@@ -107,7 +107,8 @@ namespace handoff {
    * 7. `!unit_found`: `refusal_reason::no_unit`.
    * 8. `!app_adoptable`: `refusal_reason::app_generic` when `app_reason` is empty, else
    *    `refusal_reason::app_prefix` followed by `app_reason` after it was sanitised: every CR and LF is replaced with a
-   *    space and the text is truncated to 200 bytes (so the result is always one line). If the sanitised text is empty
+   *    space and the text is truncated to at most 200 bytes, never inside a UTF-8 multi-byte sequence (the cut backs
+   *    up past continuation bytes), so the result is always one valid line. If the sanitised text is empty
    *    the generic reason is used.
    * 9. `pairing_count > 0`: `refusal_reason::pairing`.
    * 10. `pending_launch`: `refusal_reason::pending_launch`.
