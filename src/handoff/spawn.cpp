@@ -12,6 +12,7 @@
 #include <fstream>
 #include <string_view>
 #include <system_error>
+#include <thread>
 
 // platform includes
 #include <csignal>
@@ -207,11 +208,30 @@ namespace handoff {
     }
 
     len = sizeof(value);
+    if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &value, &len) < 0) {
+      return "cannot read the socket protocol: " + errno_text(errno);
+    }
+    if (value != IPPROTO_TCP) {
+      return "socket is not TCP (other protocol)";
+    }
+
+    len = sizeof(value);
     if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &value, &len) < 0) {
       return "cannot read the socket family: " + errno_text(errno);
     }
     if (value != (ipv6 ? AF_INET6 : AF_INET)) {
       return ipv6 ? "socket is not IPv6" : "socket is not IPv4";
+    }
+
+    if (ipv6) {
+      // address_family = both must also serve IPv4, so the socket must be dual-stack.
+      len = sizeof(value);
+      if (getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &value, &len) < 0) {
+        return "cannot read IPV6_V6ONLY: " + errno_text(errno);
+      }
+      if (value != 0) {
+        return "socket is IPv6 only (IPV6_V6ONLY set)";
+      }
     }
 
     len = sizeof(value);
@@ -300,13 +320,29 @@ namespace handoff {
       }
     }
     for (const auto &extra : request.extra_env) {
-      std::string name = extra.substr(0, extra.find('=') + 1);
-      auto it = std::find_if(env.begin(), env.end(), [&](const std::string &entry) {
-        return entry.compare(0, name.size(), name) == 0;
-      });
-      if (it != env.end()) {
-        *it = extra;
-      } else {
+      size_t eq = extra.find('=');
+      if (eq == std::string::npos || eq == 0) {
+        set_error(error, "invalid extra environment entry (needs NAME=value)");
+        close_all(temp);
+        return std::nullopt;
+      }
+      const std::string name = extra.substr(0, eq + 1);
+      // Replace every existing entry of that name, keeping the first position; drop the duplicates.
+      bool replaced = false;
+      for (auto it = env.begin(); it != env.end();) {
+        if (it->compare(0, name.size(), name) == 0) {
+          if (!replaced) {
+            *it = extra;
+            replaced = true;
+            ++it;
+          } else {
+            it = env.erase(it);
+          }
+        } else {
+          ++it;
+        }
+      }
+      if (!replaced) {
         env.push_back(extra);
       }
     }
@@ -371,8 +407,12 @@ namespace handoff {
     } else {
       int pidfd = -1;
       rc = pidfd_spawn(&pidfd, request.binary.c_str(), &actions, &attr, argv.data(), envp.data());
+      // pidfd_spawn needs glibc 2.39; posix_spawn_file_actions_addclosefrom_np needs glibc 2.34.
       if (rc != 0) {
         failure = "pidfd_spawn failed: " + errno_text(rc);
+        if (pidfd >= 0) {
+          ::close(pidfd);
+        }
       } else {
         child_t child;
         child.pidfd = pidfd;
@@ -426,8 +466,17 @@ namespace handoff {
 
     siginfo_t info {};
     for (;;) {
+      info = {};
       if (waitid(static_cast<idtype_t>(P_PIDFD), static_cast<id_t>(pidfd), &info, WEXITED | WNOHANG) == 0) {
-        break;
+        if (info.si_pid != 0) {
+          break;
+        }
+        // Readable but not yet reapable: retry briefly until the deadline instead of returning at once.
+        if (std::chrono::steady_clock::now() >= deadline) {
+          return reap_result_e::timeout;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
       }
       if (errno == EINTR) {
         continue;
@@ -436,10 +485,6 @@ namespace handoff {
         return reap_result_e::reaped_elsewhere;
       }
       return reap_result_e::error;
-    }
-    if (info.si_pid == 0) {
-      // Readable but not yet reapable; treat as not gone.
-      return reap_result_e::timeout;
     }
     if (exit_status) {
       *exit_status = info.si_status;
