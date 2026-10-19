@@ -132,7 +132,10 @@ namespace logging {
    * @brief Rotate the current log file (unless told not to) and initialize the logging system.
    *
    * The log file is always opened for appending (`std::ios::app`, so `O_APPEND`), in every mode, so two processes that
-   * write the same file (a draining process and its successor) never overwrite each other's lines. A normal start
+   * write the same file (a draining process and its successor) never overwrite each other's data. The sink flushes
+   * after every record (`auto_flush(true)`), so each record normally reaches the file in one `write`; records can
+   * interleave between the processes, but only at record granularity, except that a record larger than the stream
+   * buffer may be split into several writes and then be interleaved inside. A normal start
    * rotates first (`rotate_log_file` renames the old file away), so it appends to a fresh, empty file. If rotation
    * fails, a message is written to `stderr`, initialization continues, and the file is opened for appending, so the
    * old content is kept (earlier versions would have truncated it).

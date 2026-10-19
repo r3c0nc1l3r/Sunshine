@@ -6,7 +6,9 @@
  * See `docs/drain-handoff.md`. On Linux every hook reads `handoff::runtime()` (defined in `hooks.cpp`). On other
  * platforms every hook is an inline function with the neutral answer given in its comment, and nothing from the rest
  * of `src/handoff/` is needed, because the handoff sources are compiled only on Linux. Every hook is thread-safe and
- * cheap (atomic loads), and none of them blocks or logs. Both branches below must keep the same signatures and the
+ * cheap, and none performs I/O, waits or logs. Most are atomic loads; `restart_blocked()` and `quit_blocked()` take the
+ * runtime's mutex and `restart_blocked()` calls `drain_peer_t::exists()`, which must not block. Only `on_sigterm()` is
+ * async-signal-safe. Both branches below must keep the same signatures and the
  * same documented meaning. In tests (`SUNSHINE_TESTS`) every hook can be returned to its fresh-process answer with
  * `handoff::runtime().reset_for_test()`, because the hooks keep no state of their own.
  */
@@ -85,7 +87,8 @@ namespace handoff::hooks {
    * - `SUNSHINE_GENERATION`: set to the decimal `generation()` only when it is above 0; otherwise `std::nullopt`
    *   (unset).
    *
-   * When the feature is disabled (`enabled()` is false): both entries with `std::nullopt` (unset).
+   * When the feature is disabled (`enabled()` is false): both entries with `std::nullopt` (unset), so a disabled
+   * process that inherited a UDP base override reverts to the configured port on restart.
    *
    * @return Pairs of name and value; a `std::nullopt` value means "unset this variable". Non-Linux: empty (nothing to
    *         set or unset).
@@ -115,7 +118,9 @@ namespace handoff::hooks {
    * the main process (`new_pending`, `new_active`; its exit would be a rollback rather than a stop). Quit in the
    * active role is allowed, also while a handoff is in progress and while a draining process exists: the `SIGTERM`
    * that systemd then sends aborts the handoff with the kill-first rollback (switch substep 9) or stops both
-   * processes. So this hook does not look at `handoff_in_progress()`. Feature disabled: never refused.
+   * processes. So this hook does not look at `handoff_in_progress()`. Feature disabled: never refused. The Quit paths
+   * (and the `shutdown_event` watcher) call `runtime().request_shutdown()`, not `on_sigterm()`, because Quit ends in
+   * `lifetime::exit_sunshine`; the coordinator forwards it to `old_side_t::request_shutdown()`.
    *
    * @return Empty when Quit may proceed; otherwise a one-line explanation. Non-Linux: empty.
    */

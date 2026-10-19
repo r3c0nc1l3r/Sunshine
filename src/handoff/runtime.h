@@ -11,6 +11,11 @@
  * channel, peer, inherited fds, host sink) is guarded by one mutex that is never held across a call out of this class
  * except into `instance_writer_t`, which has its own lock and never calls back. The only functions that are safe in a
  * signal handler are `note_sigterm()` and `shutdown_wake_fd()`.
+ *
+ * Shutdown: the `SIGTERM` handler calls `note_sigterm()` (through `hooks::on_sigterm()`). Every other way to shut down
+ * (Quit from the web UI or the tray, which end in `lifetime::exit_sunshine`, and the watcher on `shutdown_event`) calls
+ * `request_shutdown()`, the non-signal path. The coordinator forwards it to `old_side_t::request_shutdown()` so a
+ * running handoff aborts with its kill-first rollback.
  */
 #pragma once
 
@@ -64,7 +69,8 @@ namespace handoff {
   std::string_view to_string(mode_e mode);
 
   /**
-   * @brief The environment `runtime_t::early_init()` works on. Tests inject fakes; production uses `system_environment()`.
+   * @brief The environment `runtime_t::early_init()` works on. Tests inject fakes; production uses
+   * `system_environment()`.
    */
   struct early_init_env_t {
     std::function<const char *(const char *)> getenv;  ///< Returns the value of a variable, or null when unset.
@@ -117,7 +123,8 @@ namespace handoff {
      *   `SUNSHINE_HANDOFF_UDP_BASE` (decimal, 1 to 65535) or `SUNSHINE_HANDOFF_GENERATION` (decimal, 1 to 65535)
      *   missing or invalid: an error; nothing is stored, `scrub_fds` is not called, the mode stays `disabled`.
      * - both set and valid: a handoff start. `inherited()` holds the fds, `started_by_handoff()` is `true`, the mode
-     *   is set directly to `new_pending` (so `enabled()` is `true`), `is_main()` is `false`, the UDP base override and generation come from the
+     *   is set directly to `new_pending` (so `enabled()` is `true`), `is_main()` is `false`, the UDP base override
+     *   and generation come from the
      *   `SUNSHINE_HANDOFF_` variables, and `SUNSHINE_HANDOFF_HOST_SINK` (optional, may be empty) is kept for
      *   `host_sink()`.
      *
@@ -291,16 +298,26 @@ namespace handoff {
     void note_sigterm();
 
     /**
-     * @brief Whether `note_sigterm()` has been called.
-     *
-     * @return `true` after a `SIGTERM`.
+     * @brief Record that a shutdown was requested without a signal (Quit from the web UI or the tray, the watcher on
+     * `shutdown_event`). The non-signal twin of `note_sigterm()`: the same effects (sets the shutdown-requested flag,
+     * latches the shutdown reason, writes the eventfd) and the same idempotence, but it is not meant for signal
+     * handlers; the Quit paths and the `shutdown_event` watcher call it, and the coordinator forwards it to
+     * `old_side_t::request_shutdown()`. Thread-safe.
      */
-    bool sigterm_requested() const;
+    void request_shutdown();
+
+    /**
+     * @brief Whether `note_sigterm()` or `request_shutdown()` has been called.
+     *
+     * @return `true` after a shutdown was requested by either path.
+     */
+    bool shutdown_requested() const;
 
     /**
      * @brief Reason for session stops during shutdown.
      *
-     * @return The latched reason after `note_sigterm()`; before that, `stop` while the mode is `draining` and
+     * @return The latched reason after `note_sigterm()` or `request_shutdown()`; before that,
+     *         `stop` while the mode is `draining` and
      *         `terminated` otherwise.
      */
     shutdown_reason_e shutdown_reason() const;
@@ -435,7 +452,7 @@ namespace handoff {
     std::atomic<bool> _is_main {true};  ///< Main-process flag.
     std::atomic<bool> _frozen {false};  ///< Frozen flag.
     std::atomic<bool> _handoff_in_progress {false};  ///< A handoff started by this process is running.
-    std::atomic<bool> _sigterm {false};  ///< `SIGTERM` seen.
+    std::atomic<bool> _shutdown_requested {false};  ///< A shutdown was requested.
     std::atomic<int> _latched_reason {-1};  ///< Latched `shutdown_reason_e`, or -1.
     int _wake_fd {-1};  ///< Eventfd written by `note_sigterm`; fixed after construction.
     mutable std::mutex _mutex;  ///< Guards the members below.

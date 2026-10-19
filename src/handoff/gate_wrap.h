@@ -63,7 +63,8 @@ namespace handoff {
   template<class Resp>
   void refuse_503(const Resp &response) {
     response->close_connection_after_response = true;
-    response->write(SimpleWeb::StatusCode::server_error_service_unavailable, SimpleWeb::CaseInsensitiveMultimap {{"Connection", "close"}});
+    const SimpleWeb::CaseInsensitiveMultimap headers {{"Connection", "close"}};
+    response->write(SimpleWeb::StatusCode::server_error_service_unavailable, headers);
   }
 
   /**
@@ -140,7 +141,11 @@ namespace handoff {
       for (auto &method : route.second) {
         const auto &name = method.first;
         const bool state_changing = name == "POST" || name == "DELETE" || name == "PUT" || name == "PATCH";
-        method.second = state_changing ? counted<Resp, Req>(std::move(method.second), gate) : gated<Resp, Req>(std::move(method.second), gate);
+        if (state_changing) {
+          method.second = counted<Resp, Req>(std::move(method.second), gate);
+        } else {
+          method.second = gated<Resp, Req>(std::move(method.second), gate);
+        }
       }
     }
   }

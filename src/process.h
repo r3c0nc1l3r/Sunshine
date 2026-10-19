@@ -110,7 +110,9 @@ namespace proc {
    * handoff calls. All accesses are sequentially consistent. Atomics are not movable, and `proc::refresh` replaces the
    * whole `proc_t` by move assignment, so this wrapper has a move constructor and a move assignment that copy the
    * current values one by one (not as a whole; a move happens only in `refresh`, when no other thread uses the old
-   * object). It is not copyable.
+   * object). It is not copyable. `proc::refresh` (the apps.json saves in `confighttp.cpp`) already races with `running()`
+   * outside a handoff, because it replaces the whole object while the control loop polls it; this change does not make
+   * that worse, and during a handoff the 503 gate keeps the saves out.
    */
   struct app_atomics_t {
     std::atomic<int> app_id {0};  ///< Running app id: 0 at start, -1 after a terminate, above 0 while an app is recorded.
@@ -420,7 +422,8 @@ namespace proc {
     /**
      * @brief Test-only: make the object look like it runs an app, without starting anything.
      *
-     * Sets `_app` to `app`, the atomic app id to `app_id`, the placebo flag, the process group, and the prep iterators and the atomic applied count to `applied_prep` (clamped to the prep
+     * Sets `_app` to `app`, the atomic app id to `app_id`, the placebo flag, the process group, and the prep
+     * iterators and the atomic applied count to `applied_prep` (clamped to the prep
      * list size). Does not touch `_env`.
      *
      * @param app The app (its `prep_cmds` are used).
@@ -441,7 +444,7 @@ namespace proc {
 #endif
 
   private:
-    app_atomics_t _live;  ///< Atomic running-app fields (see @ref app_atomics_t). `_live.app_id` and `_live.placebo` replace the old `_app_id` and `placebo` fields.
+    app_atomics_t _live;  ///< Atomic running-app fields (see @ref app_atomics_t); replace the old `_app_id`, `placebo`.
 
     boost::process::v1::environment _env;
     std::vector<ctx_t> _apps;

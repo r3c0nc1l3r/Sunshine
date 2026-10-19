@@ -65,7 +65,7 @@ namespace file_handler {
    * existing file), write all of `contents`, `fsync` it, close it, `rename` it over `path`, then `fsync` the directory
    * (best effort). On any failure after the temporary file was created, it is unlinked and `path` is untouched. The
    * parent directory must already exist; it is not created. A symlink at `path` is replaced by the new file, not
-   * followed (a change from `write_file`, which writes through the link; note it in `CHANGELOG.md`). Non-POSIX: the
+   * followed (unlike `write_file`, which writes through the link). Non-POSIX: the
    * function is declared on every platform; on Windows it writes the temporary file and replaces `path` with
    * `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, permission bits are ignored, and errors are
    * `std::error_code(GetLastError(), std::system_category())`. The handoff does not run there, so only the callers'
