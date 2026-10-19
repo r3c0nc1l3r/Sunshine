@@ -65,11 +65,6 @@ namespace confighttp {
   namespace fs = std::filesystem;
 
   /**
-   * @brief HTTPS server type used for Sunshine's configuration UI.
-   */
-  using https_server_t = SimpleWeb::Server<SimpleWeb::HTTPS>;
-
-  /**
    * @brief Case-insensitive map used for HTTP headers and query parameters.
    */
   using args_t = SimpleWeb::CaseInsensitiveMultimap;

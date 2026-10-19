@@ -50,7 +50,7 @@ namespace confighttp {
 #endif
 
   // Type aliases for HTTPS server components
-  using https_server_t = SimpleWeb::Server<SimpleWeb::HTTPS>;  // wave B: becomes adoptable_https_server_t
+  using https_server_t = adoptable_https_server_t;
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
   using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
 
