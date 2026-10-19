@@ -33,6 +33,7 @@
   #include <fcntl.h>
   #include <sys/eventfd.h>
   #include <sys/socket.h>
+  #include <sys/stat.h>
   #include <unistd.h>
 
   // local includes
@@ -49,6 +50,100 @@ namespace {
   namespace protocol = handoff::protocol;
   using handoff::new_stage_e;
   using handoff::validation_e;
+
+  /**
+   * @brief Five real sockets that stand for the inherited fds (HTTPS, HTTP, web UI, RTSP, channel).
+   *
+   * The code under test may close the four listener fds, so every number must be an fd this object owns. Ownership is
+   * checked with `fstat` (device and inode) before any close, so a number that was closed and reused is left alone.
+   */
+  class owned_fds_t {
+  public:
+    /**
+     * @brief Open the sockets.
+     */
+    owned_fds_t() {
+      renew();
+    }
+
+    /**
+     * @brief Close what is still ours.
+     */
+    ~owned_fds_t() {
+      close_remaining();
+    }
+
+    owned_fds_t(const owned_fds_t &) = delete;  ///< Not copyable.
+    owned_fds_t &operator=(const owned_fds_t &) = delete;  ///< Not copyable.
+
+    /**
+     * @brief Close the remaining fds and open five new ones.
+     */
+    void renew() {
+      close_remaining();
+      for (auto &entry : _entries) {
+        entry.fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct stat st {};
+        if (entry.fd >= 0 && ::fstat(entry.fd, &st) == 0) {
+          entry.dev = st.st_dev;
+          entry.ino = st.st_ino;
+        }
+      }
+    }
+
+    /**
+     * @brief Close every fd that is still open and still the same object.
+     */
+    void close_remaining() {
+      for (auto &entry : _entries) {
+        struct stat st {};
+        if (entry.fd >= 0 && ::fstat(entry.fd, &st) == 0 && st.st_dev == entry.dev && st.st_ino == entry.ino) {
+          ::close(entry.fd);
+        }
+        entry.fd = -1;
+      }
+    }
+
+    /**
+     * @brief One fd number.
+     *
+     * @param index 0 HTTPS, 1 HTTP, 2 web UI, 3 RTSP, 4 channel.
+     * @return The number.
+     */
+    int fd(std::size_t index) const {
+      return _entries[index].fd;
+    }
+
+    /**
+     * @brief Value of `SUNSHINE_HANDOFF_FDS`.
+     *
+     * @return The text.
+     */
+    std::string fds_text() const {
+      return "https:" + std::to_string(fd(0)) + ",http:" + std::to_string(fd(1)) + ",webui:" + std::to_string(fd(2)) + ",rtsp:" + std::to_string(fd(3));
+    }
+
+    /**
+     * @brief Value of `SUNSHINE_HANDOFF_CHANNEL`.
+     *
+     * @return The text.
+     */
+    std::string channel_text() const {
+      return std::to_string(fd(4));
+    }
+
+  private:
+    /**
+     * @brief One owned fd and its identity.
+     */
+    struct entry_t {
+      int fd {-1};  ///< Number, or -1.
+      dev_t dev {0};  ///< Device.
+      ino_t ino {0};  ///< Inode.
+    };
+
+    entry_t _entries[5];  ///< The fds.
+  };
 
   /**
    * @brief Thread-safe ordered record of every seam call.
@@ -335,6 +430,7 @@ protected:
     handoff::runtime().instance_remove();
     handoff::runtime().reset_for_test();
     video::set_handoff_probe_override(std::nullopt);
+    fds.close_remaining();
     std::error_code ec;
     std::filesystem::remove_all(_dir, ec);
   }
@@ -351,10 +447,11 @@ protected:
     handoff::runtime().instance_remove();
     handoff::runtime().reset_for_test();
     video::set_handoff_probe_override(std::nullopt);
+    fds.renew();
 
     std::map<std::string, std::string> vars {
-      {"SUNSHINE_HANDOFF_FDS", "https:3,http:4,webui:5,rtsp:6"},
-      {"SUNSHINE_HANDOFF_CHANNEL", "7"},
+      {"SUNSHINE_HANDOFF_FDS", fds.fds_text()},
+      {"SUNSHINE_HANDOFF_CHANNEL", fds.channel_text()},
       {"SUNSHINE_HANDOFF_UDP_BASE", "48100"},
       {"SUNSHINE_HANDOFF_GENERATION", "1"},
     };
@@ -452,6 +549,7 @@ protected:
     return rec.count("publish_mdns") > 0 || rec.count("start_upnp") > 0 || rec.count("request_tray_start") > 0 || rec.count("set_unmap_scope") > 0;
   }
 
+  owned_fds_t fds;  ///< Real fds that stand for the inherited ones.
   handoff::new_ops_config_t config;  ///< Ops configuration.
   handoff::new_ops_seams_t seams;  ///< Ops seams (all recording).
   recorder_t rec;  ///< Record of seam calls.
@@ -897,17 +995,17 @@ TEST_F(HandoffNewOpsTest, ValidateListenersChecksFourServersInOrderWithTheirPort
   EXPECT_EQ(ops->validate_listeners(), "") << "valid listeners";
   const auto log = rec.all();
   ASSERT_EQ(log.size(), 4u) << "validate_listener must be called once per server";
-  EXPECT_EQ(log[0], "validate_listener(3,47984,v4)") << "HTTPS: fd 3, port - 5";
-  EXPECT_EQ(log[1], "validate_listener(4,47989,v4)") << "HTTP: fd 4, port";
-  EXPECT_EQ(log[2], "validate_listener(5,47990,v4)") << "web UI: fd 5, port + 1";
-  EXPECT_EQ(log[3], "validate_listener(6,48010,v4)") << "RTSP: fd 6, port + 21";
+  EXPECT_EQ(log[0], "validate_listener(" + std::to_string(fds.fd(0)) + ",47984,v4)") << "HTTPS: fd 3, port - 5";
+  EXPECT_EQ(log[1], "validate_listener(" + std::to_string(fds.fd(1)) + ",47989,v4)") << "HTTP: fd 4, port";
+  EXPECT_EQ(log[2], "validate_listener(" + std::to_string(fds.fd(2)) + ",47990,v4)") << "web UI: fd 5, port + 1";
+  EXPECT_EQ(log[3], "validate_listener(" + std::to_string(fds.fd(3)) + ",48010,v4)") << "RTSP: fd 6, port + 21";
 }
 
 TEST_F(HandoffNewOpsTest, ValidateListenersPassesTheIpv6Flag) {
   config.ipv6 = true;
   rebuild();
   EXPECT_EQ(ops->validate_listeners(), "");
-  EXPECT_EQ(rec.count("validate_listener(3,47984,v6)"), 1) << "the ipv6 flag of the configuration must be passed through";
+  EXPECT_EQ(rec.count("validate_listener(" + std::to_string(fds.fd(0)) + ",47984,v6)"), 1) << "the ipv6 flag of the configuration must be passed through";
 }
 
 TEST_F(HandoffNewOpsTest, ValidateListenersPrefixesTheServerName) {
