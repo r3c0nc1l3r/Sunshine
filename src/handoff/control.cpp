@@ -14,7 +14,6 @@
 #include <fstream>
 #include <mutex>
 #include <poll.h>
-#include <sstream>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -39,6 +38,7 @@ namespace handoff {
 
     constexpr std::size_t max_request_bytes = 256;  ///< Longest request line, newline included.
     constexpr std::size_t max_reply_bytes = 4096;  ///< Longest reply line the helper accepts, newline included.
+    constexpr std::size_t max_instance_file_bytes = 64 * 1024;  ///< Largest instance file the helper reads.
     constexpr std::size_t max_reason_bytes = 1000;  ///< Longest reason in a reply line; the rest is cut.
     constexpr std::chrono::milliseconds server_io_timeout {2000};  ///< Server read and write bound per connection.
 
@@ -339,6 +339,8 @@ namespace handoff {
      * @return `true` when `dir` exists as a directory afterwards.
      */
     bool make_directories_0700(const fs::path &dir, std::string &error) {
+      // The runtime directory is assumed to be user-owned and private (`/run/user/<uid>` or `RuntimeDirectory=`), so
+      // existing parents are trusted; only the control directory itself is checked in prepare_control_directory().
       if (dir.empty() || dir == dir.root_path()) {
         return true;
       }
@@ -581,15 +583,17 @@ namespace handoff {
     }
 
     // With no control socket, the instance file of the pid explains why (drain in progress, handover failing,
-    // kill pending); otherwise there is simply no socket.
+    // kill pending); otherwise there is simply no socket. The same check runs when connect() finds the socket gone
+    // (the process closed it between the stat() and the connect()).
     const auto socket_path = control_socket_path(env.runtime_dir, *pid);
-    struct stat st {};
-    if (::stat(socket_path.c_str(), &st) != 0 && errno == ENOENT) {
+    const auto explain_missing_socket = [&]() {
       std::ifstream in(env.runtime_dir / "instances" / (std::to_string(*pid) + ".json"), std::ios::binary);
       if (in) {
-        std::ostringstream content;
-        content << in.rdbuf();
-        const auto instance = parse_instance(content.str());
+        // A file larger than the cap counts as unreadable.
+        std::string content(max_instance_file_bytes + 1, '\0');
+        in.read(content.data(), static_cast<std::streamsize>(content.size()));
+        content.resize(static_cast<std::size_t>(in.gcount()));
+        const auto instance = content.size() <= max_instance_file_bytes ? parse_instance(content) : std::nullopt;
         // A process in handover_failed or kill_pending keeps role draining, so the state is checked first.
         if (instance && instance->handoff == state_e::kill_pending) {
           err = "kill pending";
@@ -606,6 +610,11 @@ namespace handoff {
       }
       err = no_socket;
       return helper_exit_e::refused;
+    };
+
+    struct stat st {};
+    if (::stat(socket_path.c_str(), &st) != 0 && errno == ENOENT) {
+      return explain_missing_socket();
     }
 
     fd_guard_t guard(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
@@ -625,8 +634,7 @@ namespace handoff {
     }
     if (::connect(guard.get(), reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0) {
       if (errno == ENOENT || errno == ECONNREFUSED) {
-        err = no_socket;
-        return helper_exit_e::refused;
+        return explain_missing_socket();
       }
       err = std::string("connect: ") + std::strerror(errno);
       return helper_exit_e::error;
@@ -679,6 +687,11 @@ namespace handoff {
     if (_thread.joinable() || _listen_fd >= 0) {
       return fail("already started");
     }
+    // stop() on another thread is still joining: _stopped is set, the thread is moved out, and the wake fd stays open
+    // until the joiner has closed it. Starting now would close an fd the joiner still uses.
+    if (_stopped && _wake_fd >= 0) {
+      return fail("stopping");
+    }
 
     std::string reason;
     int listen_fd = -1;
@@ -688,11 +701,6 @@ namespace handoff {
     }
     fd_guard_t listener(listen_fd);
 
-    // A previous run that stopped on its own thread may have left its wake fd open; it is replaced here.
-    if (_wake_fd >= 0) {
-      ::close(_wake_fd);
-      _wake_fd = -1;
-    }
     fd_guard_t wake(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
     if (wake.get() < 0) {
       const auto message = std::string("eventfd: ") + std::strerror(errno);
@@ -713,68 +721,74 @@ namespace handoff {
       // can at worst make poll() report a spurious event, which the re-check discards.
       _thread = std::thread([this, wake_fd]() {
         while (true) {
-          int snapshot = -1;
-          {
-            std::lock_guard guard(_mutex);
-            if (_stopped) {
+          try {
+            int snapshot = -1;
+            {
+              std::lock_guard guard(_mutex);
+              if (_stopped) {
+                return;
+              }
+              snapshot = _listen_fd;
+            }
+
+            // A negative fd is ignored by poll(): while no listener is open only the wake fd is polled.
+            pollfd fds[2] = {{snapshot, POLLIN, 0}, {wake_fd, POLLIN, 0}};
+            if (::poll(fds, 2, -1) < 0) {
+              if (errno == EINTR) {
+                continue;
+              }
+              BOOST_LOG(error) << "Drain handoff: control socket poll failed: " << std::strerror(errno);
               return;
             }
-            snapshot = _listen_fd;
-          }
 
-          // A negative fd is ignored by poll(): while no listener is open only the wake fd is polled.
-          pollfd fds[2] = {{snapshot, POLLIN, 0}, {wake_fd, POLLIN, 0}};
-          if (::poll(fds, 2, -1) < 0) {
-            if (errno == EINTR) {
+            if (fds[1].revents != 0) {
+              // Reset the counter; the loop top then re-reads _stopped and the listen fd.
+              std::uint64_t counter = 0;
+              if (::read(wake_fd, &counter, sizeof(counter)) < 0 && errno != EAGAIN && errno != EINTR) {
+                BOOST_LOG(error) << "Drain handoff: cannot read the control socket wake fd: " << std::strerror(errno);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+              }
               continue;
             }
-            BOOST_LOG(error) << "Drain handoff: control socket poll failed: " << std::strerror(errno);
-            return;
-          }
+            if (snapshot < 0 || fds[0].revents == 0) {
+              continue;
+            }
 
-          if (fds[1].revents != 0) {
-            // Reset the counter; the loop top then re-reads _stopped and the listen fd.
-            std::uint64_t counter = 0;
-            if (::read(wake_fd, &counter, sizeof(counter)) < 0 && errno != EAGAIN && errno != EINTR) {
-              BOOST_LOG(error) << "Drain handoff: cannot read the control socket wake fd: " << std::strerror(errno);
-              std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            int client = -1;
+            int accept_errno = 0;
+            handler_t current_handler;
+            {
+              std::lock_guard guard(_mutex);
+              if (_stopped) {
+                return;
+              }
+              if (_listen_fd != snapshot) {
+                continue;  // closed or replaced while polling
+              }
+              client = ::accept4(snapshot, nullptr, nullptr, SOCK_CLOEXEC);
+              accept_errno = errno;
+              current_handler = _handler;
             }
-            continue;
-          }
-          if (snapshot < 0 || fds[0].revents == 0) {
-            continue;
-          }
 
-          int client = -1;
-          int accept_errno = 0;
-          handler_t current_handler;
-          {
-            std::lock_guard guard(_mutex);
-            if (_stopped) {
-              return;
+            if (client < 0) {
+              if (accept_errno != EINTR && accept_errno != EAGAIN && accept_errno != ECONNABORTED) {
+                BOOST_LOG(error) << "Drain handoff: control socket accept failed: " << std::strerror(accept_errno);
+              }
+              if ((fds[0].revents & (POLLERR | POLLHUP)) != 0 || (accept_errno != EINTR && accept_errno != EAGAIN && accept_errno != ECONNABORTED)) {
+                // Back off so a persistent error (for example out of descriptors) does not spin the thread.
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+              }
+              continue;
             }
-            if (_listen_fd != snapshot) {
-              continue;  // closed or replaced while polling
-            }
-            client = ::accept4(snapshot, nullptr, nullptr, SOCK_CLOEXEC);
-            accept_errno = errno;
-            current_handler = _handler;
-          }
 
-          if (client < 0) {
-            if (accept_errno != EINTR && accept_errno != EAGAIN && accept_errno != ECONNABORTED) {
-              BOOST_LOG(error) << "Drain handoff: control socket accept failed: " << std::strerror(accept_errno);
-            }
-            if ((fds[0].revents & (POLLERR | POLLHUP)) != 0 || (accept_errno != EINTR && accept_errno != EAGAIN && accept_errno != ECONNABORTED)) {
-              // Back off so a persistent error (for example out of descriptors) does not spin the thread.
-              std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            continue;
+            // Served without the lock: the handler may call close_listener(), reopen_listener() or stop().
+            fd_guard_t client_guard(client);
+            serve_connection(client, current_handler);
+          } catch (...) {
+            // Never let an exception end the thread (std::terminate); the fd guards have closed the connection.
+            BOOST_LOG(error) << "Drain handoff: control socket thread caught an exception";
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
           }
-
-          // Served without the lock: the handler may call close_listener(), reopen_listener() or stop().
-          fd_guard_t client_guard(client);
-          serve_connection(client, current_handler);
         }
       });
     } catch (const std::system_error &e) {
