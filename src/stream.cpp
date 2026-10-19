@@ -518,10 +518,8 @@ namespace stream {
 
     // Immutable after `session::alloc()`, so they may be read from any thread.
     std::chrono::system_clock::time_point started;  ///< Time the session was created.
-    int app_id {0};  ///< Id of the launched app.
-    std::string peer_address;  ///< Client address as seen by the RTSP server.
-    std::string client_name;  ///< Name of the paired client, or empty.
-    std::string client_uuid;  ///< UUID of the paired client, or empty.
+    std::string transport;  ///< Transport shown in the session list: `udp/ipv4` or `udp/ipv6`.
+    std::string client_category;  ///< Network class of the client shown in the session list: `local`, `lan` or `wan`.
 
     safe::shared_t<broadcast_ctx_t>::ptr_t broadcast_ref;  ///< Shared broadcast context retained while the session is active.
 
@@ -2300,38 +2298,44 @@ namespace stream {
     }
 
     /**
-     * @brief Describe a session for the web UI.
+     * @brief Get the launch session id of a session.
+     */
+    std::uint32_t id(const session_t &session) {
+      return session.launch_session_id;
+    }
+
+    /**
+     * @brief Describe a session for the session list.
      */
     rtsp_stream::session_info_t describe(const session_t &session) {
       rtsp_stream::session_info_t result;
       result.id = session.launch_session_id;
-      result.client_name = session.client_name;
-      result.client_uuid = session.client_uuid;
-      result.peer_address = session.peer_address;
-      result.app_id = session.app_id;
       result.started = session.started;
-      result.width = session.config.monitor.width;
-      result.height = session.config.monitor.height;
-      result.fps = session.config.monitor.framerate;
-      result.video_format = session.config.monitor.videoFormat;
-      result.dynamic_range = session.config.monitor.dynamicRange;
+      result.transport = session.transport;
+      result.client_category = session.client_category;
+      return result;
+    }
 
-      switch (session.state.load(std::memory_order_acquire)) {
-        case state_e::STOPPED:
-          result.state = "stopped";
-          break;
-        case state_e::STOPPING:
-          result.state = "stopping";
-          break;
-        case state_e::STARTING:
-          result.state = "starting";
-          break;
-        case state_e::RUNNING:
-          result.state = "running";
-          break;
+    /**
+     * @brief Get the network class of a session's client as shown in the session list.
+     * @param address Client address as seen by the RTSP server.
+     * @return `local`, `lan` or `wan`. Unparseable addresses are reported as `wan`.
+     */
+    static std::string client_category_of(std::string_view address) {
+      sys::error_code ec;
+      asio::ip::make_address(address, ec);
+      if (ec) {
+        return "wan";
       }
 
-      return result;
+      switch (net::from_address(address)) {
+        case net::PC:
+          return "local";
+        case net::LAN:
+          return "lan";
+        default:
+          return "wan";
+      }
     }
 
     /**
@@ -2458,10 +2462,15 @@ namespace stream {
       auto session = std::make_shared<session_t>();
 
       session->started = std::chrono::system_clock::now();
-      session->app_id = launch_session.appid;
-      session->peer_address = peer_address;
-      session->client_name = launch_session.client_name;
-      session->client_uuid = nvhttp::get_uuid_by_cert(launch_session.client_cert);
+
+      // The peer address is used only to derive the session list fields; it is not stored.
+      const auto is_ipv6 = [&]() {
+        sys::error_code ec;
+        const auto address = asio::ip::make_address(peer_address, ec);
+        return !ec && address.is_v6() && !address.to_v6().is_v4_mapped();
+      }();
+      session->transport = is_ipv6 ? "udp/ipv6" : "udp/ipv4";
+      session->client_category = client_category_of(peer_address);
 
       auto mail = std::make_shared<safe::mail_raw_t>();
 

@@ -717,7 +717,7 @@ namespace rtsp_stream {
     bool close(std::uint32_t id) {
       auto lg = _session_slots.lock();
       for (const auto &slot : *_session_slots) {
-        if (stream::session::describe(*slot).id == id) {
+        if (stream::session::id(*slot) == id) {
           stream::session::stop(*slot, stream::stop_reason_e::api_close);
           return true;
         }

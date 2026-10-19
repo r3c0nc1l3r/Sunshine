@@ -98,9 +98,13 @@ curl -u user:pass -H "X-CSRF-Token: your_token_here" \
 @copydoc confighttp::restart()
 
 ## GET /api/sessions
+Lists active streaming sessions with `id`, `started` (Unix seconds), `transport` (`udp/ipv4` or `udp/ipv6`) and
+`client_category` (`local`, `lan` or `wan`). Admin authentication is required; no client names, addresses or keys are returned.
 @copydoc confighttp::getSessions()
 
 ## POST /api/sessions/{id}/close
+Ends one session through the normal stop path. Admin authentication is required, and cross-origin requests need a CSRF
+token. Every accepted request is logged at Info with the admin user, source address and result.
 @copydoc confighttp::closeSession()
 
 ## GET /api/virtual-input/status

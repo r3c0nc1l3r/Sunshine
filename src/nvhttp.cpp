@@ -1797,19 +1797,6 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Get the UUID of a paired client by its certificate.
-   */
-  std::string get_uuid_by_cert(const std::string_view cert) {
-    std::lock_guard lock {client_auth_mutex()};
-    for (const auto &named_cert : client_root.named_devices) {
-      if (named_cert.cert == cert) {
-        return named_cert.uuid;
-      }
-    }
-    return {};
-  }
-
-  /**
    * @brief Check whether a paired client certificate is allowed to connect and return its friendly name.
    */
   std::pair<bool, std::string> get_client_status(const std::string_view cert_pem) {

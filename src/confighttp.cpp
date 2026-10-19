@@ -1410,27 +1410,33 @@ namespace confighttp {
   /**
    * @brief Convert a session description to the JSON object returned by `GET /api/sessions`.
    * @param info Session description.
-   * @return Object with the public session fields; `started` is Unix seconds.
+   * @return Object with exactly `id`, `started` (Unix seconds), `transport` and `client_category`.
    */
   nlohmann::json session_info_to_json(const rtsp_stream::session_info_t &info) {
     nlohmann::json output;
     output["id"] = info.id;
-    output["client_name"] = info.client_name;
-    output["client_uuid"] = info.client_uuid;
-    output["peer_address"] = info.peer_address;
-    output["app_id"] = info.app_id;
     output["started"] = std::chrono::duration_cast<std::chrono::seconds>(info.started.time_since_epoch()).count();
-    output["width"] = info.width;
-    output["height"] = info.height;
-    output["fps"] = info.fps;
-    output["video_format"] = info.video_format;
-    output["dynamic_range"] = info.dynamic_range;
-    output["state"] = info.state;
+    output["transport"] = info.transport;
+    output["client_category"] = info.client_category;
     return output;
   }
 
   /**
+   * @brief Log one session close request made through the API.
+   * @param id Session id as logged; for `bad-id`, the sanitised input.
+   * @param source Normalized address of the client that made the request.
+   * @param result `closed`, `not-found` or `bad-id`.
+   */
+  void log_session_close(const std::string &id, const std::string &source, std::string_view result) {
+    BOOST_LOG(info) << "Session close requested via API: id="sv << id << ", user="sv << config::sunshine.username << ", source="sv << source << ", result="sv << result;
+  }
+
+  /**
    * @brief List the active streaming sessions.
+   *
+   * Requires admin authentication, like the other API calls. Returns only `id`, `started`, `transport` and
+   * `client_category` for each session.
+   *
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    *
@@ -1456,6 +1462,11 @@ namespace confighttp {
 
   /**
    * @brief Close one streaming session through the normal stop path.
+   *
+   * Requires admin authentication and, for cross-origin requests, a valid CSRF token. Every accepted request is
+   * logged at Info with the admin user, the client address and the result (`closed`, `not-found` or `bad-id`).
+   * The log line never contains credentials or the CSRF token.
+   *
    * @param response The HTTP response object.
    * @param request The HTTP request object; `path_match[1]` is the session id.
    *
@@ -1473,15 +1484,26 @@ namespace confighttp {
 
     print_req(request);
 
+    const auto source = net::addr_to_normalized_string(request->remote_endpoint().address());
     const std::string id_text = request->path_match[1];
     std::uint32_t session_id = 0;
     const auto [end, ec] = std::from_chars(id_text.data(), id_text.data() + id_text.size(), session_id);
     if (ec != std::errc {} || end != id_text.data() + id_text.size()) {
+      // Keep the logged id short and free of anything but digits.
+      std::string logged_id;
+      for (const char c : id_text.substr(0, 32)) {
+        if (c >= '0' && c <= '9') {
+          logged_id += c;
+        }
+      }
+      log_session_close(logged_id, source, "bad-id"sv);
       bad_request(response, request, "Session id must be a 32-bit unsigned number");
       return;
     }
 
-    if (!rtsp_stream::request_session_close(session_id)) {
+    const bool closed = rtsp_stream::request_session_close(session_id);
+    log_session_close(std::to_string(session_id), source, closed ? "closed"sv : "not-found"sv);
+    if (!closed) {
       not_found(response, request, "Session not found");
       return;
     }

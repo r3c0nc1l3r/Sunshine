@@ -59,7 +59,8 @@ namespace stream {
      *
      * @param config Configuration values to apply.
      * @param launch_session Launch session.
-     * @param peer_address Client address as seen by the RTSP server, shown in the session list.
+     * @param peer_address Client address as seen by the RTSP server. It is used only to derive the session's
+     *                     `transport` and `client_category`; the address itself is not stored.
      * @return Allocated object or identifier, or an error value on failure.
      */
     std::shared_ptr<session_t> alloc(config_t &config, rtsp_stream::launch_session_t &launch_session, std::string_view peer_address = {});
@@ -94,9 +95,18 @@ namespace stream {
      */
     stop_reason_e stop_reason(const session_t &session);
     /**
-     * @brief Describe a session for the web UI.
+     * @brief Get the launch session id of a session.
      *
-     * Safe to call from any thread: it reads only immutable fields and atomics.
+     * Safe to call from any thread: it reads only an immutable field.
+     *
+     * @param session Streaming session.
+     * @return Launch session id.
+     */
+    std::uint32_t id(const session_t &session);
+    /**
+     * @brief Describe a session for the session list.
+     *
+     * Safe to call from any thread: it reads only immutable fields and the start time.
      *
      * @param session Streaming session to describe.
      * @return Public description of the session.
