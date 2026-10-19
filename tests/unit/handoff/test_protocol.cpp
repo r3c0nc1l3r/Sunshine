@@ -57,7 +57,9 @@ namespace {
     proto::probe_results_t probe;
     probe.hevc_mode = 2;
     probe.av1_mode = 3;
-    probe.yuv444 = true;
+    probe.yuv444_h264 = true;
+    probe.yuv444_hevc = false;
+    probe.yuv444_av1 = true;
     hello.probe = probe;
     proto::probe_identity_t identity;
     identity.build_id = "build-1";
@@ -329,7 +331,10 @@ TEST(HandoffProtocolTest, EncodePopulatedHelloUsesFieldNames) {
     << "capabilities must be a JSON array of strings.";
   EXPECT_EQ(json.at("probe").at("hevc_mode"), 2) << "probe must be an object with hevc_mode.";
   EXPECT_EQ(json.at("probe").at("av1_mode"), 3) << "probe must be an object with av1_mode.";
-  EXPECT_EQ(json.at("probe").at("yuv444"), true) << "probe must be an object with yuv444.";
+  EXPECT_EQ(json.at("probe").at("yuv444_h264"), true) << "probe must be an object with yuv444_h264.";
+  EXPECT_EQ(json.at("probe").at("yuv444_hevc"), false) << "probe must be an object with yuv444_hevc.";
+  EXPECT_EQ(json.at("probe").at("yuv444_av1"), true) << "probe must be an object with yuv444_av1.";
+  EXPECT_FALSE(json.at("probe").contains("yuv444")) << "The old single yuv444 member must not be encoded.";
   EXPECT_EQ(json.at("identity").at("build_id"), "build-1") << "identity must be an object with build_id.";
   EXPECT_EQ(json.at("identity").at("render_node"), "/dev/dri/renderD128") << "identity must have render_node.";
   EXPECT_EQ(json.at("identity").at("vendor_id"), 4098) << "identity must have vendor_id.";
@@ -526,7 +531,7 @@ TEST(HandoffProtocolTest, DecodeHandWrittenPong) {
 TEST(HandoffProtocolTest, DecodeHandWrittenFullHello) {
   const std::string payload = R"({
       "type":"HELLO","major":1,"minor":0,"capabilities":["feature-a"],
-      "probe":{"hevc_mode":1,"av1_mode":0,"yuv444":false},
+      "probe":{"hevc_mode":1,"av1_mode":0,"yuv444_h264":false,"yuv444_hevc":true,"yuv444_av1":false},
       "identity":{"build_id":"b","render_node":"/dev/dri/renderD128","vendor_id":4098,"device_id":5,"driver_version":"550.1"},
       "cooldown_deadline_ns":42
     })";
@@ -535,7 +540,9 @@ TEST(HandoffProtocolTest, DecodeHandWrittenFullHello) {
   proto::probe_results_t probe;
   probe.hevc_mode = 1;
   probe.av1_mode = 0;
-  probe.yuv444 = false;
+  probe.yuv444_h264 = false;
+  probe.yuv444_hevc = true;
+  probe.yuv444_av1 = false;
   expected.probe = probe;
   proto::probe_identity_t identity;
   identity.build_id = "b";
@@ -1120,5 +1127,131 @@ TEST(HandoffProtocolTest, GoSnapshotDigestValidIsAccepted) {
   ASSERT_NE(go, nullptr) << "A GO must decode to go_t.";
   ASSERT_TRUE(go->app.has_value()) << "The GO carries an app snapshot.";
   EXPECT_EQ(go->app->digest, kDigest) << "A 64-character lowercase digest must decode unchanged.";
+}
+
+// ---- Encoder probe results carried by HELLO ----------------------------------------------------------------------
+
+/**
+ * @brief Build a probe JSON object with the three yuv444 flags and the two modes.
+ * @param hevc HEVC mode value.
+ * @param av1 AV1 mode value.
+ * @return JSON object for the `probe` member.
+ */
+static nlohmann::json probe_json(const nlohmann::json &hevc, const nlohmann::json &av1) {
+  return nlohmann::json {
+    {"hevc_mode", hevc},
+    {"av1_mode", av1},
+    {"yuv444_h264", false},
+    {"yuv444_hevc", false},
+    {"yuv444_av1", false},
+  };
+}
+
+/**
+ * @brief Build a complete HELLO payload around a probe object.
+ * @param probe Value of the `probe` member.
+ * @return HELLO payload text.
+ */
+static std::string hello_with_probe(const nlohmann::json &probe) {
+  return dump({{"type", "HELLO"}, {"major", 1}, {"minor", 0}, {"capabilities", nlohmann::json::array()}, {"probe", probe}});
+}
+
+/**
+ * @brief Each of the eight combinations of the three yuv444 flags round-trips on its own.
+ */
+TEST(HandoffProtocolTest, RoundTripProbeYuv444FlagsIndependently) {
+  for (int bits = 0; bits < 8; ++bits) {
+    proto::hello_t hello;
+    proto::probe_results_t probe;
+    probe.hevc_mode = 4;
+    probe.av1_mode = 5;
+    probe.yuv444_h264 = (bits & 1) != 0;
+    probe.yuv444_hevc = (bits & 2) != 0;
+    probe.yuv444_av1 = (bits & 4) != 0;
+    hello.probe = probe;
+    SCOPED_TRACE(bits);
+    proto::message_t decoded;
+    ASSERT_EQ(proto::decode(proto::encode(hello), decoded), proto::decode_status_e::ok)
+      << "HELLO with yuv444 flags " << bits << " must decode.";
+    EXPECT_EQ(decoded, proto::message_t {hello}) << "The yuv444 flag combination " << bits << " must round-trip unchanged.";
+  }
+}
+
+/**
+ * @brief HEVC and AV1 modes 4 and 5 (the 4:4:4 variants) are accepted.
+ */
+TEST(HandoffProtocolTest, ProbeModesFourAndFiveAreAccepted) {
+  for (const int mode : {0, 1, 2, 3, 4, 5}) {
+    SCOPED_TRACE(mode);
+    proto::message_t message;
+    EXPECT_EQ(proto::decode(hello_with_probe(probe_json(mode, mode)), message), proto::decode_status_e::ok)
+      << "hevc_mode and av1_mode " << mode << " must be accepted (range 0 to 5).";
+  }
+}
+
+/**
+ * @brief A mode of 6 is out of range for both HEVC and AV1 and is malformed.
+ */
+TEST(HandoffProtocolTest, ProbeModeSixIsMalformed) {
+  expect_malformed(hello_with_probe(probe_json(6, 0)));
+  expect_malformed(hello_with_probe(probe_json(0, 6)));
+}
+
+/**
+ * @brief A mode of -1 is out of range for both HEVC and AV1 and is malformed.
+ */
+TEST(HandoffProtocolTest, ProbeModeNegativeOneIsMalformed) {
+  expect_malformed(hello_with_probe(probe_json(-1, 0)));
+  expect_malformed(hello_with_probe(probe_json(0, -1)));
+}
+
+/**
+ * @brief The old single `yuv444` member, with none of the three new flags, is malformed.
+ */
+TEST(HandoffProtocolTest, OldSingleYuv444MemberIsMalformed) {
+  expect_malformed(R"({"type":"HELLO","major":1,"minor":0,"capabilities":[],)"
+                   R"("probe":{"hevc_mode":1,"av1_mode":0,"yuv444":false}})");
+}
+
+/**
+ * @brief Each of the three yuv444 flags must be present: a missing flag is malformed.
+ */
+TEST(HandoffProtocolTest, MissingYuv444FlagIsMalformed) {
+  for (const std::string flag : {"yuv444_h264", "yuv444_hevc", "yuv444_av1"}) {
+    SCOPED_TRACE(flag);
+    auto probe = probe_json(1, 1);
+    probe.erase(flag);
+    expect_malformed(hello_with_probe(probe));
+  }
+}
+
+/**
+ * @brief Each of the three yuv444 flags must be a boolean: a number, a string or null is malformed.
+ */
+TEST(HandoffProtocolTest, NonBooleanYuv444FlagIsMalformed) {
+  for (const std::string flag : {"yuv444_h264", "yuv444_hevc", "yuv444_av1"}) {
+    for (const nlohmann::json &bad : {nlohmann::json(1), nlohmann::json("true"), nlohmann::json(nullptr)}) {
+      SCOPED_TRACE(flag + " = " + bad.dump());
+      auto probe = probe_json(1, 1);
+      probe[flag] = bad;
+      expect_malformed(hello_with_probe(probe));
+    }
+  }
+}
+
+/**
+ * @brief A complete probe with valid modes and all three flags decodes.
+ */
+TEST(HandoffProtocolTest, CompleteProbeWithAllFlagsDecodes) {
+  auto probe = probe_json(5, 4);
+  probe["yuv444_hevc"] = true;
+  proto::probe_results_t expected;
+  expected.hevc_mode = 5;
+  expected.av1_mode = 4;
+  expected.yuv444_hevc = true;
+  proto::hello_t hello;
+  hello.probe = expected;
+  EXPECT_EQ(decode_ok(hello_with_probe(probe)), proto::message_t {hello})
+    << "A probe with modes 5 and 4 and the yuv444_hevc flag set must decode unchanged.";
 }
 #endif
