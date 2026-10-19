@@ -344,6 +344,13 @@ namespace nvhttp {
    * @return PEM certificate for the paired client, or an empty string when unknown.
    */
   std::string get_cert_by_uuid(std::string_view uuid);
+  /**
+   * @brief Get the UUID of a paired client by its certificate.
+   *
+   * @param cert PEM certificate of the paired client.
+   * @return UUID of the paired client, or an empty string when the certificate is unknown.
+   */
+  std::string get_uuid_by_cert(std::string_view cert);
 
   /**
    * @brief Get all paired clients.

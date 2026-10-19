@@ -29,9 +29,11 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
 #include "stream.h"
+#include "stream_liveness.h"
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
@@ -347,6 +349,16 @@ namespace stream {
    */
   using message_queue_queue_t = std::shared_ptr<safe::queue_t<std::tuple<socket_e, av_session_id_t, message_queue_t>>>;
 
+  /**
+   * @brief Media-ping liveness of one session, shared between the UDP receive thread and the control thread.
+   */
+  struct media_ping_t {
+    std::mutex mutex;  ///< Guards `liveness`; held only for the duration of one `on_ping()` or `expired()` call.
+    liveness::media_liveness_t liveness;  ///< Tracker of the client's periodic video and audio pings.
+  };
+
+  using media_ping_registry_t = sync_util::sync_t<std::map<av_session_id_t, std::shared_ptr<media_ping_t>>>;  ///< Running sessions' media-ping state, keyed like the ping message queues.
+
   // return bytes written on success
   // return -1 on error
   static inline int encode_audio(bool encrypted, const audio::buffer_t &plaintext, uint8_t *destination, crypto::aes_t &iv, crypto::cipher::cbc_t &cbc) {
@@ -475,6 +487,8 @@ namespace stream {
     std::jthread audio_thread;  ///< Thread that sends encoded audio packets.
     std::jthread control_thread;  ///< Thread that runs the ENet control server.
 
+    media_ping_registry_t media_pings;  ///< Media-ping state of started sessions; the UDP receive thread records post-start pings here.
+
     asio::io_context io_context;  ///< Asio context used by the UDP broadcast sockets.
 
     udp::socket video_sock {io_context};  ///< UDP socket bound for video packet transmission.
@@ -497,6 +511,17 @@ namespace stream {
     std::jthread videoThread;  ///< Video thread.
 
     std::chrono::steady_clock::time_point pingTimeout;  ///< Deadline for receiving the next client ping.
+    std::chrono::steady_clock::time_point last_enet_ping;  ///< Time of the last explicit ENet ping; touched only by the control broadcast thread.
+
+    std::shared_ptr<media_ping_t> media_ping {std::make_shared<media_ping_t>()};  ///< Post-start video and audio ping tracking, shared with the broadcast context registry.
+    std::atomic<stop_reason_e> stop_reason {stop_reason_e::unknown};  ///< First reason recorded for ending the session.
+
+    // Immutable after `session::alloc()`, so they may be read from any thread.
+    std::chrono::system_clock::time_point started;  ///< Time the session was created.
+    int app_id {0};  ///< Id of the launched app.
+    std::string peer_address;  ///< Client address as seen by the RTSP server.
+    std::string client_name;  ///< Name of the paired client, or empty.
+    std::string client_uuid;  ///< UUID of the paired client, or empty.
 
     safe::shared_t<broadcast_ctx_t>::ptr_t broadcast_ref;  ///< Shared broadcast context retained while the session is active.
 
@@ -774,12 +799,15 @@ namespace stream {
           break;
         case ENET_EVENT_TYPE_CONNECT:
           BOOST_LOG(info) << "CLIENT CONNECTED"sv;
+          liveness::configure_peer(event.peer, config::stream.ping_timeout);
           break;
         case ENET_EVENT_TYPE_DISCONNECT:
           BOOST_LOG(info) << "CLIENT DISCONNECTED"sv;
           // No more clients to send video data to ^_^
+          // ENet reports a timed out peer and a client-initiated disconnect identically (event data 0, state
+          // already reset), so both are recorded as a disconnect.
           if (session->state == session::state_e::RUNNING) {
-            session::stop(*session);
+            session::stop(*session, stop_reason_e::disconnect);
           }
           break;
         case ENET_EVENT_TYPE_NONE:
@@ -1224,7 +1252,7 @@ namespace stream {
 
         BOOST_LOG(error) << "Failed to verify tag"sv;
 
-        session::stop(*session);
+        session::stop(*session, stop_reason_e::protocol_error);
         return;
       }
 
@@ -1279,7 +1307,7 @@ namespace stream {
 
         BOOST_LOG(error) << "Failed to verify tag"sv;
 
-        session::stop(*session);
+        session::stop(*session, stop_reason_e::protocol_error);
         return;
       }
 
@@ -1288,7 +1316,7 @@ namespace stream {
 
       if (type == packetTypes[IDX_ENCRYPTED]) {
         BOOST_LOG(error) << "Bad packet type [IDX_ENCRYPTED] found"sv;
-        session::stop(*session);
+        session::stop(*session, stop_reason_e::protocol_error);
         return;
       }
 
@@ -1329,7 +1357,22 @@ namespace stream {
           if (now > session->pingTimeout) {
             auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
             BOOST_LOG(info) << address << ": Ping Timeout"sv;
-            session::stop(*session);
+            session::stop(*session, stop_reason_e::ping_timeout);
+          }
+
+          // The client may keep the control stream alive while no longer sending its video/audio pings
+          if (session->state.load(std::memory_order_acquire) == session::state_e::RUNNING) {
+            bool media_expired;
+            {
+              std::lock_guard media_lg {session->media_ping->mutex};
+              media_expired = session->media_ping->liveness.expired(now, config::stream.ping_timeout);
+            }
+
+            if (media_expired) {
+              auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
+              BOOST_LOG(info) << address << ": Media Ping Timeout"sv;
+              session::stop(*session, stop_reason_e::media_ping_timeout);
+            }
           }
 
           if (session->state.load(std::memory_order_acquire) == session::state_e::STOPPING) {
@@ -1354,6 +1397,8 @@ namespace stream {
           if (!session->control.peer) {
             has_session_awaiting_peer = true;
           } else {
+            liveness::tick(session->control.peer, now, session->last_enet_ping);
+
             auto &feedback_queue = session->control.feedback_queue;
             while (feedback_queue->peek()) {
               auto feedback_msg = feedback_queue->pop();
@@ -1407,6 +1452,9 @@ namespace stream {
           BOOST_LOG(warning) << "Couldn't send termination code to ["sv << addr << ':' << port << ']';
         }
       }
+
+      auto expected_reason = stop_reason_e::unknown;
+      session->stop_reason.compare_exchange_strong(expected_reason, stop_reason_e::terminated);
 
       session->shutdown_event->raise(true);
       session->controlEnd.raise(true);
@@ -1482,6 +1530,31 @@ namespace stream {
         if (ec || !bytes) {
           BOOST_LOG(error) << "Couldn't receive data from udp socket: "sv << ec.message();
           return;
+        }
+
+        // Record post-start pings; the message queues below only serve the initial ping.
+        {
+          std::optional<av_session_id_t> media_id;
+          if (bytes == 4) {
+            media_id = peer.address();
+          } else if (bytes >= sizeof(SS_PING)) {
+            auto ping = (PSS_PING) buf[buf_elem].data();
+            media_id = std::string {ping->payload, sizeof(ping->payload)};
+          }
+
+          std::shared_ptr<media_ping_t> media_ping;
+          if (media_id) {
+            auto lg = ctx.media_pings.lock();
+            auto it = ctx.media_pings->find(*media_id);
+            if (it != ctx.media_pings->end()) {
+              media_ping = it->second;
+            }
+          }
+
+          if (media_ping) {
+            std::lock_guard media_lg {media_ping->mutex};
+            media_ping->liveness.on_ping(std::chrono::steady_clock::now());
+          }
         }
 
         if (bytes == 4) {
@@ -2139,6 +2212,7 @@ namespace stream {
     auto ref = broadcast.ref();
     auto error = recv_ping(session, ref, socket_e::video, session->video.ping_payload, session->video.peer, config::stream.ping_timeout);
     if (error < 0) {
+      session::stop(*session, stop_reason_e::initial_ping_timeout);
       return;
     }
 
@@ -2166,6 +2240,7 @@ namespace stream {
     auto ref = broadcast.ref();
     auto error = recv_ping(session, ref, socket_e::audio, session->audio.ping_payload, session->audio.peer, config::stream.ping_timeout);
     if (error < 0) {
+      session::stop(*session, stop_reason_e::initial_ping_timeout);
       return;
     }
 
@@ -2206,6 +2281,57 @@ namespace stream {
       }
 
       session.shutdown_event->raise(true);
+    }
+
+    /**
+     * @brief Stop a streaming session and record why it ended.
+     */
+    void stop(session_t &session, stop_reason_e reason) {
+      auto expected = stop_reason_e::unknown;
+      session.stop_reason.compare_exchange_strong(expected, reason);
+      stop(session);
+    }
+
+    /**
+     * @brief Get the reason recorded for the end of a session.
+     */
+    stop_reason_e stop_reason(const session_t &session) {
+      return session.stop_reason.load();
+    }
+
+    /**
+     * @brief Describe a session for the web UI.
+     */
+    rtsp_stream::session_info_t describe(const session_t &session) {
+      rtsp_stream::session_info_t result;
+      result.id = session.launch_session_id;
+      result.client_name = session.client_name;
+      result.client_uuid = session.client_uuid;
+      result.peer_address = session.peer_address;
+      result.app_id = session.app_id;
+      result.started = session.started;
+      result.width = session.config.monitor.width;
+      result.height = session.config.monitor.height;
+      result.fps = session.config.monitor.framerate;
+      result.video_format = session.config.monitor.videoFormat;
+      result.dynamic_range = session.config.monitor.dynamicRange;
+
+      switch (session.state.load(std::memory_order_acquire)) {
+        case state_e::STOPPED:
+          result.state = "stopped";
+          break;
+        case state_e::STOPPING:
+          result.state = "stopping";
+          break;
+        case state_e::STARTING:
+          result.state = "starting";
+          break;
+        case state_e::RUNNING:
+          result.state = "running";
+          break;
+      }
+
+      return result;
     }
 
     /**
@@ -2256,6 +2382,18 @@ namespace stream {
         platf::streaming_will_stop();
       }
 
+      // Stop receiving media pings for this session. Only remove entries that still belong to it.
+      if (session.broadcast_ref) {
+        auto lg = session.broadcast_ref->media_pings.lock();
+        for (auto it = session.broadcast_ref->media_pings->begin(); it != session.broadcast_ref->media_pings->end();) {
+          if (it->second == session.media_ping) {
+            it = session.broadcast_ref->media_pings->erase(it);
+          } else {
+            ++it;
+          }
+        }
+      }
+
       BOOST_LOG(debug) << "Session ended"sv;
     }
 
@@ -2272,6 +2410,15 @@ namespace stream {
 
       session.control.expected_peer_address = addr_string;
       BOOST_LOG(debug) << "Expecting incoming session connections from "sv << addr_string;
+
+      // Route the client's post-start video and audio pings to this session
+      {
+        auto lg = session.broadcast_ref->media_pings.lock();
+        if (!(session.config.mlFeatureFlags & ML_FF_SESSION_ID_V1)) {
+          session.broadcast_ref->media_pings->emplace(boost::asio::ip::make_address(addr_string), session.media_ping);
+        }
+        session.broadcast_ref->media_pings->emplace(std::string {session.video.ping_payload}, session.media_ping);
+      }
 
       // Insert this session into the session list
       {
@@ -2307,8 +2454,14 @@ namespace stream {
     /**
      * @brief Allocate and initialize platform input state for a stream.
      */
-    std::shared_ptr<session_t> alloc(config_t &config, rtsp_stream::launch_session_t &launch_session) {
+    std::shared_ptr<session_t> alloc(config_t &config, rtsp_stream::launch_session_t &launch_session, std::string_view peer_address) {
       auto session = std::make_shared<session_t>();
+
+      session->started = std::chrono::system_clock::now();
+      session->app_id = launch_session.appid;
+      session->peer_address = peer_address;
+      session->client_name = launch_session.client_name;
+      session->client_uuid = nvhttp::get_uuid_by_cert(launch_session.client_cert);
 
       auto mail = std::make_shared<safe::mail_raw_t>();
 
