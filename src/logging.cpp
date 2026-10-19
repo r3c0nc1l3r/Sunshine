@@ -6,14 +6,12 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <memory>
-#include <mutex>
-#include <utility>
 
 // lib includes
 #include <boost/core/null_deleter.hpp>
 #include <boost/format.hpp>
 #include <boost/log/attributes/clock.hpp>
+#include <boost/log/attributes/mutable_constant.hpp>
 #include <boost/log/common.hpp>
 #include <boost/log/expressions.hpp>
 #include <boost/log/sinks.hpp>
@@ -52,18 +50,20 @@ bl::sources::severity_logger<int> tests {10};  ///< Automatic tests output.
 
 BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", int)
 
-namespace {
-  std::mutex process_tag_mutex;  ///< Guards `process_tag_value`. Held only for a pointer copy or swap.
-  std::shared_ptr<const std::string> process_tag_value;  ///< Current process tag; null when none is set.
+BOOST_LOG_ATTRIBUTE_KEYWORD(process_tag_keyword, "ProcessTag", std::string)
 
+namespace {
   /**
-   * @brief Take a snapshot of the current process tag.
+   * @brief The process tag as a global Boost.Log attribute.
    *
-   * @return Shared pointer to the tag without brackets, or null when no tag is set.
+   * Boost.Log takes a snapshot of every attribute value when a record is created, so the tag is fixed at the
+   * log call even though the asynchronous sink formats the record later. The attribute is thread-safe.
+   *
+   * @return Reference to the process-wide tag attribute.
    */
-  std::shared_ptr<const std::string> current_process_tag() {
-    std::lock_guard lock {process_tag_mutex};
-    return process_tag_value;
+  bl::attributes::mutable_constant<std::string> &process_tag_attribute() {
+    static bl::attributes::mutable_constant<std::string> attribute {std::string {}};
+    return attribute;
   }
 }  // namespace
 
@@ -79,22 +79,11 @@ namespace logging {
   }
 
   void set_process_tag(std::string tag) {
-    std::shared_ptr<const std::string> value;
-    if (!tag.empty()) {
-      value = std::make_shared<const std::string>(std::move(tag));
-    }
-
-    // Swap under the lock and let the previous tag be released outside it.
-    std::shared_ptr<const std::string> previous;
-    {
-      std::lock_guard lock {process_tag_mutex};
-      previous = std::exchange(process_tag_value, std::move(value));
-    }
+    process_tag_attribute().set(std::move(tag));
   }
 
   std::string process_tag() {
-    const auto tag = current_process_tag();
-    return tag ? *tag : std::string {};
+    return process_tag_attribute().get();
   }
 
   /**
@@ -141,13 +130,13 @@ namespace logging {
     auto t = std::chrono::system_clock::to_time_t(now);
     auto lt = *std::localtime(&t);
 
-    // Read the tag once per record so the whole line uses one consistent value.
-    const auto tag = current_process_tag();
+    // The tag was captured when the record was created, so this is the value at the log call.
+    const auto tag = view.attribute_values()[process_tag_keyword];
 
     os << "["sv << std::put_time(&lt, "%Y-%m-%d %H:%M:%S.") << boost::format("%03u") % ms.count() << "]: "sv
        << log_type;
-    if (tag) {
-      os << '[' << *tag << "] "sv;
+    if (tag && !tag.get().empty()) {
+      os << '[' << tag.get() << "] "sv;
     }
     os << view.attribute_values()[message].extract<std::string>();
   }
@@ -223,6 +212,9 @@ namespace logging {
 
     // Always append, so a process that shares the file with its predecessor never overwrites its data.
     sink->locked_backend()->add_stream(boost::make_shared<std::ofstream>(log_file, std::ios::app));
+
+    // Records created from now on carry the process tag. Adding it again is a no-op.
+    bl::core::get()->add_global_attribute(process_tag_keyword.get_name(), process_tag_attribute());
     sink->set_filter(severity >= min_log_level);
     sink->set_formatter(&formatter);
 
