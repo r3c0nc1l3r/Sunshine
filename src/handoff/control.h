@@ -203,6 +203,8 @@ namespace handoff {
     std::thread _thread;  ///< Server thread.
     handler_t _handler;  ///< Verb handler.
     bool _stopped {false};  ///< `stop()` was called.
+    dev_t _bound_dev {0};  ///< Device of the socket file this server bound (for `close_listener()`).
+    ino_t _bound_ino {0};  ///< Inode of the socket file this server bound; 0 when none.
     mutable std::mutex _mutex;  ///< Guards the members above.
   };
 }  // namespace handoff
