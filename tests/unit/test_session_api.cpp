@@ -170,6 +170,21 @@ namespace {
     }
     return false;
   }
+
+  /**
+   * @brief Count how many times a fragment occurs in a text.
+   *
+   * @param text Text to search.
+   * @param needle Substring to count.
+   * @return Number of non-overlapping occurrences.
+   */
+  std::size_t count_occurrences(const std::string &text, const std::string &needle) {
+    std::size_t count = 0;
+    for (auto pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + needle.size())) {
+      ++count;
+    }
+    return count;
+  }
 }  // namespace
 
 /**
@@ -343,19 +358,8 @@ protected:
       confighttp::getCSRFToken(response, request);
     };
 
-    server->resource["^/api/sessions$"]["GET"] = [](
-                                             const std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> &response,
-                                             const std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> &request
-                                           ) {
-      confighttp::getSessions(response, request);
-    };
-
-    server->resource["^/api/sessions/([0-9]+)/close$"]["POST"] = [](
-                                                                  const std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> &response,
-                                                                  const std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> &request
-                                                                ) {
-      confighttp::closeSession(response, request);
-    };
+    // Production route table for the session API (GET /api/sessions, POST /api/sessions/<id>/close).
+    confighttp::register_session_routes(*server);
 
     server_thread = std::jthread([this]() {
       server->start([this](const unsigned short assigned_port) {
@@ -419,6 +423,34 @@ protected:
     EXPECT_EQ(response->status_code, "200 OK");
     const nlohmann::json json = nlohmann::json::parse(response->content.string());
     return json["csrf_token"].get<std::string>();
+  }
+
+  /**
+   * @brief Send an authenticated, cross-origin close for id 4243 with no CSRF token.
+   *
+   * The API logs this request as `result=csrf-rejected`, so it works as a marker: a negative test can check
+   * that the log sink is live and that no other close request was logged.
+   */
+  void send_marker_close() {
+    SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+    headers.emplace("Origin", "https://example.invalid");
+
+    const auto response = client->request("POST", "/api/sessions/4243/close", "", headers);
+    EXPECT_EQ(response->status_code, "400 Bad Request");
+  }
+
+  /**
+   * @brief Check that the only close request logged since an offset is the marker from `send_marker_close()`.
+   *
+   * @param offset Byte offset of the log taken before the action under test.
+   */
+  void expect_only_marker_close_logged(std::uintmax_t offset) {
+    const std::string logged = test_log_since(offset);
+    ASSERT_FALSE(logged.empty()) << "No log text captured from " << TEST_LOG_FILE << "; the log sink is not where the test expects it";
+    EXPECT_TRUE(has_line_with_all(logged, {"Session close requested via API: id=4243", "result=csrf-rejected"}))
+      << "The marker close line is missing from the log; the sink or the audit line is broken";
+    EXPECT_EQ(count_occurrences(logged, "Session close requested via API"), 1U)
+      << "A close request other than the marker was logged";
   }
 };
 
@@ -558,9 +590,124 @@ TEST_F(SessionApiHttpTest, CloseSessionUnknownIdIsAuditLogged) {
   ASSERT_EQ(response->status_code, "404 Not Found");
 
   const std::string logged = test_log_since(offset);
+  ASSERT_FALSE(logged.empty()) << "No log text captured from " << TEST_LOG_FILE << "; the log sink is not where the test expects it";
   EXPECT_TRUE(has_line_with_all(
     logged,
-    {"Session close requested via API: id=4242", "result=not-found", "user=testuser"}
+    {"Session close requested via API: id=4242", "result=not-found", "user=testuser", "source="}
+  ));
+  EXPECT_EQ(logged.find("testpass"), std::string::npos);
+}
+
+/**
+ * @brief Test: GET /api/sessions from a disallowed origin address is rejected with 403.
+ *
+ * Skipped: the test client connects from the loopback address, and no existing test in test_confighttp.cpp makes
+ * `config::nvhttp.origin_web_ui_allowed` reject it. Making the loopback client disallowed needs the config values
+ * for that setting, which the spec does not give.
+ */
+TEST_F(SessionApiHttpTest, GetSessionsRejectsDisallowedOriginAddress) {
+  GTEST_SKIP() << "Loopback test client cannot be made a disallowed origin; test_confighttp.cpp has no such test";
+}
+
+/**
+ * @brief Test: POST /api/sessions/<id>/close from a disallowed origin address is rejected with 403.
+ *
+ * Skipped for the same reason as `GetSessionsRejectsDisallowedOriginAddress`.
+ */
+TEST_F(SessionApiHttpTest, CloseSessionRejectsDisallowedOriginAddress) {
+  GTEST_SKIP() << "Loopback test client cannot be made a disallowed origin; test_confighttp.cpp has no such test";
+}
+
+/**
+ * @brief Test: with no admin user configured, GET /api/sessions redirects instead of listing sessions.
+ */
+TEST_F(SessionApiHttpTest, GetSessionsWithoutAdminUserRedirects) {
+  config::sunshine.username = "";
+  config::sunshine.password = "";
+
+  const auto response = client->request("GET", "/api/sessions", "");
+
+  EXPECT_NE(response->status_code, "200 OK");
+  ASSERT_EQ(response->status_code, "307 Temporary Redirect");
+  EXPECT_NE(response->header.find("Location"), response->header.end());
+}
+
+/**
+ * @brief Test: with no admin user configured, POST close redirects, does nothing and logs no close line.
+ */
+TEST_F(SessionApiHttpTest, CloseSessionWithoutAdminUserRedirectsAndIsNotLogged) {
+  config::sunshine.username = "";
+  config::sunshine.password = "";
+
+  const std::uintmax_t offset = test_log_size();
+  const auto response = client->request("POST", "/api/sessions/4242/close", "");
+
+  EXPECT_NE(response->status_code, "200 OK");
+  ASSERT_EQ(response->status_code, "307 Temporary Redirect");
+  EXPECT_NE(response->header.find("Location"), response->header.end());
+  EXPECT_EQ(count_occurrences(test_log_since(offset), "Session close requested via API"), 0U);
+}
+
+/**
+ * @brief Test: POST /api/sessions (wrong method on the list path) is not served and logs no close line.
+ */
+TEST_F(SessionApiHttpTest, PostToSessionsListIsNotServed) {
+  const std::uintmax_t offset = test_log_size();
+
+  const auto response = client->request("POST", "/api/sessions", "", auth_headers());
+
+  EXPECT_NE(response->status_code, "200 OK");
+  send_marker_close();
+  expect_only_marker_close_logged(offset);
+}
+
+/**
+ * @brief Test: GET /api/sessions/1/close (wrong method on the close path) is not served and logs no close line.
+ */
+TEST_F(SessionApiHttpTest, GetCloseRouteIsNotServed) {
+  const std::uintmax_t offset = test_log_size();
+
+  const auto response = client->request("GET", "/api/sessions/1/close", "", auth_headers());
+
+  EXPECT_NE(response->status_code, "200 OK");
+  send_marker_close();
+  expect_only_marker_close_logged(offset);
+}
+
+/**
+ * @brief Test: a close with a wrong password is rejected with 401, logs no close line and never logs the password.
+ */
+TEST_F(SessionApiHttpTest, CloseSessionWrongPasswordIsNotLogged) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "wrongpass"));
+
+  const std::uintmax_t offset = test_log_size();
+  const auto response = client->request("POST", "/api/sessions/4242/close", "", headers);
+
+  ASSERT_EQ(response->status_code, "401 Unauthorized");
+  send_marker_close();
+  const std::string logged = test_log_since(offset);
+  expect_only_marker_close_logged(offset);
+  EXPECT_EQ(logged.find("Session close requested via API: id=4242"), std::string::npos);
+  EXPECT_EQ(logged.find("wrongpass"), std::string::npos);
+}
+
+/**
+ * @brief Test: an authenticated cross-origin close without a CSRF token is audit-logged as csrf-rejected.
+ */
+TEST_F(SessionApiHttpTest, CloseSessionCrossOriginWithoutCsrfTokenIsAuditLogged) {
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("Origin", "https://example.invalid");
+
+  const std::uintmax_t offset = test_log_size();
+  const auto response = client->request("POST", "/api/sessions/4242/close", "", headers);
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+
+  const std::string logged = test_log_since(offset);
+  ASSERT_FALSE(logged.empty()) << "No log text captured from " << TEST_LOG_FILE << "; the log sink is not where the test expects it";
+  EXPECT_TRUE(has_line_with_all(
+    logged,
+    {"Session close requested via API: id=4242", "result=csrf-rejected", "user=testuser"}
   ));
   EXPECT_EQ(logged.find("testpass"), std::string::npos);
 }
