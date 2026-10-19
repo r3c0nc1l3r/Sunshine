@@ -86,8 +86,9 @@ namespace stream {
      *
      * @param session Active streaming or pairing session for the request.
      * @param reason Why the session is being stopped.
+     * @return `true` when this call moved the session from running to stopping (its reason is recorded).
      */
-    void stop(session_t &session, stop_reason_e reason);
+    bool stop(session_t &session, stop_reason_e reason);
     /**
      * @brief Get the reason recorded for the end of a session.
      *

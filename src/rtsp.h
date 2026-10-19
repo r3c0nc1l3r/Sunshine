@@ -8,12 +8,22 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
+#include <memory>
 #include <string>
 #include <vector>
 
 // local includes
 #include "crypto.h"
 #include "thread_safe.h"
+
+namespace stream {
+  struct session_t;
+
+  namespace session {
+    enum class state_e : int;
+  }  // namespace session
+}  // namespace stream
 
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
@@ -103,16 +113,57 @@ namespace rtsp_stream {
   std::vector<session_info_t> list_sessions();
 
   /**
+   * @brief Outcome of a session close request.
+   */
+  enum class close_result_e {
+    closed,  ///< The session was running and this request stopped it.
+    already_stopping,  ///< The session was already stopping, or another stop won the race.
+    not_found,  ///< No session with this id, or it has not started yet.
+  };
+
+  /**
    * @brief Ask one streaming session to stop, through the normal stop path.
    *
    * The session is stopped with reason `api-close`; the RTSP server then joins and removes it as usual.
    * Callers must authenticate the requester first (admin web UI only).
    *
    * @param id Launch session id from `list_sessions()`.
-   * @return `true` when the session is running and was asked to stop, or is already stopping; `false` for an unknown id
-   *         or a session that has not started yet.
+   * @return `closed` when this request stopped the running session, `already_stopping` when the session was already
+   *         stopping or another stop won the race, `not_found` for an unknown id or a session that has not started yet.
    */
-  bool request_session_close(std::uint32_t id);
+  close_result_e request_session_close(std::uint32_t id);
+
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Test-only access to the RTSP server's session slots.
+   */
+  namespace testing {
+    /**
+     * @brief Insert a fake session with no worker threads into the RTSP server's slots.
+     *
+     * The session describes itself with the insertion time, `udp/ipv4` and `local`. Joining it (through `clear`)
+     * completes at once and does not run the last-session platform callbacks.
+     *
+     * @param id Launch session id.
+     * @param state Initial session state.
+     * @param join_gate When valid, joining the session waits until this future is ready.
+     * @return The inserted session.
+     */
+    std::shared_ptr<stream::session_t> insert_fake_session(std::uint32_t id, stream::session::state_e state, std::shared_future<void> join_gate = {});
+
+    /**
+     * @brief Run the RTSP server's `clear()`.
+     *
+     * @param all `true` to end every session, `false` to end only stopping ones.
+     */
+    void clear(bool all);
+
+    /**
+     * @brief Remove every session from the slots without joining them.
+     */
+    void remove_all();
+  }  // namespace testing
+#endif
 
   /**
    * @brief Runs the RTSP server loop.
