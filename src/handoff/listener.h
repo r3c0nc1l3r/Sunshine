@@ -164,8 +164,8 @@ namespace handoff {
      * Posts to the io thread: clear the paused flag and, only if the acceptor is open, call `accept()`. Connections
      * that queued in the listen backlog while paused are accepted: asio's epoll reactor tries the `accept` system call
      * as soon as the operation is started, before it waits for readiness, so a queued connection is taken without a
-     * new arrival (to be verified on the build host by the test "pause, connect, resume"). Idempotent: resuming a server that is not paused
-     * returns `true` and arms nothing (never a second accept).
+     * new arrival (to be verified on the build host by the test "pause, connect, resume"). Idempotent: resuming a
+     * server that is not paused returns `true` and arms nothing (never a second accept).
      *
      * @param timeout Longest wait for the io thread to run the posted handler.
      * @return `true` when accepting is armed (or already was). `false` when the server is not running (not started,
