@@ -477,6 +477,9 @@ namespace handoff {
 
   /**
    * @brief Remove the instance file of process `pid` from `dir`.
+   *
+   * @param dir Instances directory.
+   * @param pid Pid naming the file.
    */
   void remove_instance_file(const fs::path &dir, pid_t pid) {
     const auto path = dir / (std::to_string(pid) + ".json");
@@ -527,6 +530,10 @@ namespace handoff {
 
   /**
    * @brief Read the instance files in `dir` and sort them into live and stale instances.
+   *
+   * @param dir Instances directory.
+   * @param start_time_of Returns a pid's current start time, or `std::nullopt` when it does not exist.
+   * @return Scan result.
    */
   scan_result_t scan_instances(const fs::path &dir, const std::function<std::optional<std::uint64_t>(pid_t)> &start_time_of) {
     scan_result_t result;
@@ -609,6 +616,12 @@ namespace handoff {
 
   /**
    * @brief Wait until the instance file of process `pid` in `dir` is active, or the timeout expires.
+   *
+   * @param dir Instances directory.
+   * @param pid Pid of the new process.
+   * @param start_time Its start time, as sent in `committed`.
+   * @param timeout Longest wait.
+   * @return `true` when seen within the timeout.
    */
   bool wait_for_active(const fs::path &dir, pid_t pid, std::uint64_t start_time, std::chrono::milliseconds timeout) {
     using clock = std::chrono::steady_clock;
