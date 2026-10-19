@@ -3381,6 +3381,7 @@ TEST_F(HandoffCoordinatorTest, StartControlWorksAgainAfterStopControl) {
 TEST_F(HandoffCoordinatorTest, ConcurrentStartControlStartsOneServerAndNoCallFails) {
   notify_value = "";
   const auto path = hf::control_socket_path(tmp, ::getpid()).string();
+  auto &coordinator = C();  // created once, on the test thread, before any caller thread starts
   for (int round = 0; round < 4; ++round) {
     constexpr int callers = 6;
     std::atomic<bool> go {false};
@@ -3394,7 +3395,7 @@ TEST_F(HandoffCoordinatorTest, ConcurrentStartControlStartsOneServerAndNoCallFai
         while (!go.load()) {
           std::this_thread::yield();
         }
-        if (C().start_control(path)) {
+        if (coordinator.start_control(path)) {
           ++succeeded;
         } else {
           ++failed;
