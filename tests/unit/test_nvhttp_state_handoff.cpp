@@ -369,7 +369,6 @@ TEST_F(NvhttpHandoffStateTest, UnpairedLegacyClientStaysUnknownAfterSaveAndReloa
 
   const auto clients = nvhttp::get_all_clients();
   ASSERT_EQ(clients.size(), 1u) << "precondition: exactly the one imported client must be paired";
-  // SPEC-QUESTION: the uuid key of get_all_clients() entries is not documented in nvhttp.h; "uuid" is assumed here.
   const auto uuid = clients.front().value("uuid", std::string {});
   ASSERT_FALSE(uuid.empty()) << "the imported client must have a uuid to unpair";
 
@@ -460,8 +459,8 @@ TEST_F(NvhttpHandoffStateTest, NextLaunchSessionIdWrapsAtUint32Max) {
   EXPECT_EQ(nvhttp::next_launch_session_id(), UINT32_MAX) << "the largest 32-bit id must be stored and reported unchanged";
 }
 
-TEST_F(NvhttpHandoffStateTest, NextLaunchSessionIdZeroIsReportedAsZero) {
-  // The header says the counter wraps at 2^32, so a next id of 0 is valid and must be reported as 0.
+TEST_F(NvhttpHandoffStateTest, NextLaunchSessionIdZeroIsTreatedAsOne) {
+  // The header says ids start at 1, so a next id of 0 is treated as 1.
   nvhttp::set_next_launch_session_id(0);
-  EXPECT_EQ(nvhttp::next_launch_session_id(), 0u) << "a next id of 0 must be reported as 0 (the counter wraps at 2^32)";
+  EXPECT_EQ(nvhttp::next_launch_session_id(), 1u) << "after set_next_launch_session_id(0) the next id must be 1, since ids start at 1";
 }
