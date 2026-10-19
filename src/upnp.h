@@ -144,6 +144,9 @@ namespace upnp {
    * handoff child calls it only after `COMMIT` (it maps nothing before the switch). Calling it twice in one process is
    * a programming error: the second call maps nothing, replaces no plan and returns `nullptr`.
    *
+   * Destroying the guard stops the mapping thread at once, without waiting for the process shutdown event, removes the
+   * plan's mappings under the current `unmap_scope()` and joins the thread.
+   *
    * Thread-safety: call from the main thread. The guard may be destroyed from any thread, as before.
    *
    * @param udp_base UDP base of this process.
