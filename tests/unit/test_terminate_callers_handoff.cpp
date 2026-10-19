@@ -1321,6 +1321,8 @@ TEST_F(HandoffCallersNvhttpTest, LaunchRefusedWhilePeerHasSessions) {
   EXPECT_EQ(status_code(tree), 503) << "/launch must answer status_code 503 while the peer has sessions";
   EXPECT_EQ(tree.get<int>("root.gamesession", -1), 0) << "/launch must answer gamesession 0";
   EXPECT_FALSE(tree.get<std::string>("root.<xmlattr>.status_message", "").empty()) << "status_message must carry the refusal text";
+  EXPECT_TRUE(is_guard_refusal(tree)) << "the 503 must be the guard's refusal, not one of upstream's own 503 answers";
+  EXPECT_EQ(peer->list_calls.load(), 1) << "the guard must ask the peer once";
   EXPECT_FALSE(app_running()) << "a refused /launch must start no app";
   EXPECT_EQ(nvhttp::next_launch_session_id(), next_id) << "a refused /launch must not create a launch session";
 }
@@ -1333,6 +1335,9 @@ TEST_F(HandoffCallersNvhttpTest, LaunchRefusedWhileSessionCountIsUnknown) {
   boost::property_tree::ptree tree;
   fetch(launch_target(), tree);
   EXPECT_EQ(status_code(tree), 503) << "a timed-out SESSIONS? must refuse /launch";
+  EXPECT_TRUE(is_guard_refusal(tree)) << "a timed-out SESSIONS? must refuse /launch with the guard's text";
+  EXPECT_EQ(tree.get<int>("root.gamesession", -1), 0) << "a refused /launch must answer gamesession 0";
+  EXPECT_EQ(peer->list_calls.load(), 1) << "the guard must ask the peer once";
   EXPECT_FALSE(app_running()) << "a refused /launch must start no app";
 }
 
