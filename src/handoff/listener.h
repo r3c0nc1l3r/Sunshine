@@ -161,10 +161,10 @@ namespace handoff {
     /**
      * @brief Resume accepting.
      *
-     * Posts to the io thread: clear the paused flag and, only if the acceptor is open, call `accept()`. Connections that queued in the listen
-     * backlog while paused are accepted: asio's epoll reactor tries the `accept` system call as soon as the operation
-     * is started, before it waits for readiness, so a queued connection is taken without a new arrival (to be verified
-     * on the build host by the test "pause, connect, resume"). Idempotent: resuming a server that is not paused
+     * Posts to the io thread: clear the paused flag and, only if the acceptor is open, call `accept()`. Connections
+     * that queued in the listen backlog while paused are accepted: asio's epoll reactor tries the `accept` system call
+     * as soon as the operation is started, before it waits for readiness, so a queued connection is taken without a
+     * new arrival (to be verified on the build host by the test "pause, connect, resume"). Idempotent: resuming a server that is not paused
      * returns `true` and arms nothing (never a second accept).
      *
      * @param timeout Longest wait for the io thread to run the posted handler.
@@ -225,7 +225,11 @@ namespace handoff {
 
   private:
     std::atomic<bool> paused_ {false};  ///< True while accepting is paused. Written on the io thread; read anywhere.
-    std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> work_guard_;  ///< Keeps `run()` alive while paused. Created by `start_adopted` before the loop or by `pause` on the io thread; destroyed by the destructor after the io thread ended.
+    /**
+     * @brief Keeps `run()` alive while paused. Created by `start_adopted` before the loop or by `pause` on the io
+     * thread; destroyed by the destructor after the io thread ended.
+     */
+    std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> work_guard_;
   };
 }  // namespace handoff
 #endif

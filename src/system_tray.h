@@ -222,8 +222,10 @@ namespace system_tray {
    *    Warning "Failed to create system tray", keep the phase, drop the command (the next `resume` may retry).
    * 3. If the phase is `running` and a suspend command is pending, complete it without calling `loop` (this covers a
    *    suspend that arrived between two iterations, or before this function was entered after `init_tray`; a backend's
-   *    `exit` has no memory, so the loop must look at the command itself): the teardown below, phase `suspended`,
-   *    waiters notified, repeat from 1. Otherwise, if the phase is `running`: call the backend's `loop` (blocking).
+   *    `exit` has no memory, so the loop must look at the command itself): first call the backend's `exit` once more
+   *    on this thread (the call `suspend()` made from another thread was only queued, and nothing pumped it; Qt's exit
+   *    handler is idempotent, and a fake backend sees two `exit` calls for such a suspend), then the teardown below,
+   *    phase `suspended`, waiters notified, repeat from 1. Otherwise, if the phase is `running`: call the backend's `loop` (blocking).
    *    Production `process_tray_events` returns non-zero for every blocking call (`QtTrayMenu::loop(1)` runs
    *    `QApplication::exec()` and returns -1 when it ends), and 0 only for a non-blocking call; so "returns non-zero"
    *    means "the backend's loop ended", not an error. A fake `loop` may return 0 to model one served event, in which
