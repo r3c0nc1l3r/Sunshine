@@ -61,8 +61,16 @@ namespace handoff {
     constexpr std::string_view virtual_sink_prefix = "sink-sunshine-";
 
     /**
-     * @brief Control servers whose handler is running through `start_control()` (the "already running" memory).
+     * @brief Kill-first of a child whose sequence never ran; an unconfirmed reap is logged as an Error.
+     *
+     * @param child The child.
      */
+    void early_kill(child_ops_t &child) {
+      const auto result = child.kill_and_reap(early_kill_wait);
+      if (result != reap_result_e::reaped && result != reap_result_e::reaped_elsewhere) {
+        BOOST_LOG(error) << "Drain handoff: the new process (pid "sv << child.pid() << ") did not confirm the reap in time"sv;
+      }
+    }
 
     /**
      * @brief Run `fn`; an exception is logged as an Error and `failure` is returned.
@@ -1635,7 +1643,7 @@ namespace handoff {
     const auto child_start = A::start_time(*this, spawned->pid);
     auto child = A::make_child(*this, *spawned);
     if (!child_start) {
-      child->kill_and_reap(early_kill_wait);
+      early_kill(*child);
       return fail(std::string(coordinator_reason::start_time_unreadable));
     }
     {
@@ -1643,7 +1651,7 @@ namespace handoff {
       stopping = _stopping;
     }
     if (stopping || runtime_state.shutdown_requested()) {
-      child->kill_and_reap(early_kill_wait);
+      early_kill(*child);
       return fail(std::string(coordinator_reason::shutting_down));
     }
     att->child = std::move(child);
@@ -1706,7 +1714,7 @@ namespace handoff {
 
     att->stop_fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (att->stop_fd < 0) {
-      att->child->kill_and_reap(early_kill_wait);
+      early_kill(*att->child);
       return fail("cannot create the shutdown watcher"s);
     }
 
@@ -1738,7 +1746,7 @@ namespace handoff {
       if (att->watcher.joinable()) {
         att->stop_watcher();
       }
-      att->child->kill_and_reap(early_kill_wait);
+      early_kill(*att->child);
       return fail(refused_by_stop ? std::string(coordinator_reason::shutting_down) : "cannot start the handoff thread"s);
     }
 
@@ -1751,24 +1759,20 @@ namespace handoff {
   }
 
   bool coordinator_t::start_control(const std::string &path) {
-    {
-      std::lock_guard lock {_mutex};
-      if (_stopping) {
-        return false;
-      }
+    // The whole start runs under the mutex, so two callers start one server. `control_server_t::start()` only binds and
+    // starts its thread; it never calls the handler or the coordinator before it returns.
+    std::lock_guard lock {_mutex};
+    if (_stopping) {
+      return false;
     }
-    {
-      std::lock_guard lock {_mutex};
-      if (_control_started) {
-        return true;
-      }
+    if (_control_started) {
+      return true;
     }
     std::string open_error;
     if (!_control.start(path, handler(), &open_error)) {
       BOOST_LOG(error) << "Drain handoff: the control socket could not be opened: "sv << open_error;
       return false;
     }
-    std::lock_guard lock {_mutex};
     _control_started = true;
     return true;
   }

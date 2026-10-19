@@ -12,6 +12,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -389,7 +390,18 @@ namespace handoff {
         _withdrawn = true;
         _ops.withdraw_mdns(_t.mdns_withdraw);
         _ops.remove_tray();
-        auto snapshot = _ops.take_snapshot();
+        std::optional<protocol::go_t> taken;
+        try {
+          taken = _ops.take_snapshot();
+        } catch (const std::exception &e) {
+          BOOST_LOG(error) << "Drain handoff: taking the snapshot failed: " << e.what();
+        } catch (...) {
+          BOOST_LOG(error) << "Drain handoff: taking the snapshot failed";
+        }
+        if (!taken) {
+          return fail("taking the snapshot failed");
+        }
+        auto snapshot = std::move(*taken);
         if (_ops.shutdown_requested() || _shutdown.load()) {
           return rollback("shutdown requested", true);
         }
