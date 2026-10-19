@@ -892,4 +892,57 @@ TEST_F(HandoffPeerLinkTest, OnChannelClosedDoesNotChangeStateOrGone) {
   EXPECT_EQ(_link->state(), state_e::draining);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Unknown strings and late replies after no-send paths
+// ---------------------------------------------------------------------------------------------------------------------
+
+TEST_F(HandoffPeerLinkTest, CloseUnknownResultStringCountsAsNoReply) {
+  start_responder(reply_with([](std::uint64_t id) {
+    return protocol::message_t {protocol::close_reply_t {id, "bogus-result"}};
+  }));
+  EXPECT_FALSE(_link->close(5, 300ms).has_value()) << "A CLOSED result string the link does not know counts as no reply: nullopt while the peer is not gone.";
+}
+
+TEST_F(HandoffPeerLinkTest, CloseUnknownResultStringWhenGoneIsNotFound) {
+  make_gone();
+  start_responder(reply_with([](std::uint64_t id) {
+    return protocol::message_t {protocol::close_reply_t {id, "bogus-result"}};
+  }));
+  const auto result = _link->close(5, 300ms);
+  ASSERT_TRUE(result.has_value()) << "An unknown CLOSED result with the peer gone gives the gone result (not_found).";
+  EXPECT_EQ(*result, rtsp_stream::close_result_e::not_found);
+}
+
+TEST_F(HandoffPeerLinkTest, UnknownHandoffStateStringLeavesStateUnchanged) {
+  ASSERT_TRUE(_link->deliver(protocol::handoff_state_t {"draining"}));
+  (void) _link->deliver(protocol::handoff_state_t {"bogus-state"});
+  EXPECT_EQ(_link->state(), state_e::draining) << "An unknown HANDOFF_STATE string must leave state() unchanged.";
+}
+
+TEST_F(HandoffPeerLinkTest, UnknownHandoffStateStringFromNoneStaysNone) {
+  (void) _link->deliver(protocol::handoff_state_t {"bogus-state"});
+  EXPECT_EQ(_link->state(), state_e::none);
+}
+
+TEST_F(HandoffPeerLinkTest, LateDeliverAfterNoSendPathsReturnsFalse) {
+  // After a path that sent nothing, a reply with any id (here the first ids the tracker hands out) is not consumed.
+  EXPECT_FALSE(_link->list(0ms).has_value());
+  _link->on_channel_closed();
+  EXPECT_FALSE(_link->list(100ms).has_value());
+  for (std::uint64_t id = 1; id <= 4; ++id) {
+    SCOPED_TRACE(id);
+    EXPECT_FALSE(_link->deliver(protocol::sessions_reply_t {id, two_sessions})) << "The id of a request that ended without a send must be forgotten: a late reply is dropped.";
+    EXPECT_FALSE(_link->deliver(protocol::ended_t {id}));
+  }
+}
+
+TEST_F(HandoffPeerLinkTest, LateDeliverAfterSendFailureReturnsFalse) {
+  start_recorder();
+  _far->close();
+  EXPECT_FALSE(_link->list(500ms).has_value());
+  for (std::uint64_t id = 1; id <= 3; ++id) {
+    EXPECT_FALSE(_link->deliver(protocol::sessions_reply_t {id, {}})) << "The id of a request whose send failed must be forgotten.";
+  }
+}
+
 #endif  // __linux__
