@@ -13,8 +13,16 @@
 #endif
 
 // standard includes
+#include <atomic>
+#include <cstdint>
+#include <functional>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <sys/types.h>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 // lib includes
 #include <boost/process/v1.hpp>
@@ -24,6 +32,11 @@
 #include "platform/common.h"
 #include "rtsp.h"
 #include "utility.h"
+
+#ifdef __linux__
+  #include "handoff/app_digest.h"
+  #include "handoff/protocol.h"
+#endif
 
 /**
  * @def DEFAULT_APP_IMAGE_PATH
@@ -82,6 +95,106 @@ namespace proc {
     bool wait_all;  ///< Whether Sunshine waits for all child processes.
     std::chrono::seconds exit_timeout;  ///< Exit timeout.
   };
+
+  /**
+   * @brief Atomic mirrors of the running-app fields that the drain handoff reads from other threads.
+   *
+   * The control loop writes `proc_t`'s plain fields in `running()` and `terminate()`, and HTTP threads write them in
+   * `execute()`, so the handoff threads (the coordinator, the switcher) read these copies instead. The writers
+   * update a mirror at the same points where they change the field: `execute()` (app id after it is chosen, applied
+   * count each time a prep command has run, process group after the launch, placebo when the command is empty),
+   * `running()` (the auto-detach flip to placebo) and `terminate()` (everything cleared). All accesses are
+   * sequentially consistent. Atomics are not movable, and `proc::refresh` replaces the whole `proc_t` by move
+   * assignment, so this wrapper has a move constructor and a move assignment that copy the current values (field by
+   * field, not atomically as a whole; a move happens only in `refresh`, when the old object is no longer in use). It
+   * is not copyable.
+   */
+  struct app_mirror_t {
+    std::atomic<int> app_id {0};  ///< Running app id, or 0 when no app is recorded (never negative).
+    std::atomic<bool> placebo {false};  ///< The app is in placebo mode.
+    std::atomic<long> pgid {0};  ///< Process group id of the app, or 0 when it has none.
+    std::atomic<std::uint32_t> applied {0};  ///< Number of applied prep commands (`_app_prep_it - _app_prep_begin`).
+    std::atomic<bool> released {false};  ///< The app was released to another process (`set_released`).
+
+    /**
+     * @brief Create a cleared mirror.
+     */
+    app_mirror_t() = default;
+
+    /**
+     * @brief Copy the current values of another mirror.
+     *
+     * @param other Source.
+     */
+    app_mirror_t(app_mirror_t &&other) noexcept;
+
+    /**
+     * @brief Copy the current values of another mirror.
+     *
+     * @param other Source.
+     * @return This mirror.
+     */
+    app_mirror_t &operator=(app_mirror_t &&other) noexcept;
+
+    app_mirror_t(const app_mirror_t &) = delete;  ///< Not copyable.
+    app_mirror_t &operator=(const app_mirror_t &) = delete;  ///< Not copyable.
+  };
+
+  /**
+   * @brief Tells whether a process group still has a process.
+   *
+   * The production probe (used when none is given) is `kill(-pgid, 0)`: `pgid <= 1` means none; success or `EPERM`
+   * means a process is present (zombies count, a reused pgid gives a false "present", which refuses safely); `ESRCH`
+   * means none. Tests inject their own.
+   */
+  using group_probe_t = std::function<bool(pid_t pgid)>;
+
+  /**
+   * @brief Names of the launch environment variables that `execute()` sets (prefix `SUNSHINE_APP_` or
+   * `SUNSHINE_CLIENT_`).
+   *
+   * @param name Environment variable name.
+   * @return `true` when the name starts with `SUNSHINE_APP_` or `SUNSHINE_CLIENT_`.
+   */
+  bool is_launch_env_name(std::string_view name);
+
+  /**
+   * @brief The base environment for the app digest: the entries of the process environment plus the `apps.json`
+   * `env` section, without the launch variables (names for which `is_launch_env_name` is true), without
+   * `SUNSHINE_UDP_BASE` and `SUNSHINE_GENERATION` (restart variables) and without names starting with
+   * `SUNSHINE_HANDOFF_`. Both processes compute the digest from this, so values that differ only by process or launch
+   * do not break adoption. The result is sorted by name (byte-wise).
+   *
+   * @param env The `proc_t` environment.
+   * @return Name and value pairs.
+   */
+  std::vector<std::pair<std::string, std::string>> base_env_for_digest(const boost::process::v1::environment &env);
+
+#ifdef __linux__
+  /**
+   * @brief The digest inputs of one app in an environment.
+   *
+   * `prep` is `app.prep_cmds` mapped to (`do_cmd`, `undo_cmd`, `elevated`) in order (the list is already merged with
+   * the global commands when the apps are loaded); `working_dir` and `output` are the app's; `exit_timeout_s` is
+   * `app.exit_timeout` in seconds; `base_env` is `base_env_for_digest(env)`.
+   *
+   * @param app App.
+   * @param env The `proc_t` environment.
+   * @return Digest inputs for `handoff::app_digest()`.
+   */
+  handoff::app_digest_input_t digest_input(const ctx_t &app, const boost::process::v1::environment &env);
+
+  /**
+   * @brief An adoption that was checked and prepared but not installed. Plain data; movable and copyable.
+   */
+  struct adoption_plan_t {
+    bool has_app {false};  ///< `false` when `GO` carried no app: installing it does nothing.
+    int app_id {0};  ///< App id to adopt.
+    ctx_t app {};  ///< Copy of the app from the new process's own app list.
+    std::uint32_t applied_prep {0};  ///< Number of applied prep commands.
+    std::vector<std::pair<std::string, std::string>> launch_env;  ///< Launch environment from the snapshot.
+  };
+#endif
 
   /**
    * @brief Tracks launched child processes and terminates them during shutdown.
@@ -148,10 +261,165 @@ namespace proc {
     std::string get_last_run_app_name();
     /**
      * @brief Terminate the launched application process.
+     *
+     * When the app is released (`set_released(true)`), it only drops the app state: the released flag is cleared,
+     * `placebo` is false, the prep iterators are set to `_app_prep_begin` (so no `undo` command can run), the output
+     * pipe is closed, the app id is set to -1 as an ordinary terminate does and the mirrors are cleared. It neither
+     * calls `terminate_process_group` (there is none: only adoptable apps are handed off), nor runs any `undo`
+     * command, nor calls `input::terminate_gamepads`, `system_tray::update_tray_stopped` or
+     * `display_device::revert_configuration`. Otherwise it behaves as before and also clears the mirrors.
      */
     void terminate();
 
+    /**
+     * @brief Whether the running app (if any) can be handed to another process.
+     *
+     * Drain handoff, spec step 1 ("adoptable") and switch substep 4. Reads only the atomic mirrors and the group
+     * probe; never takes a lock, never calls `running()` (which can terminate the app and run `undo` commands) and
+     * never changes any state, so any thread may call it at any time.
+     *
+     * - No app recorded (mirror app id is 0): adoptable (there is nothing to hand over); `why` is untouched.
+     * - The app is not in placebo mode: not adoptable, `why` = "the running app is not in placebo mode". This includes
+     *   a non-placebo app whose process has exited but has not been polled yet.
+     * - Placebo mode and a process group id above 1 for which `probe(pgid)` is true: not adoptable, `why` = "the
+     *   running app still has processes in its process group".
+     * - Otherwise adoptable.
+     *
+     * @param why Receives the reason when not adoptable; may be null.
+     * @param probe Process-group probe; an empty function uses the production probe (see @ref group_probe_t).
+     * @return `true` when adoptable.
+     */
+    bool adoptable(std::string *why, const group_probe_t &probe = {}) const;
+
+    /**
+     * @brief Release or take back the running app.
+     *
+     * The old process sets the flag right before it sends `GO`, and clears it when a rollback takes the app back.
+     * `running()` ignores the flag, so the control loop still sees the app and its sessions keep streaming. Only
+     * `terminate()` reads it (see there). Lock-free; callable from any thread.
+     *
+     * @param released `true` to release, `false` to take back.
+     */
+    void set_released(bool released);
+
+    /**
+     * @brief Whether the app is released.
+     *
+     * @return The flag.
+     */
+    bool released() const;
+
+    /**
+     * @brief Drop a released app's state without running anything (a rollback after `ENDED`, and the exit of a
+     * draining process).
+     *
+     * If the app is released: clears the app (mirror app id, applied count, placebo, process group, the app id, the
+     * prep iterators set to `_app_prep_begin`, the output pipe closed) and the released flag. It runs no `undo`
+     * command, terminates no process group, calls no tray, gamepad or display function. It changes only members that
+     * `running()` does not read while placebo mode is set, plus the mirrors, so it is safe next to the control loop.
+     * If the app is not released it does nothing, so it can never skip an `undo` by mistake. The caller logs the
+     * Warning.
+     *
+     * @return `true` when a released app was dropped; `false` when nothing was released.
+     */
+    bool drop_released_app();
+
+    /**
+     * @brief Replace only the application list (the old process, on rollback), not the whole `proc_t`.
+     *
+     * `proc::refresh` replaces the whole object while the control loop polls `running()`; this replaces `_apps` and
+     * nothing else (`_app`, the environment, the mirrors and the iterators stay), so a running app keeps its own copy
+     * of its prep list and a changed `apps.json` does not change what its `undo` runs. Same rule as adoption: the
+     * caller guarantees that no request that reads or changes the list is running (the 503 gate is up and the in-flight
+     * counters are zero) and takes no lock here.
+     *
+     * @param apps The new application list.
+     */
+    void swap_app_list(std::vector<ctx_t> &&apps);
+
+    /**
+     * @brief The environment's base entries for the digest, from this object's environment.
+     *
+     * @return `base_env_for_digest(_env)`. Same caller rule as `snapshot()` (no concurrent `execute()`).
+     */
+    std::vector<std::pair<std::string, std::string>> base_env_for_digest() const;
+
+#ifdef __linux__
+    /**
+     * @brief Take the snapshot that `GO` carries.
+     *
+     * Precondition (the caller's, not checked): the gate is up, the in-flight requests have finished and `adoptable()`
+     * was true, so nothing changes `_app`, `_env` or the mirrors during the call.
+     *
+     * @return `std::nullopt` when no app is recorded (mirror app id 0). Otherwise `app_snapshot_t{app_id = mirror app
+     *         id, name = _app.name, applied_prep = mirror applied count, digest = handoff::app_digest(digest_input(_app,
+     *         _env)), launch_env = the entries of _env for which is_launch_env_name is true, sorted by name}`.
+     */
+    std::optional<handoff::protocol::app_snapshot_t> snapshot() const;
+
+    /**
+     * @brief Check a received snapshot against this process's own app list and prepare the adoption (the new process,
+     * at `GO`). Installs nothing, starts nothing, changes no member.
+     *
+     * Rules, first failing wins; `reason` receives the text:
+     * - `go.app` is empty: success with a plan whose `has_app` is `false`.
+     * - this object already records a running app: "this process already runs an app".
+     * - the snapshot's digest is empty, or the computed digest is empty: "invalid app snapshot".
+     * - `_apps` has no entry with `id == std::to_string(app_id)` and `name == snapshot.name`, or its
+     *   `digest_input` digest differs from the snapshot's (compared as given, lowercase hex), or the applied count is
+     *   larger than that entry's `prep_cmds.size()`: "app or prep commands changed while an app runs; cancel the app
+     *   first". This is the reason the old process logs and the helper reports.
+     *
+     * @param go The `GO` message.
+     * @param reason Receives the failure reason; cleared on success.
+     * @return The plan, or `std::nullopt` with `reason` set.
+     */
+    std::optional<adoption_plan_t> prepare_adoption(const handoff::protocol::go_t &go, std::string &reason) const;
+
+    /**
+     * @brief Install a prepared adoption (the new process, at `COMMIT`).
+     *
+     * Does nothing when `plan.has_app` is `false`. Otherwise sets `_app_id`, `_app` (the plan's copy, which also gives
+     * `get_last_run_app_name()`), `_app_prep_begin` (the begin of `_app.prep_cmds`), `_app_prep_it` (begin plus
+     * `applied_prep`), placebo mode, and the environment: each launch entry is stored in `_env`; then reopens the app's
+     * `output` file for appending when it is neither empty nor `null` (a failure logs a Warning and continues without
+     * a pipe). Updates the mirrors (app id, placebo true, process group 0, applied count, released false). Starts no
+     * process, runs no command and sends no tray notification. Precondition: it runs before the process accepts any
+     * request, on the plan from `prepare_adoption()` of this same object with no `refresh` or `swap_app_list` in
+     * between; no lock is taken.
+     *
+     * @param plan The prepared adoption.
+     */
+    void install_adoption(adoption_plan_t &&plan);
+#endif
+
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief Test-only: make the object look like it runs an app, without starting anything.
+     *
+     * Sets `_app` to `app`, `_app_id` and the mirror app id to `app_id`, the mirror placebo flag and `placebo`, the
+     * mirror process group, and the prep iterators and mirror applied count to `applied_prep` (clamped to the prep
+     * list size). Does not touch `_env`.
+     *
+     * @param app The app (its `prep_cmds` are used).
+     * @param app_id App id.
+     * @param is_placebo Placebo mode.
+     * @param pgid Process group id (0 for none).
+     * @param applied_prep Number of applied prep commands.
+     */
+    void set_running_for_test(const ctx_t &app, int app_id, bool is_placebo, pid_t pgid, std::uint32_t applied_prep);
+
+    /**
+     * @brief Test-only: set an environment variable of the object.
+     *
+     * @param name Name.
+     * @param value Value.
+     */
+    void set_env_for_test(const std::string &name, const std::string &value);
+#endif
+
   private:
+    app_mirror_t _mirror;  ///< Atomic copies of the running-app fields for the handoff (see @ref app_mirror_t).
     int _app_id;
 
     boost::process::v1::environment _env;
