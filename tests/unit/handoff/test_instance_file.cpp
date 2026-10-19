@@ -82,6 +82,19 @@ namespace {
   }
 
   /**
+   * @brief Restores a path's permissions when destroyed, so cleanup can remove it.
+   */
+  struct perms_restore_t {
+    fs::path path;  ///< Path whose permissions are restored.
+    fs::perms saved;  ///< Permissions to restore.
+
+    ~perms_restore_t() {
+      std::error_code ec;
+      fs::permissions(path, saved, fs::perm_options::replace, ec);
+    }
+  };
+
+  /**
    * @brief Write raw content to a file in the directory.
    */
   void write_raw(const fs::path &dir, const std::string &name, const std::string &content) {
@@ -815,6 +828,64 @@ TEST_F(HandoffInstanceFileTest, WriterCreatesMissingNestedParents) {
   hf::instance_writer_t writer(dir, make_instance(4242, 99, hf::role_e::active, hf::state_e::none, 0));
   EXPECT_TRUE(writer.write()) << "write() must create missing parent directories";
   EXPECT_TRUE(fs::is_directory(dir)) << "the nested instances directory must exist after write()";
+}
+
+TEST_F(HandoffInstanceFileTest, ScanInstancesPathThatIsRegularFileFailsClosed) {
+  temp_dir_t tmp;
+  write_raw(tmp.path, "instances", "not a directory");
+  auto scan = hf::scan_instances(tmp.path / "instances", [](pid_t) {
+    return std::optional<std::uint64_t>();
+  });
+  EXPECT_FALSE(scan.dir_missing) << "a path that exists as a regular file must not be reported as a missing directory";
+  EXPECT_TRUE(scan.any_unreadable) << "a regular file where the directory belongs must fail closed (any_unreadable)";
+  EXPECT_TRUE(hf::consumer_busy(scan, {})) << "a regular file where the directory belongs must make consumers busy";
+}
+
+TEST_F(HandoffInstanceFileTest, ScanUnreadableDirectoryFailsClosed) {
+  if (geteuid() == 0) {
+    GTEST_SKIP() << "root bypasses directory permissions, so an unreadable directory cannot be simulated";
+  }
+  const std::vector<fs::perms> modes = {fs::perms::none, fs::perms::owner_write | fs::perms::owner_exec};
+  for (fs::perms mode : modes) {
+    temp_dir_t tmp;
+    fs::path dir = tmp.path / "instances";
+    write_instance_file(dir, make_instance(100, 555, hf::role_e::active, hf::state_e::none, 0));
+    // Restores the directory's permissions before temp_dir_t removes it (declared after it, so destroyed first).
+    perms_restore_t restore {dir, fs::status(dir).permissions()};
+    fs::permissions(dir, mode, fs::perm_options::replace);
+
+    auto scan = hf::scan_instances(dir, [](pid_t pid) {
+      return pid == 100 ? std::optional<std::uint64_t>(555) : std::nullopt;
+    });
+    EXPECT_FALSE(scan.dir_missing) << "an existing directory without read permission is not missing (mode "
+                                   << static_cast<unsigned>(mode) << ")";
+    EXPECT_TRUE(scan.any_unreadable) << "a directory that cannot be listed must set any_unreadable (mode "
+                                     << static_cast<unsigned>(mode) << ")";
+    EXPECT_TRUE(hf::consumer_busy(scan, {})) << "a directory that cannot be listed must make consumers busy (mode "
+                                             << static_cast<unsigned>(mode) << ")";
+  }
+}
+
+TEST_F(HandoffInstanceFileTest, ScanMissingDirectoryIsBusyOnlyWithRunningPid) {
+  temp_dir_t tmp;
+  auto scan = hf::scan_instances(tmp.path / "absent", [](pid_t) {
+    return std::optional<std::uint64_t>();
+  });
+  EXPECT_TRUE(scan.dir_missing) << "a directory that does not exist must set dir_missing";
+  EXPECT_FALSE(scan.any_unreadable) << "a missing directory must not set any_unreadable";
+  EXPECT_FALSE(hf::consumer_busy(scan, {})) << "with no running Sunshine pid a missing directory must not be busy";
+  EXPECT_TRUE(hf::consumer_busy(scan, {100})) << "with a running Sunshine pid a missing directory must be busy";
+}
+
+TEST_F(HandoffInstanceFileTest, ScanKillPendingFileIsBusyWithZeroSessions) {
+  temp_dir_t tmp;
+  fs::path dir = tmp.path / "instances";
+  write_instance_file(dir, make_instance(100, 555, hf::role_e::active, hf::state_e::kill_pending, 0));
+  auto scan = hf::scan_instances(dir, [](pid_t pid) {
+    return pid == 100 ? std::optional<std::uint64_t>(555) : std::nullopt;
+  });
+  ASSERT_EQ(scan.live.size(), 1U) << "the kill_pending file of a live process must be listed as live";
+  EXPECT_TRUE(hf::consumer_busy(scan, {100})) << "a live file in state kill_pending must be busy even with 0 sessions";
 }
 
 #endif  // __linux__
