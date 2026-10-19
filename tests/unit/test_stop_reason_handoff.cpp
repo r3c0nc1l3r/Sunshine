@@ -480,7 +480,7 @@ TEST_F(HandoffShutdownReasonTest, DrainingShutdownRecordsStop) {
   handoff::settings_t settings;
   settings.enabled = true;
   handoff::runtime().configure(settings);
-  ASSERT_TRUE(handoff::runtime().transition(handoff::runtime_t::mode_e::normal, handoff::runtime_t::mode_e::draining))
+  ASSERT_TRUE(handoff::runtime().transition(handoff::mode_e::normal, handoff::mode_e::draining))
     << "setup failed: a normal process must be able to move to draining";
 
   EXPECT_EQ(handoff::hooks::shutdown_reason(), handoff::shutdown_reason_e::stop)
