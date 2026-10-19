@@ -424,7 +424,11 @@ namespace config {
    * (-2147483648 to 2147483647). Empty text, hex (`0x...`), text with spaces or other characters, and an out-of-range
    * value such as `99999999999` are not valid integers: Error, feature off, and the field keeps its default. The
    * implementation must use its own strict parser. `int_f` and `parse_config_integer` in `config.cpp` accept hex and
-   * must not be reused for these keys. Values are never clamped.
+   * must not be reused for these keys. Values are never clamped. Quoted numbers (`"3600"`) are "other characters".
+   * Note: the config-file parser drops a `key =` line with an empty value before options are applied (upstream
+   * behaviour, unchanged), so an empty value in the file means the default; an empty value that reaches
+   * `apply_config` directly (for example in a test) is invalid as above. Parse errors are logged even when
+   * `drain_handoff` is `disabled`.
    *
    * Validation runs in `apply_config` after `port` is set, against the configured `port`, through
    * `handoff::hooks::config_refusal(settings, port)`. Any parse or validation Error logs one Error line naming the key,
