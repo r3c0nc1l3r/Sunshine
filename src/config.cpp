@@ -1567,10 +1567,10 @@ namespace config {
   /**
    * @brief Get supported gamepad options.
    *
-   * The list is rebuilt on each call. The views point into names this function keeps, and stay valid until the next
-   * call.
+   * The list is rebuilt on each call, so it holds no entries from earlier calls. The views point into names this
+   * function keeps, and stay valid until the next call.
    *
-   * @return Platform-supported gamepad backend names accepted by configuration, each once.
+   * @return Platform-supported gamepad backend names accepted by configuration.
    */
   std::vector<std::string_view> &get_supported_gamepad_options() {
     static std::vector<std::string> names {};
