@@ -1567,15 +1567,20 @@ namespace config {
   /**
    * @brief Get supported gamepad options.
    *
-   * @return Platform-supported gamepad backend names accepted by configuration.
+   * The list is rebuilt on each call. The views point into names this function keeps, and stay valid until the next
+   * call.
+   *
+   * @return Platform-supported gamepad backend names accepted by configuration, each once.
    */
   std::vector<std::string_view> &get_supported_gamepad_options() {
-    const auto options = platf::supported_gamepads(nullptr);
+    static std::vector<std::string> names {};
     static std::vector<std::string_view> opts {};
-    opts.reserve(options.size());
-    for (auto &opt : options) {
-      opts.emplace_back(opt.name);
+    opts.clear();
+    names.clear();
+    for (const auto &opt : platf::supported_gamepads(nullptr)) {
+      names.emplace_back(opt.name);
     }
+    opts.assign(names.begin(), names.end());
     return opts;
   }
 

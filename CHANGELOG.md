@@ -8,6 +8,8 @@ https://github.com/LizardByte/Sunshine/releases.
 ### Fixed
 - The default gamepad setting is copied from one gamepad list call; it was read from a list buffer freed during static
   initialization (#42).
+- The allowed `gamepad` values are kept valid while the configuration is applied, and listed once; they were views
+  into a destroyed copy and grew on every load (#43).
 
 ## v2026.914.233613-lb.2
 Upstream base: `63d35f702ee9` (nightly `2026.914.233613`). Arch package `sunshine 2026.914.233613.2-1` (CUDA off).
