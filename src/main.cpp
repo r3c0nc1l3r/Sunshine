@@ -149,41 +149,6 @@ WINAPI BOOL ConsoleCtrlHandler(DWORD type) {
 }
 #endif
 
-#ifdef __linux__
-/**
- * @brief Owner of the input deinit guard that can be released once, early (by the drain exit) or at scope exit.
- */
-struct input_release_t {
-  std::once_flag once;  ///< Makes the release run at most once.
-  std::unique_ptr<platf::deinit_t> guard;  ///< The guard from `input::init()`.
-
-  /**
-   * @brief Take the guard.
-   *
-   * @param input_guard The guard to own.
-   */
-  explicit input_release_t(std::unique_ptr<platf::deinit_t> input_guard):
-      guard {std::move(input_guard)} {
-  }
-
-  /**
-   * @brief Release the devices (destroy the guard) if that has not happened yet.
-   */
-  void release() {
-    std::call_once(once, [this]() {
-      guard.reset();
-    });
-  }
-
-  /**
-   * @brief Release the devices.
-   */
-  ~input_release_t() {
-    release();
-  }
-};
-#endif
-
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
 constexpr bool tray_is_enabled = true;  ///< Compile-time flag indicating tray support is enabled.
 #else
@@ -559,15 +524,7 @@ int main(int argc, char *argv[]) {
 
   reed_solomon_init();
 #ifdef __linux__
-  // The drain exit may release the devices earlier from another thread, so the closure owns a share of the guard.
-  auto input_deinit_guard = std::make_shared<input_release_t>(input::init());
-  handoff::register_device_release([input_deinit_guard]() {
-    input_deinit_guard->release();
-  });
-  // Releases the devices at upstream's position in the destruction order; a later call from the drain thread is a no-op.
-  auto input_release_guard = util::fail_guard([input_deinit_guard]() {
-    input_deinit_guard->release();
-  });
+  handoff::entry::device_release_t input_deinit_guard {input::init()};
 #else
   auto input_deinit_guard = input::init();
 #endif
