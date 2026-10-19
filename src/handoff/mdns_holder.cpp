@@ -130,7 +130,13 @@ namespace handoff {
     if (arm_rename_checks) {
       // The task runs on another thread; it never runs inline in `schedule`.
       const auto make_task = [this, id, epoch = epoch_]() {
-        return [this, id, epoch]() {
+        // Shared by the copies of the task, so running the same task twice fires it once.
+        auto fired = std::make_shared<std::atomic_bool>(false);
+        return [this, id, epoch, fired]() {
+          if (fired->exchange(true)) {
+            return;
+          }
+
           // Registry mutex first: it keeps the holder alive while the check runs.
           const std::scoped_lock registry_lock {registry_mutex()};
           const auto it = registry().find(this);
