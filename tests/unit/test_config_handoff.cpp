@@ -12,10 +12,17 @@
 
 // standard includes
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
+
+#ifndef _WIN32
+  #include <unistd.h>
+#endif
 
 // local includes
 #include <src/config.h>
@@ -113,8 +120,16 @@ protected:
     original_options_ = config::drain_handoff;
     original_file_apps_ = config::stream.file_apps;
     config::drain_handoff = handoff::settings_t {};
-    // apply_config copies a default apps.json when file_apps does not exist; point it at a file that does.
-    config::stream.file_apps = SUNSHINE_SOURCE_DIR "/tests/unit/test_config_handoff.cpp";
+    // apply_config copies a default apps.json when file_apps does not exist, so point it at a fresh temp file.
+    static std::atomic<unsigned> counter {0};
+    long pid = 0;
+#ifndef _WIN32
+    pid = static_cast<long>(::getpid());
+#endif
+    file_apps_path_ = std::filesystem::temp_directory_path() / ("sunshine_handoff_cfg_" + std::to_string(pid) + "_" + std::to_string(++counter) + ".json");
+    std::filesystem::remove(file_apps_path_);
+    { std::ofstream created {file_apps_path_}; }
+    config::stream.file_apps = file_apps_path_.string();
   }
 
   /**
@@ -124,6 +139,8 @@ protected:
     config::sunshine.port = original_port_;
     config::drain_handoff = original_options_;
     config::stream.file_apps = original_file_apps_;
+    std::error_code ignored;
+    std::filesystem::remove(file_apps_path_, ignored);
   }
 
   /**
@@ -138,6 +155,7 @@ protected:
   std::uint16_t original_port_ {};  ///< Port restored after each test.
   handoff::settings_t original_options_;  ///< Options restored after each test.
   std::string original_file_apps_;  ///< Apps file path restored after each test.
+  std::filesystem::path file_apps_path_;  ///< Temp apps file created for each test and removed after it.
 };
 
 /**
