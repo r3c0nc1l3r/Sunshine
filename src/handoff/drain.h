@@ -198,7 +198,8 @@ namespace handoff {
      *
      * Call after `runtime().open_instance()` (a pass without a writer writes nothing, so an earlier start is harmless).
      * The thread waits with `poll` on its own eventfd and `runtime().shutdown_wake_fd()`; a readable shutdown fd makes
-     * it do one last pass and end (it stays ended; the instance file is removed by the shutdown path).
+     * it do one last pass and end (it stays ended; the instance file is removed by the shutdown path). After `stop()` the
+     * notifier stays stopped; `start()` does nothing.
      */
     void start();
 
@@ -348,7 +349,8 @@ namespace handoff {
    * ## The exit sequence (binding, bounded)
    *
    * Runs once, on the controller thread, phase `exiting`. If `ops.shutdown_requested()` is true at the start, the
-   * sequence does nothing and the controller ends (the signal path owns the exit and its own limit). Otherwise, in this
+   * sequence does nothing more and the controller ends (the signal path owns the exit and its own limit). The unmap
+   * scope is ensured first, also when a shutdown request ends the sequence before any other step. Otherwise, in this
    * order:
    * 1. `ensure_unmap_scope()`.
    * 2. `end_sessions(reason)`: `drain_deadline` when the deadline passed, else `stop` (with zero sessions it only
