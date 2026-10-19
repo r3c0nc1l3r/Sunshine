@@ -394,7 +394,9 @@ namespace nvhttp {
    *
    * While frozen (see @ref set_state_frozen) it writes nothing and returns `true` (nothing was lost on purpose, so
    * the caller must not report a failure). Otherwise it does what the internal save does today (merge the host unique
-   * id and `root.named_devices` into the existing file, keeping other keys) but writes the result with
+   * id and `root.named_devices` into the existing file, replacing those two nodes and keeping other keys, except the
+   * legacy `root.devices` list, which is removed: the loader has already imported it into `root.named_devices`, and
+   * keeping it would re-import unpaired clients on every load) but writes the result with
    * `file_handler::write_file_atomic` (temporary file in the same directory, fsync, rename). If the existing file
    * exists and cannot be parsed, or the write fails, it writes nothing, logs an Error and returns `false`. Takes
    * `client_auth_mutex()` itself, so it must not be called with that mutex held. The saves done by pairing, unpair and
