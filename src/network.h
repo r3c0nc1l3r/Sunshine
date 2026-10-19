@@ -49,12 +49,12 @@ namespace net {
    * including the same out-of-range warning, so a normal start is unchanged.
    *
    * Environment round trip: `SUNSHINE_UDP_BASE` is read once by `handoff::runtime().early_init()` at the start of
-   * `main()` (decimal, 1 to 65535). A value that does not parse, or is out of range, is ignored, and the base stays
-   * the configured `port`. The variable is removed from the environment before any app or thread can inherit it.
+   * `main()` (decimal, 1 to 65524). The upper limit keeps every mapped UDP port (base + 9, 10, 11) at or below 65535. A
+   * value that does not parse, or is outside 1 to 65524, is ignored, and the base stays the configured `port`. The variable is removed from the environment before any app or thread can inherit it.
    * An in-place restart (`/api/restart`, the tray restart) sets it again just before `execv`, through
    * `handoff::hooks::restart_environment()`, only when the base differs from the configured `port`, and unsets it
    * when it does not. A handoff child gets its base from `SUNSHINE_HANDOFF_UDP_BASE` instead, which is invalid
-   * (refused, exit 1) when it does not parse or is out of range. `early_init` range-checks the value only: there is no
+   * (refused, exit 1) when it does not parse or is outside 1 to 65524. `early_init` range-checks the value only: there is no
    * collision check against the TCP ports or the other base. Sunshine sets the variable itself, and the old process
    * validated the configured offset before it spawned the child, so the variable is trusted once it parses.
    *

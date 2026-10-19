@@ -116,11 +116,12 @@ namespace handoff {
      *
      * Rules:
      * - `SUNSHINE_HANDOFF_FDS` and `SUNSHINE_HANDOFF_CHANNEL` both unset: a normal start. Then `SUNSHINE_UDP_BASE`
-     *   (decimal, 1 to 65535) and `SUNSHINE_GENERATION` (decimal, 0 to 65535) are read when set, so that an in-place
-     *   restart keeps both; a value that does not parse is ignored (the defaults stay: no override, generation 0).
+     *   (decimal, 1 to 65524, so that base + 11 stays within 65535) and `SUNSHINE_GENERATION` (decimal, 0 to 65535) are
+     *   read when set, so that an in-place restart keeps both; a value that does not parse, or is outside 1 to 65524 for
+     *   the base, is ignored (the defaults stay: no override, generation 0).
      *   Mode stays `disabled` until `configure()`, `is_main()` stays `true`.
      * - exactly one of the two set, or both set but not accepted by `parse_inherited_fds`, or
-     *   `SUNSHINE_HANDOFF_UDP_BASE` (decimal, 1 to 65535) or `SUNSHINE_HANDOFF_GENERATION` (decimal, 1 to 65535)
+     *   `SUNSHINE_HANDOFF_UDP_BASE` (decimal, 1 to 65524) or `SUNSHINE_HANDOFF_GENERATION` (decimal, 1 to 65535)
      *   missing or invalid: an error; nothing is stored, `scrub_fds` is not called, the mode stays `disabled`.
      * - both set and valid: a handoff start. `inherited()` holds the fds, `started_by_handoff()` is `true`, the mode
      *   is set directly to `new_pending` (so `enabled()` is `true`), `is_main()` is `false`, the UDP base override

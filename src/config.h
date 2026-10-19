@@ -404,29 +404,37 @@ namespace config {
   /**
    * @brief Drain-handoff options, read by `apply_config` from the `drain_handoff*` keys.
    *
-   * The struct is `handoff::settings_t` (`src/handoff/settings.h`), which is plain data and compiles on every
-   * platform. Only the Linux handoff code acts on it. Defaults are the struct's defaults, so a config without the keys
-   * behaves as before. The keys, in `docs/configuration.md` order:
+   * The struct is `handoff::settings_t` (`src/handoff/settings.h`), which is plain data and compiles on every platform.
+   * Shared code never calls the Linux-only handoff sources directly; it goes through `handoff::hooks`. Defaults are the
+   * struct's defaults, so a config without the keys behaves as before. Keys, in `docs/configuration.md` order:
    *
-   * | Key | Field | Type | Default | Valid values | Invalid value |
-   * |-----|-------|------|---------|--------------|---------------|
-   * | `drain_handoff` | `enabled` | `enabled` or `disabled` | `disabled` | `enabled`, `disabled` (case-sensitive) | any other text: Error, feature off |
-   * | `drain_handoff_udp_offset` | `udp_offset` | integer | `100` | rules of `handoff::validate` (no zero, both UDP bases in 1024-65535, no overlap with each other or any TCP port) | not a decimal integer: Error, feature off; a rule failure: Error, feature off |
-   * | `drain_handoff_deadline` | `deadline_s` | integer, seconds | `3600` | 1 to 86400, and at least the rollback window | as above |
-   * | `drain_handoff_ready_timeout` | `ready_timeout_s` | integer, seconds | `30` | at least 1 | as above |
-   * | `drain_handoff_rollback_window` | `rollback_window_s` | integer, seconds | `60` | at least 1 | as above |
-   * | `drain_handoff_cooldown` | `cooldown_s` | integer, seconds | `120` | at least the rollback window | as above |
-   * | `drain_handoff_binary` | `binary` | string (path) | empty (the path Sunshine was started from) | any text; not checked here | stored as given; a bad path fails the handoff at spawn time |
+   * - `drain_handoff` (field `enabled`, the flag read as `config::drain_handoff.enabled`): `enabled` or `disabled`,
+   *   case-sensitive, default `disabled`. Any other text: Error, feature off.
+   * - `drain_handoff_udp_offset` (`udp_offset`): integer, default `100`. The rules of `handoff::validate` apply: no
+   *   zero, both UDP bases inside 1024-65535, no overlap with each other or with a TCP port.
+   * - `drain_handoff_deadline` (`deadline_s`): integer seconds, default `3600`, 1 to 86400, and at least the rollback
+   *   window.
+   * - `drain_handoff_ready_timeout` (`ready_timeout_s`): integer seconds, default `30`, at least 1.
+   * - `drain_handoff_rollback_window` (`rollback_window_s`): integer seconds, default `60`, at least 1.
+   * - `drain_handoff_cooldown` (`cooldown_s`): integer seconds, default `120`, at least the rollback window.
+   * - `drain_handoff_binary` (`binary`): string path, default empty (the path Sunshine was started from). Any text is
+   *   stored as given and is not checked here; a bad path fails the handoff at spawn time.
    *
-   * "Decimal integer" means an optional leading `-` followed by one or more digits. Empty text, hex (`0x`) and any
-   * other text are not decimal integers. A non-integer value leaves the field at its default and is never clamped.
+   * Integer keys: "decimal integer" means an optional leading `-` followed by one or more digits that fits in `int`
+   * (-2147483648 to 2147483647). Empty text, hex (`0x...`), text with spaces or other characters, and an out-of-range
+   * value such as `99999999999` are not valid integers: Error, feature off, and the field keeps its default. The
+   * implementation must use its own strict parser. `int_f` and `parse_config_integer` in `config.cpp` accept hex and
+   * must not be reused for these keys. Values are never clamped.
    *
-   * Validation runs in `apply_config` after `port` is set, against the configured `port`. The rules are those of
-   * `handoff::validate`, reached through `handoff::hooks` (shared code may not call the Linux-only `settings.cpp`
-   * directly). Any Error from the parse or the validation logs one Error line naming the key, sets `enabled` to
-   * `false` and keeps the other fields as parsed. The process keeps running. `enabled` is left `true` only when
-   * `drain_handoff` is `enabled` and every key passes. Startup then calls `handoff::check_enable` with the host facts
-   * (`main.cpp`, right after `display_device::init`); a refusal there also sets `enabled` to `false` and logs an Error.
+   * Validation runs in `apply_config` after `port` is set, against the configured `port`, through
+   * `handoff::hooks::config_refusal(settings, port)`. Any parse or validation Error logs one Error line naming the key,
+   * sets `enabled` to `false` and keeps the other fields as parsed. The process keeps running. `enabled` stays `true`
+   * only when `drain_handoff` is `enabled` and every key passes.
+   *
+   * Startup then calls `handoff::hooks::enable_refusal(context, privileged_execution)` after `display_device::init`.
+   * `main.cpp` passes its existing `privileged_execution` local (`main.cpp:186`). The Linux rules are in
+   * `hooks.h`: nothing when `enabled` is `false`; a privileged refusal; then `check_enable`. A non-empty result logs
+   * one Error and sets `enabled` to `false`. Shared code must not name `handoff::check_enable` itself.
    *
    * Tests: `apply_config_for_test` (`SUNSHINE_TESTS`) is the seam; set the keys, then read this struct. No separate
    * seam is needed.

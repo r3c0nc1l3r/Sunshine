@@ -141,7 +141,8 @@ namespace handoff::hooks {
    * task).
    *
    * @param arm_rename_checks False for a normal start; true only for the new process at `COMMIT`.
-   * @return A handle that stops publishing when destroyed. Never null (the holder handles an unavailable publisher).
+   * @return A handle that stops publishing when destroyed. May be null when publishing is unavailable; the caller
+   *         null-checks.
    */
   std::unique_ptr<platf::deinit_t> mdns_start(bool arm_rename_checks);
 
@@ -181,14 +182,35 @@ namespace handoff::hooks {
   /**
    * @brief Why the host forbids enabling the feature, judged from the host facts.
    *
-   * Called once at startup, after `display_device::init` and before the runtime is configured. It is
-   * `handoff::check_enable(context)` on Linux. Pure apart from the host facts the caller collected.
+   * Called once at startup, after `apply_config` (so `config_refusal` has already run) and after `display_device::init`.
+   * Checks, in this order:
+   * 1. `config::drain_handoff.enabled` is `false`: empty. Nothing is logged for a normal start.
+   * 2. `privileged_execution` is `true`: "drain handoff is not available with privileged execution (its environment
+   *    sanitising drops the SUNSHINE_HANDOFF_* variables)". The caller passes its `privileged_execution` local
+   *    (`main.cpp`, the value that `sanitize_process_environment` is guarded by).
+   * 3. Otherwise `handoff::check_enable(context)`, which gives the capture, `FRESH_STATE`, display-manager and
+   *    runtime-directory refusals.
+   * The caller logs a non-empty result as one Error and sets `config::drain_handoff.enabled` to `false`.
    *
    * @param context Host facts (capture backend, `FRESH_STATE`, display settings manager, runtime directory).
-   * @return Empty when the feature may enable; otherwise the Error text the caller logs before it sets `enabled` to
-   *         `false`. Non-Linux: see the non-Linux declaration.
+   * @param privileged_execution The caller's `privileged_execution` value.
+   * @return Empty when the feature may enable; otherwise the Error text. Non-Linux: see the non-Linux declaration.
    */
-  std::string enable_refusal(const enable_context_t &context);
+  std::string enable_refusal(const enable_context_t &context, bool privileged_execution);
+
+  /**
+   * @brief Whether startup skips the encoder probe because the probe results came from the old process.
+   *
+   * True only when `started_by_handoff()` is true and `video::handoff_probe_override()` holds a value, that is, the new
+   * side accepted the old process's `HELLO` probe identity. False otherwise, so a handoff child whose identity does not
+   * match probes as usual, and a normal start always probes.
+   *
+   * Requirement on the new side (P18): it handles `HELLO` and installs the accepted override before `main` reaches the
+   * startup probe (`main.cpp`, about line 461). If it cannot, the probe runs and the flag reads false.
+   *
+   * @return The condition above. Non-Linux: false.
+   */
+  bool startup_probe_skipped();
 #else
   /**
    * @brief Whether the feature is on in this process.
@@ -275,7 +297,7 @@ namespace handoff::hooks {
    * @brief Start mDNS publishing exactly as before: `platf::publish::start()`.
    *
    * @param arm_rename_checks Ignored on this platform.
-   * @return The publisher handle (may be null when publishing is unavailable, as before).
+   * @return The publisher handle. May be null when publishing is unavailable; the caller null-checks.
    */
   inline std::unique_ptr<platf::deinit_t> mdns_start(bool arm_rename_checks) {
     (void) arm_rename_checks;
@@ -316,14 +338,27 @@ namespace handoff::hooks {
   /**
    * @brief Why the host forbids enabling the feature (non-Linux).
    *
-   * The caller calls it only when the options enabled the feature, so the answer is always the fixed refusal text.
+   * Drain handoff exists only on Linux. With `config::drain_handoff.enabled` set, this returns the fixed refusal text,
+   * so every non-Linux start with the option on logs one Error and runs without the feature. With the option off it
+   * returns empty, so non-Linux starts log nothing.
    *
    * @param context Host facts; unused here.
-   * @return `"drain handoff is available on Linux only"`.
+   * @param privileged_execution Unused here.
+   * @return `"drain handoff is available on Linux only"` when `config::drain_handoff.enabled`; otherwise empty.
    */
-  inline std::string enable_refusal(const enable_context_t &context) {
+  inline std::string enable_refusal(const enable_context_t &context, bool privileged_execution) {
     (void) context;
-    return "drain handoff is available on Linux only";
+    (void) privileged_execution;
+    return config::drain_handoff.enabled ? std::string {"drain handoff is available on Linux only"} : std::string {};
+  }
+
+  /**
+   * @brief Whether startup skips the encoder probe because the probe results came from the old process.
+   *
+   * @return Always `false` on this platform.
+   */
+  inline bool startup_probe_skipped() {
+    return false;
   }
 #endif
 }  // namespace handoff::hooks
