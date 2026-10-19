@@ -2362,7 +2362,7 @@ namespace input {
     std::call_once(*platform_input_once(), []() {
       auto &factory = platform_input_factory();
       platf_input = factory ? factory() : platf::input();
-      platform_input_created() = true;
+      platform_input_created().store(true, std::memory_order_release);
     });
   }
 
@@ -2391,6 +2391,13 @@ namespace input {
 
   void refresh_virtual_input() {
     dispatch_input_task([]() {
+      // platf_input is written once, inside ensure_platform_input()'s call_once, which can run on another thread (a handoff
+      // start creates the backend at its first session). Read it only after the acquire load that pairs with the release
+      // store of the created flag; before that there is no backend to refresh.
+      if (!platform_input_created().load(std::memory_order_acquire)) {
+        return;
+      }
+
       if (platf_input) {
         task_pool.cancel(key_press_repeat_id);
         key_press_repeat_id = nullptr;
@@ -2453,7 +2460,7 @@ namespace input {
       // Counts as the once-created backend: ensure_platform_input() must not call the factory afterwards.
       std::call_once(*platform_input_once(), []() {
       });
-      platform_input_created() = true;
+      platform_input_created().store(true, std::memory_order_release);
     }
 
     void set_platform_input_factory_for_test(std::function<platf::input_t()> factory) {
