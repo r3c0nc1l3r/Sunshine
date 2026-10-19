@@ -136,7 +136,9 @@ namespace handoff::hooks {
    * `handoff::mdns_holder().stop()`, so `main` keeps its `mDNS` handle and its destruction order unchanged. With the
    * feature disabled, or in a normal start (`arm_rename_checks` false), the service is published exactly as before.
    * The caller must not call this in a process started by a handoff (`started_by_handoff()`) before `COMMIT`: the new
-   * side publishes through the holder itself at `COMMIT`, and `main` then takes no handle. Main thread only.
+   * side publishes through the holder itself at `COMMIT`, and `main` then takes no handle (that process's shutdown
+   * path calls `handoff::mdns_holder().stop()`). One thread at a time (`main` calls it from its `std::async` start
+   * task).
    *
    * @param arm_rename_checks False for a normal start; true only for the new process at `COMMIT`.
    * @return A handle that stops publishing when destroyed. Never null (the holder handles an unavailable publisher).
