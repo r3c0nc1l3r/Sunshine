@@ -619,9 +619,11 @@ or from the draining process's file when the channel is gone.
 - Consumers read every file in the directory and ignore stale ones. A `pending` file never names the active ports, and
   it makes consumers treat Sunshine as busy (a handoff is in progress).
 - Fail-safe rule for consumers: treat Sunshine as busy when the directory is missing while a Sunshine process runs, when
-  a running Sunshine process has no file, when any `pending` file exists, when any file is unreadable, or when any
-  instance has sessions above 0 or traffic on its base ports. Between `/launch` and the first media, `sessions` can
-  still be 0, so consumers also treat recent RTSP connections as busy.
+  a running Sunshine process has no file, when any `pending` file exists, when any file is unreadable, when the
+  directory exists but cannot be listed completely (an error opening or reading it, also one in the middle of the scan:
+  fail closed, never a partial list read as idle), when any instance is in state `kill_pending`, or when any instance
+  has sessions above 0 or traffic on its base ports. Between `/launch` and the first media, `sessions` can still be 0,
+  so consumers also treat recent RTSP connections as busy.
 
 ## systemd unit
 Readiness: whenever `NOTIFY_SOCKET` is set, Sunshine sends `READY=1` once its servers run (TCP listeners bound or
