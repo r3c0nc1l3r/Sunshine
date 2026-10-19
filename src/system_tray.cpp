@@ -145,6 +145,7 @@ namespace system_tray {
       bool ended {false};  ///< `end_tray` ran.
       bool loop_entered {false};  ///< `run_main_loop` was entered.
       bool loop_exited {false};  ///< `run_main_loop` returned.
+      std::uint64_t suspends_completed {0};  ///< Suspends the loop completed; `suspend` waits for it to grow.
       bool initializing {false};  ///< The loop is inside a backend `init`; `suspend` waits for it.
       std::thread::id loop_thread;  ///< The thread that runs `run_main_loop`.
       std::optional<bool> enabled_for_testing;  ///< Overrides `config::sunshine.system_tray` when set (tests).
@@ -1069,8 +1070,13 @@ namespace system_tray {
     void complete_suspend(std::unique_lock<std::mutex> &lock, bool from_exec) {
       auto &state = lifecycle();
       const auto backend = effective_backend_locked();
-      state.command = tray_command_e::none;
+      // The command stays `suspend` until the end: while the teardown runs, `resume` and `request_start` still see a
+      // suspend in progress and defer instead of being lost.
       lock.unlock();
+
+      // Clear the flag first (without `tray_state_mutex()`, this thread must not wait for it), so an `update_tray_*`
+      // arriving during the poll returns early and cannot hold the mutex while blocked on this thread.
+      tray_initialized_state().store(false);
 
       // A suspend from another thread queued an exit event to the Qt thread. When the loop did not just return from
       // `exec()` (a pre-loop suspend), that event is still in the queue and the next `exec()` after a resume would
@@ -1080,10 +1086,10 @@ namespace system_tray {
         backend.poll();
       }
 
-      tray_initialized_state().store(false);
       backend.exit();
 
       lock.lock();
+      state.command = tray_command_e::none;
       if (!state.ended) {
         state.phase = tray_phase_e::suspended;
         if (state.resume_after_suspend) {
@@ -1091,6 +1097,7 @@ namespace system_tray {
         }
       }
       state.resume_after_suspend = false;
+      ++state.suspends_completed;
       state.cv.notify_all();
     }
   #endif
@@ -1219,6 +1226,7 @@ namespace system_tray {
 
     state.command = tray_command_e::suspend;
     state.resume_after_suspend = false;
+    const auto completed_before = state.suspends_completed;
     const auto backend = effective_backend_locked();
     const bool loop_gone = state.loop_exited;
     lock.unlock();
@@ -1264,8 +1272,9 @@ namespace system_tray {
       state.command = tray_command_e::none;
       return true;
     }
-    return state.cv.wait_until(lock, deadline, [&state]() {
-      return state.phase != tray_phase_e::running || state.ended;
+    // Count, not phase: a deferred resume may already have made the phase `running` again.
+    return state.cv.wait_until(lock, deadline, [&state, completed_before]() {
+      return state.suspends_completed != completed_before || state.phase != tray_phase_e::running || state.ended;
     });
   #else
     (void) timeout;
