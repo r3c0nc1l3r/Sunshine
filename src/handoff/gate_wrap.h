@@ -7,9 +7,17 @@
  * Handler shape: every Sunshine route handler is callable as `handler(response, request)` where both are the
  * `std::shared_ptr` types of a Simple-Web-Server `ServerBase<...>::Response` and `::Request` (see `resp_https_t`,
  * `req_https_t`, `resp_http_t`, `req_http_t` in `nvhttp.cpp` and `confighttp.cpp`). The wrappers are templates over
- * those two pointer types, so one implementation serves the HTTP, HTTPS and web UI servers. They need only these
- * members of the response: `close_connection_after_response` (a `bool` member) and
- * `write(SimpleWeb::StatusCode, const SimpleWeb::CaseInsensitiveMultimap &)`, so a test passes a fake response type.
+ * those two pointer types, so one implementation serves the HTTP, HTTPS and web UI servers. What a response type must
+ * provide (through `operator->`): a writable `bool close_connection_after_response` member, and
+ * `write(SimpleWeb::StatusCode, const SimpleWeb::CaseInsensitiveMultimap &)` (the types come from
+ * `Simple-Web-Server/status_code.hpp` and `utility.hpp`, which this header includes on Linux). Nothing else of the
+ * response is touched, and nothing at all of the request, so a test passes a fake response type (for example a
+ * `std::shared_ptr` to a struct with those two members) and any object as the request.
+ *
+ * Exceptions: a handler's exception propagates unchanged to the caller (Simple-Web-Server) after the guard of a
+ * counted route has decremented. Double wrapping: wrapping an already wrapped handler (`counted` over `counted`, or
+ * `wrap_resources` over routes already wrapped by hand) counts the request twice and can refuse it in the inner layer
+ * after the outer layer admitted it; it is safe but wasteful, so wrap each handler once.
  *
  * Refusal: when the gate refuses, the wrapper does not call the handler. It sets
  * `response->close_connection_after_response = true` and writes status 503 (`Service Unavailable`) with the single
@@ -29,6 +37,7 @@
 #pragma once
 
 // standard includes
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -37,6 +46,7 @@
 #ifdef __linux__
   // lib includes
   #include <Simple-Web-Server/status_code.hpp>
+  #include <Simple-Web-Server/utility.hpp>
 
   // local includes
   #include "gate.h"
@@ -53,7 +63,8 @@ namespace handoff {
   template<class Resp>
   void refuse_503(const Resp &response) {
     response->close_connection_after_response = true;
-    response->write(SimpleWeb::StatusCode::server_error_service_unavailable, SimpleWeb::CaseInsensitiveMultimap {{"Connection", "close"}});
+    const SimpleWeb::CaseInsensitiveMultimap headers {{"Connection", "close"}};
+    response->write(SimpleWeb::StatusCode::server_error_service_unavailable, headers);
   }
 
   /**
@@ -130,7 +141,11 @@ namespace handoff {
       for (auto &method : route.second) {
         const auto &name = method.first;
         const bool state_changing = name == "POST" || name == "DELETE" || name == "PUT" || name == "PATCH";
-        method.second = state_changing ? counted<Resp, Req>(std::move(method.second), gate) : gated<Resp, Req>(std::move(method.second), gate);
+        if (state_changing) {
+          method.second = counted<Resp, Req>(std::move(method.second), gate);
+        } else {
+          method.second = gated<Resp, Req>(std::move(method.second), gate);
+        }
       }
     }
   }
@@ -141,11 +156,13 @@ namespace handoff {
    * @tparam Resp Response pointer type.
    * @tparam Req Request pointer type.
    * @tparam Handler Callable invocable as `handler(Resp, Req)`.
+   * @tparam Gate Type of the optional gate argument (any type; it is ignored).
    * @param handler Route handler.
+   * @param gate Ignored, accepted so shared code compiles unchanged.
    * @return The handler as a `std::function<void(Resp, Req)>`.
    */
-  template<class Resp, class Req, class Handler>
-  std::function<void(Resp, Req)> counted(Handler handler) {
+  template<class Resp, class Req, class Handler, class Gate = std::nullptr_t>
+  std::function<void(Resp, Req)> counted(Handler handler, [[maybe_unused]] const Gate &gate = Gate {}) {
     return handler;
   }
 
@@ -155,11 +172,13 @@ namespace handoff {
    * @tparam Resp Response pointer type.
    * @tparam Req Request pointer type.
    * @tparam Handler Callable invocable as `handler(Resp, Req)`.
+   * @tparam Gate Type of the optional gate argument (any type; it is ignored).
    * @param handler Route handler.
+   * @param gate Ignored, accepted so shared code compiles unchanged.
    * @return The handler as a `std::function<void(Resp, Req)>`.
    */
-  template<class Resp, class Req, class Handler>
-  std::function<void(Resp, Req)> gated(Handler handler) {
+  template<class Resp, class Req, class Handler, class Gate = std::nullptr_t>
+  std::function<void(Resp, Req)> gated(Handler handler, [[maybe_unused]] const Gate &gate = Gate {}) {
     return handler;
   }
 
@@ -169,11 +188,12 @@ namespace handoff {
    * @tparam Resp Response pointer type.
    * @tparam Req Request pointer type.
    * @tparam Resources Type of the resource map.
+   * @tparam Gate Type of the optional gate argument (any type; it is ignored).
    * @param resources The resource map (unchanged).
+   * @param gate Ignored, accepted so shared code compiles unchanged.
    */
-  template<class Resp, class Req, class Resources>
-  void wrap_resources(Resources &resources) {
-    (void) resources;
+  template<class Resp, class Req, class Resources, class Gate = std::nullptr_t>
+  void wrap_resources([[maybe_unused]] Resources &resources, [[maybe_unused]] const Gate &gate = Gate {}) {
   }
 #endif
 }  // namespace handoff

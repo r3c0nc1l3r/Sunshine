@@ -396,7 +396,8 @@ namespace nvhttp {
    * `file_handler::write_file_atomic` (temporary file in the same directory, fsync, rename). If the existing file
    * exists and cannot be parsed, or the write fails, it writes nothing, logs an Error and returns `false`. Takes
    * `client_auth_mutex()` itself, so it must not be called with that mutex held. The saves done by pairing, unpair and
-   * client enable go through the same atomic write and the same frozen rule.
+   * client enable go through the same atomic write and the same frozen rule. `FRESH_STATE` is
+   * already refused by `handoff::check_enable`; this function's behaviour under that flag is unchanged.
    *
    * @return `true` when the file now holds the current state, or when frozen; `false` on failure.
    */
@@ -405,8 +406,10 @@ namespace nvhttp {
   /**
    * @brief Freeze or unfreeze the state file. While frozen every save (including `save_state_checked`) is a no-op.
    *
-   * Thread-safe (an atomic flag). The old process freezes at the switch and unfreezes on a rollback; the flag is not
-   * persisted.
+   * The flag is atomic, and `set_state_frozen(true)` also takes and releases `client_auth_mutex()` after setting it, so
+   * when it returns no save is running and none will write later: a save that was in flight has finished. It must not
+   * be called with that mutex held. `set_state_frozen(false)` only clears the flag. The old process freezes at the
+   * switch and unfreezes on a rollback; the flag is not persisted.
    *
    * @param frozen `true` to freeze.
    */

@@ -129,12 +129,22 @@ namespace logging {
   std::string process_tag();
 
   /**
-   * @brief Rotate the current log file and initialize the logging system.
+   * @brief Rotate the current log file (unless told not to) and initialize the logging system.
+   *
+   * The log file is always opened for appending (`std::ios::app`, so `O_APPEND`), in every mode, so two processes that
+   * write the same file (a draining process and its successor) never overwrite each other's data. The sink flushes
+   * after every record (`auto_flush(true)`), so each record normally reaches the file in one `write`; records can
+   * interleave between the processes, but only at record granularity, except that a record larger than the stream
+   * buffer may be split into several writes and then be interleaved inside. A normal start
+   * rotates first (`rotate_log_file` renames the old file away), so it appends to a fresh, empty file. If rotation
+   * fails, a message is written to `stderr`, initialization continues, and the file is opened for appending, so the
+   * old content is kept (earlier versions would have truncated it).
+   *
    * @param min_log_level The minimum log level to output.
    * @param log_file The log file to write to.
-   * @param append_no_rotate When `true` (a drain-handoff child process), the log file is not rotated and is opened
-   *        for appending (`std::ios::app`), so the new process continues the running process's log instead of
-   *        renaming or truncating it. When `false` (the default), behaviour is unchanged: rotate, then truncate.
+   * @param append_no_rotate When `true` (a drain-handoff child process), rotation is skipped, so the running
+   *        process's log is not renamed away. It means only "do not rotate": appending is the behaviour in every mode.
+   *        The default `false` rotates as before.
    * @return An object that will deinitialize the logging system when it goes out of scope.
    * @examples
    * log_init(2, "sunshine.log");

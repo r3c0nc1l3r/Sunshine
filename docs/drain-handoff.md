@@ -375,9 +375,10 @@ get reason `drain-deadline`.
   - in the active role while a draining process exists or a handoff is in progress: refused (409 for the API, a
     Warning in the log). The 409 body names the ways out: wait for the drain, `SIGTERM` to the draining pid (ends its
     sessions), or `systemctl restart` of the unit (ends all sessions);
-  - otherwise allowed; the restarted process keeps its UDP base and device generation (passed in `SUNSHINE_UDP_BASE` and
-    `SUNSHINE_GENERATION`, set just before the `execv` and unset again at startup, so apps never inherit them) and binds
-    TCP as at a normal start;
+  - otherwise allowed; the restarted process keeps its UDP base and device generation. They are passed in
+    `SUNSHINE_UDP_BASE` (set only when the base differs from the configured `port`) and `SUNSHINE_GENERATION` (set only
+    when the generation is above 0), set just before the `execv` and unset again at startup, so apps never inherit them;
+    when a variable is not needed, it is unset. The process binds TCP as at a normal start;
   - a draining process has no web UI and ignores tray restart and quit (it disables those menu entries).
 - Quit (web UI or tray) in the active role ends the main process, so systemd stops the unit, including any draining
   process (as for `systemctl stop`). Until it is the main process (`MAIN`, step 7), a new process refuses Quit and

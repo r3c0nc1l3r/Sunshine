@@ -97,47 +97,52 @@ namespace proc {
   };
 
   /**
-   * @brief Atomic mirrors of the running-app fields that the drain handoff reads from other threads.
+   * @brief The fields of the running app that are read from other threads, held as atomics.
    *
-   * The control loop writes `proc_t`'s plain fields in `running()` and `terminate()`, and HTTP threads write them in
-   * `execute()`, so the handoff threads (the coordinator, the switcher) read these copies instead. The writers
-   * update a mirror at the same points where they change the field: `execute()` (app id after it is chosen, applied
-   * count each time a prep command has run, process group after the launch, placebo when the command is empty),
-   * `running()` (the auto-detach flip to placebo) and `terminate()` (everything cleared). All accesses are
-   * sequentially consistent. Atomics are not movable, and `proc::refresh` replaces the whole `proc_t` by move
-   * assignment, so this wrapper has a move constructor and a move assignment that copy the current values (field by
-   * field, not atomically as a whole; a move happens only in `refresh`, when the old object is no longer in use). It
-   * is not copyable.
+   * These are the only copies of the app id and of placebo mode (the plain `_app_id` and `placebo` fields of earlier
+   * versions are gone), so the control loop's `running()`, the `/serverinfo` handler (which calls `running()` and stays
+   * open while the process drains), the handoff threads and `drop_released_app()` can read and write them without a
+   * data race. `execute()` sets `app_id` after the app is chosen, `applied` each time a prep command has run, `pgid`
+   * after the launch and `placebo` when the command is empty; `running()` sets `placebo` on the auto-detach flip;
+   * `terminate()` and `drop_released_app()` clear everything (`app_id` becomes -1 as before, and `placebo`, `pgid`,
+   * `applied` and `released` are cleared). Non-atomic members (`_app`, `_env`, `_apps`, the prep iterators, `_pipe`,
+   * `_process`, `_process_group`) are still owned by the thread that runs `execute()`, `terminate()` or the documented
+   * handoff calls. All accesses are sequentially consistent. Atomics are not movable, and `proc::refresh` replaces the
+   * whole `proc_t` by move assignment, so this wrapper has a move constructor and a move assignment that copy the
+   * current values one by one (not as a whole; a move happens only in `refresh`, when no other thread uses the old
+   * object). It is not copyable. `proc::refresh` (the apps.json saves in `confighttp.cpp`) already races with `running()`
+   * outside a handoff, because it replaces the whole object while the control loop polls it; this change does not make
+   * that worse, and during a handoff the 503 gate keeps the saves out.
    */
-  struct app_mirror_t {
-    std::atomic<int> app_id {0};  ///< Running app id, or 0 when no app is recorded (never negative).
+  struct app_atomics_t {
+    std::atomic<int> app_id {0};  ///< Running app id: 0 at start, -1 after a terminate, above 0 while an app is recorded.
     std::atomic<bool> placebo {false};  ///< The app is in placebo mode.
     std::atomic<long> pgid {0};  ///< Process group id of the app, or 0 when it has none.
     std::atomic<std::uint32_t> applied {0};  ///< Number of applied prep commands (`_app_prep_it - _app_prep_begin`).
     std::atomic<bool> released {false};  ///< The app was released to another process (`set_released`).
 
     /**
-     * @brief Create a cleared mirror.
+     * @brief Create cleared state.
      */
-    app_mirror_t() = default;
+    app_atomics_t() = default;
 
     /**
-     * @brief Copy the current values of another mirror.
+     * @brief Copy the current values of another instance.
      *
      * @param other Source.
      */
-    app_mirror_t(app_mirror_t &&other) noexcept;
+    app_atomics_t(app_atomics_t &&other) noexcept;
 
     /**
-     * @brief Copy the current values of another mirror.
+     * @brief Copy the current values of another instance.
      *
      * @param other Source.
-     * @return This mirror.
+     * @return This object.
      */
-    app_mirror_t &operator=(app_mirror_t &&other) noexcept;
+    app_atomics_t &operator=(app_atomics_t &&other) noexcept;
 
-    app_mirror_t(const app_mirror_t &) = delete;  ///< Not copyable.
-    app_mirror_t &operator=(const app_mirror_t &) = delete;  ///< Not copyable.
+    app_atomics_t(const app_atomics_t &) = delete;  ///< Not copyable.
+    app_atomics_t &operator=(const app_atomics_t &) = delete;  ///< Not copyable.
   };
 
   /**
@@ -164,6 +169,11 @@ namespace proc {
    * `SUNSHINE_UDP_BASE` and `SUNSHINE_GENERATION` (restart variables) and without names starting with
    * `SUNSHINE_HANDOFF_`. Both processes compute the digest from this, so values that differ only by process or launch
    * do not break adoption. The result is sorted by name (byte-wise).
+   *
+   * Both processes must compute the digest from an environment that has not changed since `proc::parse` built it, apart
+   * from the stripped names: `execute()` adds only launch variables, which are stripped. Any other later change to
+   * `_env` (or a differing process environment between the two processes) makes the digests differ and the adoption
+   * fail, safely.
    *
    * @param env The `proc_t` environment.
    * @return Name and value pairs.
@@ -213,7 +223,6 @@ namespace proc {
       boost::process::v1::environment &&env,
       std::vector<ctx_t> &&apps
     ):
-        _app_id(0),
         _env(std::move(env)),
         _apps(std::move(apps)) {
     }
@@ -228,7 +237,14 @@ namespace proc {
     int execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session);
 
     /**
-     * @return `_app_id` if a process is running, otherwise returns `0`
+     * @brief Whether an app is running.
+     *
+     * Thread-safe for the placebo branch: it loads `placebo` and then `app_id` (both atomic) and returns the id when it
+     * is above 0, else 0, so a concurrent `drop_released_app()` or `terminate()` makes it return the old id or 0, never
+     * -1 or a torn value. When `placebo` is false it behaves as before (the non-atomic `_process` and
+     * `_process_group` are read by the control-loop thread only; `drop_released_app()` never touches them).
+     *
+     * @return The app id if an app is running, otherwise `0`.
      */
     int running();
 
@@ -264,26 +280,30 @@ namespace proc {
      *
      * When the app is released (`set_released(true)`), it only drops the app state: the released flag is cleared,
      * `placebo` is false, the prep iterators are set to `_app_prep_begin` (so no `undo` command can run), the output
-     * pipe is closed, the app id is set to -1 as an ordinary terminate does and the mirrors are cleared. It neither
+     * pipe is closed, the app id is set to -1 as an ordinary terminate does and the atomics are cleared. It neither
      * calls `terminate_process_group` (there is none: only adoptable apps are handed off), nor runs any `undo`
      * command, nor calls `input::terminate_gamepads`, `system_tray::update_tray_stopped` or
-     * `display_device::revert_configuration`. Otherwise it behaves as before and also clears the mirrors.
+     * `display_device::revert_configuration`. Otherwise it behaves as before and also clears the atomics.
      */
     void terminate();
 
     /**
      * @brief Whether the running app (if any) can be handed to another process.
      *
-     * Drain handoff, spec step 1 ("adoptable") and switch substep 4. Reads only the atomic mirrors and the group
+     * Drain handoff, spec step 1 ("adoptable") and switch substep 4. Reads only the atomics and the group
      * probe; never takes a lock, never calls `running()` (which can terminate the app and run `undo` commands) and
      * never changes any state, so any thread may call it at any time.
      *
-     * - No app recorded (mirror app id is 0): adoptable (there is nothing to hand over); `why` is untouched.
+     * - No app recorded (the atomic app id is 0 or below): adoptable (there is nothing to hand over); `why` is untouched.
      * - The app is not in placebo mode: not adoptable, `why` = "the running app is not in placebo mode". This includes
      *   a non-placebo app whose process has exited but has not been polled yet.
      * - Placebo mode and a process group id above 1 for which `probe(pgid)` is true: not adoptable, `why` = "the
      *   running app still has processes in its process group".
      * - Otherwise adoptable.
+     *
+     * Compiled on every platform (it reads only atomics), but only the Linux handoff code calls it. Where
+     * `kill(-pgid, 0)` does not exist (Windows) the process group id is always 0, so the production probe is never
+     * asked and the answer depends on the placebo flag alone.
      *
      * @param why Receives the reason when not adoptable; may be null.
      * @param probe Process-group probe; an empty function uses the production probe (see @ref group_probe_t).
@@ -313,10 +333,15 @@ namespace proc {
      * @brief Drop a released app's state without running anything (a rollback after `ENDED`, and the exit of a
      * draining process).
      *
-     * If the app is released: clears the app (mirror app id, applied count, placebo, process group, the app id, the
-     * prep iterators set to `_app_prep_begin`, the output pipe closed) and the released flag. It runs no `undo`
-     * command, terminates no process group, calls no tray, gamepad or display function. It changes only members that
-     * `running()` does not read while placebo mode is set, plus the mirrors, so it is safe next to the control loop.
+     * If the app is released: clears the app (the atomic `app_id` set to -1, `applied`, `placebo`, `pgid`,
+     * then the released flag, in this order; the non-atomic prep iterators are set to `_app_prep_begin` and the output
+     * pipe is closed) and the released flag. It runs no `undo`
+     * command, terminates no process group, calls no tray, gamepad or display function. It writes only the atomics above and
+     * members that no other thread reads while the app is released (`_app_prep_it`, `_pipe`; `terminate()` is not
+     * reached by `running()` in placebo mode), and never assigns `_process` or `_process_group`. The caller is the
+     * handoff thread (the rollback worker, or the draining process's exit path) with the 503 gate up; it may run
+     * concurrently with the control loop's `running()` and with `/serverinfo`, which see the old id or 0 (see
+     * `running()`).
      * If the app is not released it does nothing, so it can never skip an `undo` by mistake. The caller logs the
      * Warning.
      *
@@ -328,7 +353,7 @@ namespace proc {
      * @brief Replace only the application list (the old process, on rollback), not the whole `proc_t`.
      *
      * `proc::refresh` replaces the whole object while the control loop polls `running()`; this replaces `_apps` and
-     * nothing else (`_app`, the environment, the mirrors and the iterators stay), so a running app keeps its own copy
+     * nothing else (`_app`, the environment, the atomics and the iterators stay), so a running app keeps its own copy
      * of its prep list and a changed `apps.json` does not change what its `undo` runs. Same rule as adoption: the
      * caller guarantees that no request that reads or changes the list is running (the 503 gate is up and the in-flight
      * counters are zero) and takes no lock here.
@@ -340,19 +365,19 @@ namespace proc {
     /**
      * @brief The environment's base entries for the digest, from this object's environment.
      *
-     * @return `base_env_for_digest(_env)`. Same caller rule as `snapshot()` (no concurrent `execute()`).
+     * @return `proc::base_env_for_digest(_env)`. Same caller rule as `snapshot()` (no concurrent `execute()`).
      */
-    std::vector<std::pair<std::string, std::string>> base_env_for_digest() const;
+    std::vector<std::pair<std::string, std::string>> digest_base_env() const;
 
 #ifdef __linux__
     /**
      * @brief Take the snapshot that `GO` carries.
      *
      * Precondition (the caller's, not checked): the gate is up, the in-flight requests have finished and `adoptable()`
-     * was true, so nothing changes `_app`, `_env` or the mirrors during the call.
+     * was true, so nothing changes `_app`, `_env` or the atomics during the call.
      *
-     * @return `std::nullopt` when no app is recorded (mirror app id 0). Otherwise `app_snapshot_t{app_id = mirror app
-     *         id, name = _app.name, applied_prep = mirror applied count, digest = handoff::app_digest(digest_input(_app,
+     * @return `std::nullopt` when no app is recorded (atomic app id 0 or below). Otherwise `app_snapshot_t{app_id = the atomic app
+     *         id, name = _app.name, applied_prep = the atomic applied count, digest = handoff::app_digest(digest_input(_app,
      *         _env)), launch_env = the entries of _env for which is_launch_env_name is true, sorted by name}`.
      */
     std::optional<handoff::protocol::app_snapshot_t> snapshot() const;
@@ -379,11 +404,11 @@ namespace proc {
     /**
      * @brief Install a prepared adoption (the new process, at `COMMIT`).
      *
-     * Does nothing when `plan.has_app` is `false`. Otherwise sets `_app_id`, `_app` (the plan's copy, which also gives
+     * Does nothing when `plan.has_app` is `false`. Otherwise sets the atomic app id, `_app` (the plan's copy, which also gives
      * `get_last_run_app_name()`), `_app_prep_begin` (the begin of `_app.prep_cmds`), `_app_prep_it` (begin plus
      * `applied_prep`), placebo mode, and the environment: each launch entry is stored in `_env`; then reopens the app's
      * `output` file for appending when it is neither empty nor `null` (a failure logs a Warning and continues without
-     * a pipe). Updates the mirrors (app id, placebo true, process group 0, applied count, released false). Starts no
+     * a pipe). Sets the atomics (app id, placebo true, process group 0, applied count, released false). Starts no
      * process, runs no command and sends no tray notification. Precondition: it runs before the process accepts any
      * request, on the plan from `prepare_adoption()` of this same object with no `refresh` or `swap_app_list` in
      * between; no lock is taken.
@@ -397,8 +422,8 @@ namespace proc {
     /**
      * @brief Test-only: make the object look like it runs an app, without starting anything.
      *
-     * Sets `_app` to `app`, `_app_id` and the mirror app id to `app_id`, the mirror placebo flag and `placebo`, the
-     * mirror process group, and the prep iterators and mirror applied count to `applied_prep` (clamped to the prep
+     * Sets `_app` to `app`, the atomic app id to `app_id`, the placebo flag, the process group, and the prep
+     * iterators and the atomic applied count to `applied_prep` (clamped to the prep
      * list size). Does not touch `_env`.
      *
      * @param app The app (its `prep_cmds` are used).
@@ -419,16 +444,12 @@ namespace proc {
 #endif
 
   private:
-    app_mirror_t _mirror;  ///< Atomic copies of the running-app fields for the handoff (see @ref app_mirror_t).
-    int _app_id;
+    app_atomics_t _live;  ///< Atomic running-app fields (see @ref app_atomics_t); replace the old `_app_id`, `placebo`.
 
     boost::process::v1::environment _env;
     std::vector<ctx_t> _apps;
     ctx_t _app;
     std::chrono::steady_clock::time_point _app_launch_time;
-
-    // If no command associated with _app_id, yet it's still running
-    bool placebo {};
 
     boost::process::v1::child _process;
     boost::process::v1::group _process_group;
