@@ -81,23 +81,16 @@ namespace rtsp_stream {
   void terminate_sessions_by_cert(std::string_view cert);
 
   /**
-   * @brief Public description of one streaming session, safe to show in the web UI.
+   * @brief Minimal description of one streaming session, for an operator to pick a session to close.
    *
-   * It never contains keys, IVs, ping payloads, connect data or certificates.
+   * It holds only what is needed to choose a session. It never contains client identities (names, UUIDs,
+   * addresses, certificates), keys, IVs, ping payloads or connect data.
    */
   struct session_info_t {
     std::uint32_t id {0};  ///< Launch session id; stable for the session's lifetime.
-    std::string client_name;  ///< Name of the paired client, or empty when unknown.
-    std::string client_uuid;  ///< UUID of the paired client, or empty when unknown.
-    std::string peer_address;  ///< Client IP address as seen by the RTSP server.
-    int app_id {0};  ///< Id of the launched app.
     std::chrono::system_clock::time_point started {};  ///< Time the session was created.
-    int width {0};  ///< Stream width in pixels.
-    int height {0};  ///< Stream height in pixels.
-    int fps {0};  ///< Requested frame rate.
-    int video_format {0};  ///< 0 = H.264, 1 = HEVC, 2 = AV1.
-    int dynamic_range {0};  ///< 0 = SDR, 1 = HDR.
-    std::string state;  ///< `stopped`, `stopping`, `starting` or `running`.
+    std::string transport;  ///< `udp/ipv4` or `udp/ipv6`.
+    std::string client_category;  ///< Network class of the client: `local`, `lan` or `wan`.
   };
 
   /**
@@ -111,6 +104,7 @@ namespace rtsp_stream {
    * @brief Ask one streaming session to stop, through the normal stop path.
    *
    * The session is stopped with reason `api-close`; the RTSP server then joins and removes it as usual.
+   * Callers must authenticate the requester first (admin web UI only).
    *
    * @param id Launch session id from `list_sessions()`.
    * @return `true` when a session with this id exists and was asked to stop.

@@ -90,6 +90,9 @@ namespace confighttp {
   /**
    * @brief Close one streaming session by id (`POST /api/sessions/<id>/close`).
    *
+   * Requires admin authentication and a CSRF token. Every close is logged at Info with the session id,
+   * the authenticated user and the source address.
+   *
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client; `path_match[1]` is the session id.
    */
@@ -99,8 +102,7 @@ namespace confighttp {
    * @brief Convert a session description to the JSON object returned by `GET /api/sessions`.
    *
    * @param info Session description.
-   * @return Object with `id`, `client_name`, `client_uuid`, `peer_address`, `app_id`, `started` (Unix seconds),
-   *         `width`, `height`, `fps`, `video_format`, `dynamic_range` and `state`.
+   * @return Object with exactly `id`, `started` (Unix seconds), `transport` and `client_category`.
    */
   nlohmann::json session_info_to_json(const rtsp_stream::session_info_t &info);
 
