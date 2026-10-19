@@ -14,6 +14,8 @@
   #include <functional>
   #include <memory>
   #include <mutex>
+  #include <optional>
+  #include <stdexcept>
   #include <thread>
   #include <vector>
 
@@ -277,6 +279,50 @@ TEST(HandoffEndAllTest, WaitingEndAllIsRejectedToo) {
     << "an END_ALL that waited for a round that ended in a rollback gets the same answer, END_REJECTED";
 }
 
+TEST(HandoffEndAllTest, WaitingEndAllKeepsTheRunnersAnswerEvenIfRollbackFollowsAtOnce) {
+  for (int i = 0; i < 25; ++i) {
+    auto m = std::make_shared<handoff::end_all_machine_t>();
+    auto b = std::make_shared<blocker_t>();
+    std::atomic<int> first_answer {-1};
+    std::atomic<int> second_answer {-1};
+    std::thread first([&, m, b] {
+      first_answer = static_cast<int>(m->handle_end_all(std::ref(*b)));
+    });
+    ASSERT_TRUE(b->wait_started(1000ms));
+    std::thread second([&, m] {
+      second_answer = static_cast<int>(m->handle_end_all([] {
+      }));
+    });
+    std::this_thread::sleep_for(20ms);
+    b->release();
+    first.join();
+    m->decide_rollback();
+    second.join();
+    ASSERT_EQ(static_cast<int>(end_all_answer_e::ended), first_answer.load());
+    ASSERT_EQ(static_cast<int>(end_all_answer_e::ended), second_answer.load())
+      << "iteration " << i << ": a waiting END_ALL must get the runner's answer even if decide_rollback() follows at once";
+  }
+}
+
+TEST(HandoffEndAllTest, ThrowingEndAndJoinReturnsToIdleAndNextEndAllRuns) {
+  handoff::end_all_machine_t m;
+  try {
+    m.handle_end_all([] {
+      throw std::runtime_error("boom");
+    });
+  } catch (...) {
+    // Whether the exception propagates is not specified.
+  }
+  EXPECT_EQ(end_state_e::idle, m.state()) << "a throwing end_and_join must leave the state idle, not stuck in ending";
+  int runs = 0;
+  auto answer = m.handle_end_all([&] {
+    ++runs;
+  });
+  EXPECT_EQ(1, runs) << "the next END_ALL must run end_and_join again";
+  EXPECT_EQ(end_all_answer_e::ended, answer);
+  EXPECT_EQ(end_state_e::ended, m.state());
+}
+
 TEST(HandoffEndAllTest, StateAndRollbackCanBeCalledInsideEndAndJoin) {
   auto m = std::make_shared<handoff::end_all_machine_t>();
   auto inner_state = std::make_shared<std::atomic<int>>(-1);
@@ -359,13 +405,14 @@ namespace {
     bool block_for_timeout {false};  ///< `end_all()` waits for its whole timeout (as a real, silent peer does).
     int end_all_calls {0};  ///< Calls of `end_all()`.
     std::chrono::milliseconds last_timeout {0};  ///< Timeout of the last `end_all()`.
+    std::optional<clock_type::time_point> gone_at;  ///< `gone()` turns true at this time.
 
     bool exists() override {
       return exists_value;
     }
 
     bool gone() override {
-      return gone_value;
+      return gone_value || (gone_at && clock_type::now() >= *gone_at);
     }
 
     reply_e end_all(std::chrono::milliseconds timeout) override {
@@ -411,13 +458,31 @@ TEST(HandoffEndAllTest, EndAllIsSentWithTheWholeBudget) {
   EXPECT_LE(peer.last_timeout, 5000ms);
 }
 
-TEST(HandoffEndAllTest, RejectedWhileAliveIsRefusedQuickly) {
+TEST(HandoffEndAllTest, RejectedWhileAliveIsRefusedAtTheEndOfTheBudget) {
   fake_peer_t peer;
   peer.reply = handoff::drain_peer_t::reply_e::rejected;
   auto start = clock_type::now();
-  EXPECT_EQ(handoff::terminate_permission_e::refused, handoff::await_terminate_permission(peer, 1500ms));
-  EXPECT_LT(clock_type::now() - start, 700ms) << "END_REJECTED must be answered with refused without waiting out the budget";
+  EXPECT_EQ(handoff::terminate_permission_e::refused, handoff::await_terminate_permission(peer, 200ms));
+  auto elapsed = clock_type::now() - start;
+  EXPECT_GE(elapsed, 160ms) << "END_REJECTED counts as a timeout: the peer is polled until the budget ends";
+  EXPECT_LT(elapsed, 1500ms);
   EXPECT_EQ(1, peer.end_all_calls);
+}
+
+TEST(HandoffEndAllTest, RejectedThenPeerDiesDuringBudgetIsPeerGone) {
+  fake_peer_t peer;
+  peer.reply = handoff::drain_peer_t::reply_e::rejected;
+  peer.gone_at = clock_type::now() + 60ms;
+  auto start = clock_type::now();
+  EXPECT_EQ(handoff::terminate_permission_e::peer_gone, handoff::await_terminate_permission(peer, 1500ms));
+  EXPECT_LT(clock_type::now() - start, 1000ms) << "peer_gone is returned as soon as the peer is gone, not at the end of the budget";
+}
+
+TEST(HandoffEndAllTest, NoReplyThenPeerDiesDuringBudgetIsPeerGone) {
+  fake_peer_t peer;
+  peer.reply = handoff::drain_peer_t::reply_e::no_reply;
+  peer.gone_at = clock_type::now() + 60ms;
+  EXPECT_EQ(handoff::terminate_permission_e::peer_gone, handoff::await_terminate_permission(peer, 1500ms));
 }
 
 TEST(HandoffEndAllTest, RejectedButGoneByThenIsPeerGone) {
