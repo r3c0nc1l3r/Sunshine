@@ -36,6 +36,7 @@
   #include <unistd.h>
 
   // local includes
+  #include "src/handoff/coordinator.h"
   #include "src/handoff/hooks.h"
   #include "src/handoff/new_ops.h"
   #include "src/handoff/runtime.h"
@@ -327,6 +328,7 @@ protected:
    * @brief Remove the instance file and the temporary directory and reset the process-wide state.
    */
   void TearDown() override {
+    handoff::set_new_ops_coordinator(nullptr);
     ops.reset();
     peer.reset();
     channel.reset();
@@ -1266,6 +1268,179 @@ TEST_F(HandoffNewOpsTest, ServerListeningNeverBlocksOnAnIdleOps) {
     ops->server_listening();
   }
   EXPECT_LT(std::chrono::steady_clock::now() - start, 500ms) << "server_listening must never block";
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Production default seams and the coordinator hook (set_new_ops_coordinator)
+// ---------------------------------------------------------------------------------------------------------------------
+
+namespace {
+  /**
+   * @brief Sets the coordinator hook to null on destruction (declared after the coordinator, so it runs first).
+   */
+  struct hook_reset_t {
+    /**
+     * @brief Clear the hook.
+     */
+    ~hook_reset_t() {
+      handoff::set_new_ops_coordinator(nullptr);
+    }
+  };
+
+  /**
+   * @brief Set `RUNTIME_DIRECTORY` for the life of the object.
+   */
+  struct runtime_dir_env_t {
+    /**
+     * @brief Set the variable.
+     *
+     * @param value New value.
+     */
+    explicit runtime_dir_env_t(const std::string &value) {
+      if (const char *old = ::getenv("RUNTIME_DIRECTORY")) {
+        had = true;
+        previous = old;
+      }
+      ::setenv("RUNTIME_DIRECTORY", value.c_str(), 1);
+    }
+
+    /**
+     * @brief Restore the variable.
+     */
+    ~runtime_dir_env_t() {
+      if (had) {
+        ::setenv("RUNTIME_DIRECTORY", previous.c_str(), 1);
+      } else {
+        ::unsetenv("RUNTIME_DIRECTORY");
+      }
+    }
+
+    bool had {false};  ///< The variable was set before.
+    std::string previous;  ///< Its old value.
+  };
+}  // namespace
+
+/**
+ * @brief Fixture for the default `set_cooldown_deadline_ns` and `start_control_server` seams.
+ */
+class HandoffNewOpsCoordinatorHookTest: public HandoffNewOpsTest {
+protected:
+  /**
+   * @brief Use the production cooldown and control seams, then rebuild.
+   */
+  void SetUp() override {
+    HandoffNewOpsTest::SetUp();
+    seams.set_cooldown_deadline_ns = nullptr;
+    seams.start_control_server = nullptr;
+    rebuild();
+    _tmp = std::filesystem::temp_directory_path() / ("sunshine-t18b-hook-" + std::to_string(::getpid()) + "-" + ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    std::error_code ec;
+    std::filesystem::remove_all(_tmp, ec);
+    std::filesystem::create_directories(_tmp, ec);
+  }
+
+  /**
+   * @brief Remove the temporary directory.
+   */
+  void TearDown() override {
+    HandoffNewOpsTest::TearDown();
+    std::error_code ec;
+    std::filesystem::remove_all(_tmp, ec);
+  }
+
+  /**
+   * @brief Deliver an old `HELLO` that carries a cooldown deadline.
+   *
+   * @param ahead How far ahead the deadline is.
+   * @return The deadline as a steady-clock time point.
+   */
+  std::chrono::steady_clock::time_point deliver_deadline(std::chrono::seconds ahead) {
+    const auto deadline = std::chrono::steady_clock::now() + ahead;
+    auto hello = old_hello();
+    hello.cooldown_deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch()).count();
+    ops->accept_old_hello(hello, make_fake_pidfd());
+    return deadline;
+  }
+
+  /**
+   * @brief Whether the coordinator's cooldown is active until about `deadline`.
+   *
+   * @param coordinator Coordinator.
+   * @param deadline Expected deadline.
+   * @return `true` when `cooldown_until()` is within 5 ms of it.
+   */
+  static bool cooldown_matches(const handoff::coordinator_t &coordinator, std::chrono::steady_clock::time_point deadline) {
+    const auto diff = coordinator.cooldown_until() - deadline;
+    return diff < 5ms && diff > -5ms;
+  }
+
+  std::filesystem::path _tmp;  ///< Runtime directory for the control socket.
+};
+
+TEST_F(HandoffNewOpsCoordinatorHookTest, DeadlineDeliveredBeforeTheCoordinatorIsAppliedWhenItIsSet) {
+  handoff::control_server_t control;
+  handoff::coordinator_t coordinator {control};
+  hook_reset_t reset;
+  EXPECT_EQ(coordinator.cooldown_until(), std::chrono::steady_clock::time_point::min()) << "control: no cooldown before anything is delivered";
+  const auto deadline = deliver_deadline(30s);
+  EXPECT_EQ(coordinator.cooldown_until(), std::chrono::steady_clock::time_point::min()) << "a null hook must not reach the coordinator yet";
+  handoff::set_new_ops_coordinator(&coordinator);
+  EXPECT_TRUE(cooldown_matches(coordinator, deadline)) << "set_new_ops_coordinator(non-null) must apply the stored deadline before it returns";
+  EXPECT_GT(coordinator.cooldown_until(), std::chrono::steady_clock::now()) << "the cooldown is active";
+}
+
+TEST_F(HandoffNewOpsCoordinatorHookTest, DeadlineDeliveredAfterTheCoordinatorIsSetIsApplied) {
+  handoff::control_server_t control;
+  handoff::coordinator_t coordinator {control};
+  hook_reset_t reset;
+  handoff::set_new_ops_coordinator(&coordinator);
+  const auto deadline = deliver_deadline(30s);
+  EXPECT_TRUE(cooldown_matches(coordinator, deadline)) << "with the coordinator set, the default seam applies the deadline at once";
+}
+
+TEST_F(HandoffNewOpsCoordinatorHookTest, SettingNullDiscardsAStoredDeadline) {
+  handoff::control_server_t control;
+  handoff::coordinator_t coordinator {control};
+  hook_reset_t reset;
+  deliver_deadline(30s);
+  handoff::set_new_ops_coordinator(nullptr);
+  handoff::set_new_ops_coordinator(&coordinator);
+  EXPECT_EQ(coordinator.cooldown_until(), std::chrono::steady_clock::time_point::min()) << "the deadline was discarded by set_new_ops_coordinator(nullptr), so no cooldown";
+}
+
+TEST_F(HandoffNewOpsCoordinatorHookTest, ASetDeadlineIsAppliedOnlyOnce) {
+  handoff::control_server_t control;
+  handoff::coordinator_t coordinator {control};
+  hook_reset_t reset;
+  deliver_deadline(30s);
+  handoff::set_new_ops_coordinator(&coordinator);
+  handoff::set_new_ops_coordinator(nullptr);
+  handoff::set_new_ops_coordinator(&coordinator);
+  EXPECT_GT(coordinator.cooldown_until(), std::chrono::steady_clock::now()) << "the earlier application stays (cooldown never lowers)";
+}
+
+TEST_F(HandoffNewOpsCoordinatorHookTest, DefaultControlServerWithoutACoordinatorDoesNothing) {
+  const runtime_dir_env_t env {_tmp.string()};
+  run_pre_commit();
+  run_commit();
+  ops->on_main();
+  EXPECT_EQ(ops->stage(), new_stage_e::main) << "on_main completes even though the control server cannot start";
+  EXPECT_FALSE(std::filesystem::exists(handoff::control_socket_path(_tmp, ::getpid()))) << "no control socket may appear without a coordinator";
+}
+
+TEST_F(HandoffNewOpsCoordinatorHookTest, DefaultControlServerWithACoordinatorStartsTheControlSocket) {
+  const runtime_dir_env_t env {_tmp.string()};
+  handoff::control_server_t control;
+  handoff::coordinator_t coordinator {control};
+  hook_reset_t reset;
+  handoff::set_new_ops_coordinator(&coordinator);
+  run_pre_commit();
+  run_commit();
+  ops->on_main();
+  EXPECT_TRUE(std::filesystem::exists(handoff::control_socket_path(_tmp, ::getpid()))) << "on_main must start the control server through the coordinator";
+  coordinator.request_shutdown();
+  handoff::set_new_ops_coordinator(nullptr);
+  coordinator.stop_control();
 }
 
 #endif  // __linux__
