@@ -52,6 +52,9 @@ namespace confighttp {
 #endif
 
   // Type aliases for HTTPS server components
+  /**
+   * @brief HTTPS server type of the admin web UI.
+   */
   using https_server_t = adoptable_https_server_t;
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
   using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;

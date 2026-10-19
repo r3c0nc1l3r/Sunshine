@@ -1480,8 +1480,6 @@ namespace video {
 
   /**
    * @brief Set or clear the `/serverinfo` probe override.
-   *
-   * @param value Override to install, or `std::nullopt` to clear it.
    */
   void set_handoff_probe_override(std::optional<handoff_probe_override_t> value) {
     std::lock_guard lock {handoff_probe_override_mutex};

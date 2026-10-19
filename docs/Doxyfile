@@ -50,6 +50,7 @@ INPUT = ../README.md \
         guides.md \
         performance_tuning.md \
         api.md \
+        drain-handoff.md \
         troubleshooting.md \
         building.md \
         contributing.md \

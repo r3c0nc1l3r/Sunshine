@@ -1619,8 +1619,6 @@ namespace confighttp {
 
   /**
    * @brief Close a session of this process or, on Linux, of the draining process.
-   * @param id Launch session id.
-   * @return The close result, as for `rtsp_stream::request_session_close()`.
    */
   rtsp_stream::close_result_e close_session_any(std::uint32_t id) {
     const auto result = rtsp_stream::request_session_close(id);
@@ -1741,8 +1739,6 @@ namespace confighttp {
    * Registers exactly `POST /api/apps/close`, `/api/clients/unpair`, `/api/clients/unpair-all` and
    * `/api/clients/update` with their production handlers. `start()` calls this, so tests can exercise the production
    * route table.
-   *
-   * @param server Admin web UI HTTPS server.
    */
   void register_app_client_routes(https_server_t &server) {
     server.resource["^/api/apps/close$"]["POST"] = closeApp;

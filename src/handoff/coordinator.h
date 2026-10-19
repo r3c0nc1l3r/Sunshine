@@ -526,33 +526,111 @@ namespace handoff {
      */
     sunshine_old_ops_t(control_server_t &control, int new_base, pid_t child_pid, std::chrono::steady_clock::time_point cooldown_until, std::filesystem::path instances_dir);
 
-    protocol::hello_t hello() override;  ///< See the class comment.
-    int self_pidfd() override;  ///< See the class comment.
-    std::string pause_accept() override;  ///< See the class comment; empty when all four confirmed.
+    /**
+     * @brief Own `HELLO` (probe results, identity, cooldown deadline).
+     *
+     * @return Message to send.
+     */
+    protocol::hello_t hello() override;
+    /**
+     * @brief A pidfd of this process for `HELLO`; the side closes it after sending.
+     *
+     * @return Pidfd, or -1 (then the start fails).
+     */
+    int self_pidfd() override;
+    /**
+     * @brief Substep 1: pause accepting on all four sockets.
+     *
+     * @return An empty string when all four sockets confirmed the pause; otherwise a one-line reason naming the server that did not confirm.
+     */
+    std::string pause_accept() override;
     void resume_accept() override;  ///< See the class comment.
     void raise_gate() override;  ///< See the class comment.
     void lower_gate() override;  ///< See the class comment.
-    bool wait_in_flight(std::chrono::milliseconds timeout) override;  ///< See the class comment.
-    std::string recheck(std::chrono::milliseconds pairing_wait) override;  ///< See the class comment.
-    bool save_state() override;  ///< See the class comment.
+    /**
+     * @brief Wait for the in-flight counters to reach zero.
+     *
+     * @param timeout Longest wait; negative waits without limit.
+     * @return `true` when zero was reached.
+     */
+    bool wait_in_flight(std::chrono::milliseconds timeout) override;
+    /**
+     * @brief Substep 4: repeat the step-1 checks, wait for pairing sessions and drop a pending launch.
+     *
+     * @param pairing_wait Longest wait for pairing sessions.
+     * @return Empty when the switch may continue; otherwise the reason.
+     */
+    std::string recheck(std::chrono::milliseconds pairing_wait) override;
+    /**
+     * @brief Substep 5: save `sunshine_state.json`.
+     *
+     * @return `true` on success.
+     */
+    bool save_state() override;
     void freeze() override;  ///< See the class comment.
     void unfreeze() override;  ///< See the class comment.
-    void withdraw_mdns(std::chrono::milliseconds timeout) override;  ///< See the class comment.
+    /**
+     * @brief Substep 7: withdraw mDNS and wait for Avahi to drop the entry.
+     *
+     * @param timeout Longest wait.
+     */
+    void withdraw_mdns(std::chrono::milliseconds timeout) override;
     void publish_mdns() override;  ///< See the class comment.
     void remove_tray() override;  ///< See the class comment.
     void restore_tray() override;  ///< See the class comment.
-    protocol::go_t take_snapshot() override;  ///< See the class comment.
-    bool shutdown_requested() override;  ///< See the class comment.
-    void set_released(bool released) override;  ///< See the class comment.
+    /**
+     * @brief Substep 8: the snapshot `GO` carries.
+     *
+     * @return Snapshot.
+     */
+    protocol::go_t take_snapshot() override;
+    /**
+     * @brief Substep 9: whether a shutdown request has arrived.
+     *
+     * @return `true` when shutting down.
+     */
+    bool shutdown_requested() override;
+    /**
+     * @brief Set or clear the app's release flag.
+     *
+     * @param released New value.
+     */
+    void set_released(bool released) override;
     void drop_app() override;  ///< See the class comment.
-    bool reload_after_rollback() override;  ///< See the class comment.
+    /**
+     * @brief Rollback: reload both state files and the credentials file and swap in the app list.
+     *
+     * @return `false` when a reload failed.
+     */
+    bool reload_after_rollback() override;
     void enter_drain_mode() override;  ///< See the class comment.
     void leave_drain_mode() override;  ///< See the class comment.
-    void set_role(role_e role) override;  ///< See the class comment.
-    void set_state(state_e state) override;  ///< See the class comment.
+    /**
+     * @brief Set this process's instance-file role.
+     *
+     * @param role Role.
+     */
+    void set_role(role_e role) override;
+    /**
+     * @brief Set this process's handoff state.
+     *
+     * @param state State.
+     */
+    void set_state(state_e state) override;
     void remove_new_instance_file() override;  ///< See the class comment.
-    void start_upnp_cleanup(int new_base) override;  ///< See the class comment.
-    bool handover(pid_t new_pid) override;  ///< See the class comment.
+    /**
+     * @brief Rollback after `COMMIT`: start the best-effort UPnP cleanup of the new base on a background task.
+     *
+     * @param new_base The killed new process's UDP base.
+     */
+    void start_upnp_cleanup(int new_base) override;
+    /**
+     * @brief Step 7.2-7.3: `MAINPID=` plus the barrier, then the read-back.
+     *
+     * @param new_pid New process pid.
+     * @return `true` when the read-back equals `new_pid`.
+     */
+    bool handover(pid_t new_pid) override;
     void close_socket_copies() override;  ///< See the class comment.
 
 #ifdef SUNSHINE_TESTS

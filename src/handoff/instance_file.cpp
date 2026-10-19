@@ -475,6 +475,9 @@ namespace handoff {
     remove_instance_file(_dir, _instance.pid);
   }
 
+  /**
+   * @brief Remove the instance file of process `pid` from `dir`.
+   */
   void remove_instance_file(const fs::path &dir, pid_t pid) {
     const auto path = dir / (std::to_string(pid) + ".json");
     if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
@@ -522,6 +525,9 @@ namespace handoff {
     }
   }  // namespace
 
+  /**
+   * @brief Read the instance files in `dir` and sort them into live and stale instances.
+   */
   scan_result_t scan_instances(const fs::path &dir, const std::function<std::optional<std::uint64_t>(pid_t)> &start_time_of) {
     scan_result_t result;
 
@@ -601,6 +607,9 @@ namespace handoff {
     return false;
   }
 
+  /**
+   * @brief Wait until the instance file of process `pid` in `dir` is active, or the timeout expires.
+   */
   bool wait_for_active(const fs::path &dir, pid_t pid, std::uint64_t start_time, std::chrono::milliseconds timeout) {
     using clock = std::chrono::steady_clock;
     constexpr auto poll_interval = std::chrono::milliseconds(100);
