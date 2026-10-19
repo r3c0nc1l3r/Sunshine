@@ -63,8 +63,6 @@ namespace handoff {
     /**
      * @brief Control servers whose handler is running through `start_control()` (the "already running" memory).
      */
-    std::mutex control_started_mutex;
-    std::set<const control_server_t *> control_started;
 
     /**
      * @brief Run `fn`; an exception is logged as an Error and `failure` is returned.
@@ -151,6 +149,137 @@ namespace handoff {
     upnp::unmap_scope_e scope_for_drain(int new_base, int own_base) {
       return new_base == own_base ? upnp::unmap_scope_e::none : upnp::unmap_scope_e::udp_only;
     }
+
+    /**
+     * @brief Forwards every `old_side_ops_t` call and reports the call that comes just before `GO` is written.
+     */
+    class tracking_ops_t final: public old_side_ops_t {
+    public:
+      tracking_ops_t(std::unique_ptr<old_side_ops_t> inner, std::function<void()> before_go):
+          _inner(std::move(inner)),
+          _before_go(std::move(before_go)) {
+      }
+
+      protocol::hello_t hello() override {
+        return _inner->hello();
+      }
+
+      int self_pidfd() override {
+        return _inner->self_pidfd();
+      }
+
+      std::string pause_accept() override {
+        return _inner->pause_accept();
+      }
+
+      void resume_accept() override {
+        _inner->resume_accept();
+      }
+
+      void raise_gate() override {
+        _inner->raise_gate();
+      }
+
+      void lower_gate() override {
+        _inner->lower_gate();
+      }
+
+      bool wait_in_flight(std::chrono::milliseconds timeout) override {
+        return _inner->wait_in_flight(timeout);
+      }
+
+      std::string recheck(std::chrono::milliseconds pairing_wait) override {
+        return _inner->recheck(pairing_wait);
+      }
+
+      bool save_state() override {
+        return _inner->save_state();
+      }
+
+      void freeze() override {
+        _inner->freeze();
+      }
+
+      void unfreeze() override {
+        _inner->unfreeze();
+      }
+
+      void withdraw_mdns(std::chrono::milliseconds timeout) override {
+        _inner->withdraw_mdns(timeout);
+      }
+
+      void publish_mdns() override {
+        _inner->publish_mdns();
+      }
+
+      void remove_tray() override {
+        _inner->remove_tray();
+      }
+
+      void restore_tray() override {
+        _inner->restore_tray();
+      }
+
+      protocol::go_t take_snapshot() override {
+        return _inner->take_snapshot();
+      }
+
+      bool shutdown_requested() override {
+        return _inner->shutdown_requested();
+      }
+
+      void set_released(bool released) override {
+        if (released) {
+          // The old side sets the flag immediately before it writes `GO`.
+          _before_go();
+        }
+        _inner->set_released(released);
+      }
+
+      void drop_app() override {
+        _inner->drop_app();
+      }
+
+      bool reload_after_rollback() override {
+        return _inner->reload_after_rollback();
+      }
+
+      void enter_drain_mode() override {
+        _inner->enter_drain_mode();
+      }
+
+      void leave_drain_mode() override {
+        _inner->leave_drain_mode();
+      }
+
+      void set_role(role_e role) override {
+        _inner->set_role(role);
+      }
+
+      void set_state(state_e state) override {
+        _inner->set_state(state);
+      }
+
+      void remove_new_instance_file() override {
+        _inner->remove_new_instance_file();
+      }
+
+      void start_upnp_cleanup(int new_base) override {
+        _inner->start_upnp_cleanup(new_base);
+      }
+
+      bool handover(pid_t new_pid) override {
+        return _inner->handover(new_pid);
+      }
+
+      void close_socket_copies() override {
+        _inner->close_socket_copies();
+      }
+
+    private:
+      std::unique_ptr<old_side_ops_t> _inner;  ///< The real operations.
+      std::function<void()> _before_go;  ///< Called before the operation that precedes `GO`.
+    };
   }  // namespace
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -972,6 +1101,7 @@ namespace handoff {
     bool answered {false};  ///< The helper has been answered (guarded by the coordinator mutex).
     control_reply_t reply;  ///< The answer (guarded by the coordinator mutex).
     bool started {false};  ///< The run thread was started (guarded by the coordinator mutex).
+    bool commit_possible {false};  ///< The switch reached the point just before `GO` (and so `COMMIT`) can be written (guarded by the coordinator mutex).
     bool run_done {false};  ///< The run thread finished (guarded by the coordinator mutex).
     bool stop_started {false};  ///< `stop()` began on this attempt (guarded by the coordinator mutex).
     bool stop_done {false};  ///< `stop()` finished on this attempt (guarded by the coordinator mutex).
@@ -1286,14 +1416,16 @@ namespace handoff {
         post_handover(c, att);
       } else {
         const bool rolled_back = completed && outcome == old_outcome_e::rolled_back;
-        bool after_commit;
+        bool commit_possible;
         {
           std::lock_guard lock {c._mutex};
-          after_commit = att->reply.kind == reply_kind_e::committed;
+          commit_possible = att->commit_possible || att->reply.kind == reply_kind_e::committed;
         }
-        after_commit = after_commit || rt(c).mode() == mode_e::draining;
-        // A shutdown after COMMIT keeps the scope the freeze set: the new process may hold the shared mappings.
-        finish_failed(c, att, rolled_back, rolled_back || !after_commit);
+        commit_possible = commit_possible || rt(c).mode() == mode_e::draining;
+        // Once COMMIT may have been written, the new process may own the shared mappings. Every outcome other than a
+        // completed rollback (the new process confirmed gone) keeps the scope the freeze set. A mapping may be left
+        // behind at shutdown; the active process's mapping is never removed.
+        finish_failed(c, att, rolled_back, rolled_back || !commit_possible);
       }
 
       {
@@ -1324,8 +1456,6 @@ namespace handoff {
 
   coordinator_t::~coordinator_t() {
     stop();
-    std::lock_guard lock {control_started_mutex};
-    control_started.erase(&_control);
   }
 
   control_server_t::handler_t coordinator_t::handler() {
@@ -1538,6 +1668,11 @@ namespace handoff {
     if (!att->ops) {
       att->ops = std::make_unique<sunshine_old_ops_t>(_control, att->new_base, att->child->pid(), cooldown, A::instances_dir(*this));
     }
+    // Note the point just before `GO` is written: from there on `COMMIT` may be written and the new process may commit.
+    att->ops = std::make_unique<tracking_ops_t>(std::move(att->ops), [this, raw = att.get()]() {
+      std::lock_guard lock {_mutex};
+      raw->commit_possible = true;
+    });
 
 #ifdef SUNSHINE_TESTS
     if (_env.make_responder) {
@@ -1623,8 +1758,8 @@ namespace handoff {
       }
     }
     {
-      std::lock_guard lock {control_started_mutex};
-      if (control_started.count(&_control) != 0) {
+      std::lock_guard lock {_mutex};
+      if (_control_started) {
         return true;
       }
     }
@@ -1633,15 +1768,15 @@ namespace handoff {
       BOOST_LOG(error) << "Drain handoff: the control socket could not be opened: "sv << open_error;
       return false;
     }
-    std::lock_guard lock {control_started_mutex};
-    control_started.insert(&_control);
+    std::lock_guard lock {_mutex};
+    _control_started = true;
     return true;
   }
 
   void coordinator_t::stop_control() {
     _control.stop();
-    std::lock_guard lock {control_started_mutex};
-    control_started.erase(&_control);
+    std::lock_guard lock {_mutex};
+    _control_started = false;
   }
 
   void coordinator_t::request_shutdown() {

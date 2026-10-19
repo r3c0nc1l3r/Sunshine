@@ -921,6 +921,7 @@ namespace handoff {
     bool _claimed {false};  ///< An attempt holds the claim.
     bool _stopping {false};  ///< `request_shutdown()` or `stop()` ran.
     bool _handed_over {false};  ///< `handed_over` happened.
+    bool _control_started {false};  ///< True once start_control() started the control server; guarded by _mutex.
     end_all_machine_t _end_all;  ///< Shared by `old_side_t` and the responder.
     std::shared_ptr<attempt_t> _attempt;  ///< The current or last attempt.
     std::unique_ptr<channel_reader_t> _reader;  ///< After a handover.
