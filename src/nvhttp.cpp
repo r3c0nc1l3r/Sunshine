@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <format>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -277,9 +278,9 @@ namespace nvhttp {
       }
     }
 
-    root.erase("root"s);
-
+    // Only the keys this save owns are replaced; every other key under `root` is kept.
     root.put("root.uniqueid", http::unique_id);
+    root.erase("root.named_devices"s);
     client_t &client = client_root;
     pt::ptree node;
 
@@ -392,12 +393,13 @@ namespace nvhttp {
    * @brief Parse the paired-client records of the `root` node of the state file.
    *
    * Imports the old `devices` format, reads `named_devices`, and canonicalizes the certificates. Throws on a malformed
-   * record (`boost::property_tree` exceptions).
+   * record (`boost::property_tree` exceptions). With `strict`, a non-empty scalar `root.named_devices` also throws.
    *
    * @param root The `root` node of the state file.
+   * @param strict Reject a malformed client list (used by reload_state); startup passes `false`.
    * @return The parsed clients.
    */
-  client_t parse_client_tree(const pt::ptree &root) {
+  client_t parse_client_tree(const pt::ptree &root, const bool strict) {
     client_t client;
 
     // Import from old format
@@ -419,6 +421,10 @@ namespace nvhttp {
     }
 
     if (root.count("named_devices")) {
+      // A non-empty scalar is not a list. Startup treats it as an empty list; a reload rejects it.
+      if (strict && root.get_child("named_devices").empty() && !root.get<std::string>("named_devices").empty()) {
+        throw std::runtime_error("root.named_devices is not a list");
+      }
       for (auto &[_, el] : root.get_child("named_devices")) {
         named_cert_t named_cert;
         named_cert.name = el.get_child("name").get_value<std::string>();
@@ -466,7 +472,7 @@ namespace nvhttp {
     }
     http::unique_id = std::move(*unique_id_p);
 
-    client_t client = parse_client_tree(tree.get_child("root"));
+    client_t client = parse_client_tree(tree.get_child("root"), false);
 
     std::lock_guard lock {client_auth_mutex()};
     client_root = std::move(client);
@@ -501,7 +507,7 @@ namespace nvhttp {
 
     client_t client;
     try {
-      client = parse_client_tree(tree.get_child("root"));
+      client = parse_client_tree(tree.get_child("root"), true);
     } catch (std::exception &e) {
       BOOST_LOG(error) << "Couldn't parse the paired clients in "sv << config::nvhttp.file_state << ": "sv << e.what();
       return load_status_e::unreadable;
