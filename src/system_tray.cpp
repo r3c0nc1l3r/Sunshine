@@ -1256,12 +1256,12 @@ namespace system_tray {
       }
 
       // Re-check: the loop may have completed this suspend, and a resume may have followed, since the unlock above.
-      bool still_pending = false;
-      {
-        const std::scoped_lock check(state.mutex);
-        still_pending = state.phase == tray_phase_e::running && state.command == tray_command_e::suspend && !state.tearing_down;
-      }
-      if (still_pending) {
+      // The lifecycle mutex stays held across the flag store and the exit, so the check and the queued exit are atomic
+      // against `tearing_down` (the loop sets it under the same mutex before it polls). Lock order: tray_state_mutex,
+      // then the lifecycle mutex. The backend `exit` taken here is a non-blocking queued emit (production `tray_exit`);
+      // no `exit` path of this file takes the lifecycle mutex or waits for the loop thread.
+      const std::scoped_lock check(state.mutex);
+      if (state.phase == tray_phase_e::running && state.command == tray_command_e::suspend && !state.tearing_down) {
         tray_initialized_state().store(false);
         backend.exit();
       }
