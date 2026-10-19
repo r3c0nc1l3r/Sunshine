@@ -21,7 +21,11 @@ namespace handoff {
   channel_reader_t::channel_reader_t(channel_t &channel, bool answer_pings, message_handler_t on_message, close_handler_t on_close):
       _channel(channel),
       _answer_pings(answer_pings),
-      _on_message(std::move(on_message)),
+      _on_message(on_message ? std::move(on_message) : message_handler_t {[](received_t item) {
+        if (item.fd >= 0) {
+          ::close(item.fd);
+        }
+      }}),
       _on_close(std::move(on_close)) {
   }
 
@@ -48,12 +52,20 @@ namespace handoff {
           received_t item = std::move(_queue.front());
           _queue.pop_front();
           lock.unlock();
+          // The handler owns the fd once called; if it throws before taking it, close it here.
+          const int item_fd = item.fd;
           try {
             _on_message(std::move(item));
           } catch (const std::exception &e) {
             BOOST_LOG(error) << "Handoff channel handler failed: " << e.what();
+            if (item_fd >= 0) {
+              ::close(item_fd);
+            }
           } catch (...) {
             BOOST_LOG(error) << "Handoff channel handler failed";
+            if (item_fd >= 0) {
+              ::close(item_fd);
+            }
           }
           lock.lock();
           continue;

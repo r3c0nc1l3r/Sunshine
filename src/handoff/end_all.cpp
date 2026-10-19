@@ -23,7 +23,7 @@ namespace handoff {
           _cv.wait(lock, [this]() {
             return _state != end_state_e::ending;
           });
-          return _state == end_state_e::ended ? end_all_answer_e::ended : end_all_answer_e::rejected;
+          return _ending_rejected ? end_all_answer_e::rejected : end_all_answer_e::ended;
         }
       case end_state_e::idle:
         break;
@@ -42,6 +42,7 @@ namespace handoff {
         // The sessions may not have ended: this is not an `ENDED`. Go back to idle so a later attempt can retry.
         _state = end_state_e::idle;
       }
+      _ending_rejected = true;
       _cv.notify_all();
       throw;
     }
@@ -50,6 +51,7 @@ namespace handoff {
     end_all_answer_e answer;
     if (_state == end_state_e::ending) {
       _state = end_state_e::ended;
+      _ending_rejected = false;
       answer = end_all_answer_e::ended;
     } else {
       // A rollback was decided meanwhile: the state stays `rolling_back`.
@@ -112,16 +114,12 @@ namespace handoff {
       return terminate_permission_e::peer_gone;
     }
 
-    switch (peer.end_all(budget)) {
-      case drain_peer_t::reply_e::ended:
-        return terminate_permission_e::ended;
-      case drain_peer_t::reply_e::rejected:
-        return peer.gone() ? terminate_permission_e::peer_gone : terminate_permission_e::refused;
-      case drain_peer_t::reply_e::no_reply:
-        break;
+    const auto remaining = std::max(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock::now()), std::chrono::milliseconds {0});
+    if (peer.end_all(remaining) == drain_peer_t::reply_e::ended) {
+      return terminate_permission_e::ended;
     }
 
-    // No answer: the peer may still exit within the budget (for example both processes got SIGTERM). Poll its pidfd
+    // No `ENDED` (`END_REJECTED` counts as a timeout): the peer may still exit within the budget (for example both processes got SIGTERM). Poll its pidfd
     // until the budget is used up; never return `refused` early.
     constexpr auto poll_step = std::chrono::milliseconds {20};
     while (true) {
