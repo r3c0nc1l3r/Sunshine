@@ -4,6 +4,7 @@
  * @note Adapted from https://www.avahi.org/doxygen/html/client-publish-service_8c-example.html
  */
 // standard includes
+#include <atomic>
 #include <thread>
 
 // local includes
@@ -402,6 +403,9 @@ namespace platf::publish {
 
   ptr_t<char> name;  ///< Current service name, updated when Avahi reports a collision.
 
+  std::atomic_bool name_renamed {false};  ///< Whether a collision renamed the live service (see `renamed()`).
+  std::atomic_bool publisher_live {false};  ///< Whether a publisher object exists (one at a time).
+
   /**
    * @brief Create or update the Avahi service entry group.
    *
@@ -424,6 +428,7 @@ namespace platf::publish {
         break;
       case avahi::ENTRY_GROUP_COLLISION:
         name.reset(avahi::alternative_service_name(name.get()));
+        name_renamed.store(true);
 
         BOOST_LOG(info) << "Avahi service name collision, renaming service to " << name.get();
 
@@ -475,6 +480,7 @@ namespace platf::publish {
         if (ret == avahi::ERR_COLLISION) {
           // A service name collision with a local service happened. Let's pick a new name
           name.reset(avahi::alternative_service_name(name.get()));
+          name_renamed.store(true);
           BOOST_LOG(info) << "Service name collision, renaming service to "sv << name.get();
 
           avahi::entry_group_reset(group);
@@ -553,13 +559,33 @@ namespace platf::publish {
       }
 
       poll.reset();
+      name_renamed.store(false);
+      publisher_live.store(false);
     }
   };
+
+  bool renamed() {
+    return name_renamed.load();
+  }
 
   [[nodiscard]] std::unique_ptr<::platf::deinit_t> start() {
     if (avahi::init_client()) {
       return nullptr;
     }
+
+    // One live publisher at a time: the Avahi client, group and poll are statics.
+    if (publisher_live.exchange(true)) {
+      BOOST_LOG(error) << "A publisher is already alive, not starting a second one"sv;
+      return nullptr;
+    }
+
+    name_renamed.store(false);
+
+    // Until the publisher object exists, a failure must release the claim and the poll.
+    auto release = util::fail_guard([]() {
+      poll.reset();
+      publisher_live.store(false);
+    });
 
     platf::set_thread_name("publish::avahi");
 
@@ -582,6 +608,8 @@ namespace platf::publish {
       BOOST_LOG(error) << "Failed to create client: "sv << avahi::strerror(avhi_error);
       return nullptr;
     }
+
+    release.disable();
 
     return std::make_unique<deinit_t>(std::jthread {[]() {
       avahi::simple_poll_loop(poll.get());
