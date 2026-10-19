@@ -41,6 +41,7 @@
   #include <poll.h>
   #include <sys/eventfd.h>
   #include <sys/socket.h>
+  #include <sys/stat.h>
   #include <sys/un.h>
   #include <unistd.h>
 
@@ -58,6 +59,100 @@ namespace {
   namespace protocol = handoff::protocol;
   using handoff::new_stage_e;
   using reply_e = handoff::drain_peer_t::reply_e;
+
+  /**
+   * @brief Five real sockets that stand for the inherited fds (HTTPS, HTTP, web UI, RTSP, channel).
+   *
+   * The code under test may close the four listener fds, so every number must be an fd this object owns. Ownership is
+   * checked with `fstat` (device and inode) before any close, so a number that was closed and reused is left alone.
+   */
+  class owned_fds_t {
+  public:
+    /**
+     * @brief Open the sockets.
+     */
+    owned_fds_t() {
+      renew();
+    }
+
+    /**
+     * @brief Close what is still ours.
+     */
+    ~owned_fds_t() {
+      close_remaining();
+    }
+
+    owned_fds_t(const owned_fds_t &) = delete;  ///< Not copyable.
+    owned_fds_t &operator=(const owned_fds_t &) = delete;  ///< Not copyable.
+
+    /**
+     * @brief Close the remaining fds and open five new ones.
+     */
+    void renew() {
+      close_remaining();
+      for (auto &entry : _entries) {
+        entry.fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct stat st {};
+        if (entry.fd >= 0 && ::fstat(entry.fd, &st) == 0) {
+          entry.dev = st.st_dev;
+          entry.ino = st.st_ino;
+        }
+      }
+    }
+
+    /**
+     * @brief Close every fd that is still open and still the same object.
+     */
+    void close_remaining() {
+      for (auto &entry : _entries) {
+        struct stat st {};
+        if (entry.fd >= 0 && ::fstat(entry.fd, &st) == 0 && st.st_dev == entry.dev && st.st_ino == entry.ino) {
+          ::close(entry.fd);
+        }
+        entry.fd = -1;
+      }
+    }
+
+    /**
+     * @brief One fd number.
+     *
+     * @param index 0 HTTPS, 1 HTTP, 2 web UI, 3 RTSP, 4 channel.
+     * @return The number.
+     */
+    int fd(std::size_t index) const {
+      return _entries[index].fd;
+    }
+
+    /**
+     * @brief Value of `SUNSHINE_HANDOFF_FDS`.
+     *
+     * @return The text.
+     */
+    std::string fds_text() const {
+      return "https:" + std::to_string(fd(0)) + ",http:" + std::to_string(fd(1)) + ",webui:" + std::to_string(fd(2)) + ",rtsp:" + std::to_string(fd(3));
+    }
+
+    /**
+     * @brief Value of `SUNSHINE_HANDOFF_CHANNEL`.
+     *
+     * @return The text.
+     */
+    std::string channel_text() const {
+      return std::to_string(fd(4));
+    }
+
+  private:
+    /**
+     * @brief One owned fd and its identity.
+     */
+    struct entry_t {
+      int fd {-1};  ///< Number, or -1.
+      dev_t dev {0};  ///< Device.
+      ino_t ino {0};  ///< Inode.
+    };
+
+    entry_t _entries[5];  ///< The fds.
+  };
 
   /**
    * @brief Thread-safe ordered record of every seam call.
@@ -205,10 +300,12 @@ namespace {
 
     /**
      * @brief Fill a complete, valid handoff start.
+     *
+     * @param fds Real fds to name in the variables.
      */
-    void set_handoff_vars() {
-      vars["SUNSHINE_HANDOFF_FDS"] = "https:3,http:4,webui:5,rtsp:6";
-      vars["SUNSHINE_HANDOFF_CHANNEL"] = "7";
+    void set_handoff_vars(const owned_fds_t &fds) {
+      vars["SUNSHINE_HANDOFF_FDS"] = fds.fds_text();
+      vars["SUNSHINE_HANDOFF_CHANNEL"] = fds.channel_text();
       vars["SUNSHINE_HANDOFF_UDP_BASE"] = "48100";
       vars["SUNSHINE_HANDOFF_GENERATION"] = "1";
     }
@@ -587,6 +684,7 @@ protected:
   }
 
   std::filesystem::path _dir;  ///< Temporary runtime directory.
+  owned_fds_t fds;  ///< Real fds that stand for the inherited ones.
 
 private:
   handoff::settings_t _saved_settings;  ///< Saved `config::drain_handoff`.
@@ -605,7 +703,7 @@ TEST_F(HandoffEntryStartupTest, EarlyStartOnANormalStartIsEmptyAndLeavesTheModeD
 
 TEST_F(HandoffEntryStartupTest, EarlyStartOnAHandoffStartSetsNewPending) {
   fake_env_t env;
-  env.set_handoff_vars();
+  env.set_handoff_vars(fds);
   EXPECT_EQ(handoff::entry::early_start(false, env.make()), "") << "a valid handoff start without privileged execution succeeds";
   EXPECT_TRUE(handoff::runtime().started_by_handoff()) << "early_start must call runtime().early_init";
   EXPECT_EQ(handoff::runtime().mode(), handoff::mode_e::new_pending) << "handoff start mode";
@@ -613,7 +711,7 @@ TEST_F(HandoffEntryStartupTest, EarlyStartOnAHandoffStartSetsNewPending) {
 
 TEST_F(HandoffEntryStartupTest, EarlyStartRefusesAHandoffStartWithPrivilegedExecution) {
   fake_env_t env;
-  env.set_handoff_vars();
+  env.set_handoff_vars(fds);
   EXPECT_EQ(handoff::entry::early_start(true, env.make()), "drain handoff start is refused with privileged execution") << "exact refusal text";
 }
 
@@ -624,7 +722,7 @@ TEST_F(HandoffEntryStartupTest, EarlyStartAllowsAPrivilegedNormalStart) {
 
 TEST_F(HandoffEntryStartupTest, EarlyStartReturnsTheEarlyInitErrorForBrokenVariables) {
   fake_env_t env;
-  env.vars["SUNSHINE_HANDOFF_FDS"] = "https:3,http:4,webui:5,rtsp:6";
+  env.vars["SUNSHINE_HANDOFF_FDS"] = fds.fds_text();
   const auto reason = handoff::entry::early_start(false, env.make());
   EXPECT_NE(reason, "") << "exactly one of the two handoff variables set is an early_init error, returned as is";
   EXPECT_FALSE(handoff::runtime().started_by_handoff()) << "nothing is stored on an error";
@@ -696,7 +794,7 @@ TEST_F(HandoffEntryStartupTest, PolicyRefusesWithoutARuntimeDirectory) {
 
 TEST_F(HandoffEntryStartupTest, PolicyInAHandoffStartedProcessKeepsTheModeAndReturnsTheRefusal) {
   fake_env_t env;
-  env.set_handoff_vars();
+  env.set_handoff_vars(fds);
   ASSERT_EQ(handoff::entry::early_start(false, env.make()), "");
   configure_enabled_feature();
   const env_guard_t runtime_directory {"RUNTIME_DIRECTORY", _dir.string()};
@@ -731,7 +829,7 @@ TEST_F(HandoffEntryStartupTest, OpenInstanceFileWritesRoleActiveInANormalStart) 
 
 TEST_F(HandoffEntryStartupTest, OpenInstanceFileWritesRolePendingInAHandoffStartedProcess) {
   fake_env_t env;
-  env.set_handoff_vars();
+  env.set_handoff_vars(fds);
   ASSERT_EQ(handoff::entry::early_start(false, env.make()), "");
   configure_enabled_feature();
   const env_guard_t runtime_directory {"RUNTIME_DIRECTORY", _dir.string()};
@@ -1009,6 +1107,7 @@ protected:
     channel.reset();
     handoff::runtime().instance_remove();
     handoff::runtime().reset_for_test();
+    fds.close_remaining();
     std::error_code ec;
     std::filesystem::remove_all(_dir, ec);
   }
@@ -1020,7 +1119,7 @@ protected:
     handoff::runtime().instance_remove();
     handoff::runtime().reset_for_test();
     fake_env_t env;
-    env.set_handoff_vars();
+    env.set_handoff_vars(fds);
     auto callbacks = env.make();
     ASSERT_EQ(handoff::runtime().early_init(callbacks), "") << "setup: early_init";
     handoff::instance_t initial;
@@ -1176,6 +1275,7 @@ protected:
     return ack && ack->ok;
   }
 
+  owned_fds_t fds;  ///< Real fds that stand for the inherited ones.
   handoff::new_ops_config_t config;  ///< Ops configuration.
   handoff::new_ops_seams_t seams;  ///< Ops seams (all recording).
   recorder_t rec;  ///< Record of seam calls.
