@@ -1153,15 +1153,28 @@ TEST_F(HandoffDrainNotifierTest, StartIsIdempotent) {
   EXPECT_EQ(rig.sessions_written().size(), 1u) << "A second start() must do nothing.";
 }
 
-TEST_F(HandoffDrainNotifierTest, StopIsIdempotentAndSafeWithoutStart) {
-  notifier->stop();  // never started
+TEST_F(HandoffDrainNotifierTest, StopOfNeverStartedNotifierIsSafe) {
+  notifier->stop();
+  notifier->stop();
+  const auto after = notifier->passes();
+  notifier->poke();
+  std::this_thread::sleep_for(40ms);
+  EXPECT_EQ(notifier->passes(), after) << "poke() on a stopped, never-started notifier must run no pass.";
+}
+
+TEST_F(HandoffDrainNotifierTest, NotifierStaysStoppedAfterStop) {
   start_and_settle();
   notifier->stop();
   notifier->stop();
   const auto after = notifier->passes();
   notifier->poke();
   std::this_thread::sleep_for(40ms);
-  EXPECT_EQ(notifier->passes(), after) << "poke() after stop() must do nothing.";
+  EXPECT_EQ(notifier->passes(), after) << "poke() after stop() must run no pass.";
+
+  notifier->start();
+  notifier->poke();
+  std::this_thread::sleep_for(40ms);
+  EXPECT_EQ(notifier->passes(), after) << "After stop() the notifier stays stopped: start() must do nothing.";
 }
 
 TEST_F(HandoffDrainNotifierTest, DrainingSendsStateOnFirstPassOnly) {
