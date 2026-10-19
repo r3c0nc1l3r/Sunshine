@@ -2228,6 +2228,10 @@ namespace stream {
   namespace session {
     std::atomic_uint running_sessions;  ///< Running sessions.
 
+    int running_session_count() {
+      return static_cast<int>(running_sessions.load(std::memory_order_relaxed));
+    }
+
     /**
      * @brief Platform handle returned from stream setup.
      */
@@ -2360,7 +2364,9 @@ namespace stream {
       input::reset(session.input);
 
       // If this is the last session, invoke the platform callbacks
-      if (--running_sessions == 0) {
+      const auto remaining_sessions = --running_sessions;
+      handoff::hooks::sessions_changed();
+      if (remaining_sessions == 0) {
         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
         if (proc::proc.running()) {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
@@ -2428,7 +2434,9 @@ namespace stream {
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
 
       // If this is the first session, invoke the platform callbacks
-      if (++running_sessions == 1) {
+      const auto started_sessions = ++running_sessions;
+      handoff::hooks::sessions_changed();
+      if (started_sessions == 1) {
         platf::streaming_will_start();
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
         system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
