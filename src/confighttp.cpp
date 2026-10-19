@@ -64,6 +64,9 @@
 
 #ifdef __linux__
   #include "handoff/coordinator.h"
+  #include "handoff/instance_file.h"
+  #include "handoff/peer_link.h"
+  #include "handoff/protocol.h"
   #include "handoff/runtime.h"
   #include "handoff/terminate.h"
 #endif
@@ -1542,15 +1545,99 @@ namespace confighttp {
   /**
    * @brief Convert a session description to the JSON object returned by `GET /api/sessions`.
    * @param info Session description.
-   * @return Object with exactly `id`, `started` (Unix seconds), `transport` and `client_category`.
+   * @param draining Value of the `draining` key: `true` for a session of the draining process.
+   * @return Object with exactly `id`, `started` (Unix seconds), `transport`, `client_category` and `draining` (bool).
    */
-  nlohmann::json session_info_to_json(const rtsp_stream::session_info_t &info) {
+  nlohmann::json session_info_to_json(const rtsp_stream::session_info_t &info, bool draining) {
     nlohmann::json output;
     output["id"] = info.id;
     output["started"] = std::chrono::duration_cast<std::chrono::seconds>(info.started.time_since_epoch()).count();
     output["transport"] = info.transport;
     output["client_category"] = info.client_category;
+    output["draining"] = draining;
     return output;
+  }
+
+#ifdef __linux__
+  /**
+   * @brief Convert a session entry reported by the draining process to the JSON object returned by `GET /api/sessions`.
+   * @param entry Session entry from the handoff channel (`SESSIONS` reply).
+   * @return Object with exactly `id`, `started` (Unix seconds, `started_unix_ms / 1000`), `transport`,
+   *         `client_category` and `draining` (always `true`).
+   */
+  nlohmann::json session_entry_to_json(const handoff::protocol::session_entry_t &entry) {
+    nlohmann::json output;
+    output["id"] = entry.id;
+    output["started"] = entry.started_unix_ms / 1000;
+    output["transport"] = entry.transport;
+    output["client_category"] = entry.client_category;
+    output["draining"] = true;
+    return output;
+  }
+#endif
+
+  /**
+   * @brief Build the full body of `GET /api/sessions`.
+   *
+   * Contains `status` (`true`), `sessions` and `handoff`. `sessions` holds this process's sessions (`draining`
+   * false) first, then, on Linux with a session peer, the draining process's sessions (`draining` true). If the
+   * draining process does not answer in time, only this process's sessions are listed and a Warning is logged.
+   * `handoff` is the state of the instance file (`none`, `draining`, `handover_failed` or `kill_pending`), or `none`
+   * when there is no instance or on platforms without handoff.
+   *
+   * @return The reply object.
+   */
+  nlohmann::json sessions_reply() {
+    nlohmann::json sessions = nlohmann::json::array();
+    for (const auto &info : rtsp_stream::list_sessions()) {
+      sessions.push_back(session_info_to_json(info, false));
+    }
+
+    std::string handoff_state {"none"};
+#ifdef __linux__
+    if (const auto peer = std::dynamic_pointer_cast<handoff::session_peer_t>(handoff::runtime().peer())) {
+      if (const auto entries = peer->list(handoff::peer_request_timeout)) {
+        for (const auto &entry : *entries) {
+          sessions.push_back(session_entry_to_json(entry));
+        }
+      } else {
+        BOOST_LOG(warning) << "Draining process did not list its sessions in time; showing this process's sessions only"sv;
+      }
+    }
+
+    if (const auto instance = handoff::runtime().instance_current()) {
+      handoff_state = std::string(handoff::to_string(instance->handoff));
+    }
+#endif
+
+    nlohmann::json output_tree;
+    output_tree["status"] = true;
+    output_tree["sessions"] = sessions;
+    output_tree["handoff"] = handoff_state;
+    return output_tree;
+  }
+
+  /**
+   * @brief Close a session of this process or, on Linux, of the draining process.
+   * @param id Launch session id.
+   * @return The close result, as for `rtsp_stream::request_session_close()`.
+   */
+  rtsp_stream::close_result_e close_session_any(std::uint32_t id) {
+    const auto result = rtsp_stream::request_session_close(id);
+    if (result != rtsp_stream::close_result_e::not_found) {
+      return result;
+    }
+
+#ifdef __linux__
+    if (const auto peer = std::dynamic_pointer_cast<handoff::session_peer_t>(handoff::runtime().peer())) {
+      if (const auto peer_result = peer->close(id, handoff::peer_request_timeout)) {
+        return *peer_result;
+      }
+      BOOST_LOG(warning) << "Draining process did not answer the close request for session "sv << id << " in time"sv;
+    }
+#endif
+
+    return rtsp_stream::close_result_e::not_found;
   }
 
   /**
@@ -1579,10 +1666,12 @@ namespace confighttp {
   }
 
   /**
-   * @brief List the active streaming sessions.
+   * @brief List the streaming sessions of this process and, on Linux, of the draining process.
    *
-   * Requires admin authentication, like the other API calls. Returns only `id`, `started`, `transport` and
-   * `client_category` for each session.
+   * Requires admin authentication, like the other API calls. The body is built by `sessions_reply()`: this process's
+   * sessions first, then the draining process's sessions (`draining` true), plus the top-level `handoff` state. Each
+   * entry has `id`, `started`, `transport`, `client_category` and `draining`. When the draining process does not
+   * answer in time, only this process's sessions are listed.
    *
    * @api_examples{/api/sessions| GET| null}
    */
@@ -1593,24 +1682,19 @@ namespace confighttp {
 
     print_req(request);
 
-    nlohmann::json sessions = nlohmann::json::array();
-    for (const auto &info : rtsp_stream::list_sessions()) {
-      sessions.push_back(session_info_to_json(info));
-    }
-
-    nlohmann::json output_tree;
-    output_tree["status"] = true;
-    output_tree["sessions"] = sessions;
-    send_response(response, output_tree);
+    const auto reply = sessions_reply();
+    send_response(response, reply);
   }
 
   /**
    * @brief Close one streaming session through the normal stop path.
    *
    * Requires admin authentication and, for cross-origin requests, a valid CSRF token in the `X-CSRF-Token` header.
-   * Every request that passes authentication is logged at Info with the admin user, the client address and the
-   * result (`closed`, `already-stopping`, `not-found`, `csrf-rejected` or `bad-id`). A session that is already
-   * stopping gets 200 like a session this request stopped. The log line never contains credentials or the CSRF token.
+   * The session may belong to this process or, on Linux, to the draining process (the request goes over the handoff
+   * channel through `close_session_any()`). Every request that passes authentication is logged at Info with the admin
+   * user, the client address and the result (`closed`, `already-stopping`, `not-found`, `csrf-rejected` or `bad-id`).
+   * A session that is already stopping gets 200 like a session this request stopped. A draining process that does not
+   * answer in time gives `not-found` (404). The log line never contains credentials or the CSRF token.
    *
    * @api_examples{/api/sessions/1/close| POST| null}
    */
@@ -1638,7 +1722,7 @@ namespace confighttp {
       return;
     }
 
-    const auto result = rtsp_stream::request_session_close(session_id);
+    const auto result = close_session_any(session_id);
     if (result == rtsp_stream::close_result_e::not_found) {
       log_session_close(std::to_string(session_id), source, "not-found"sv);
       not_found(response, request, "Session not found");
