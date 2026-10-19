@@ -254,6 +254,12 @@ Simple-Web-Server's accept loops (HTTP, HTTPS, web UI) need the same: a pause th
 nor closes the acceptor (to be checked against its source when the patch is written). Simple-Web-Server does not
 re-arm its accept after `operation_aborted`, so resuming must start its accept again.
 
+Every pause and resume waits for its confirmation with a finite timeout (at most the 5 s in-flight wait). A server
+whose `io_context` thread does not respond in time does not confirm;
+a pause that times out fails the switch (rollback, with the server named in the reason), and a resume that times out
+during a rollback is logged as an Error and does not block the rollback. So an unresponsive server thread makes a
+reload fail within the `ExecReload` bound instead of hanging it.
+
 ### 6. Rollback window
 - The new process serves normally. The old process sends `PING <seq>` over the channel every 2 s from the switch until
   the handover in step 7 is done (or a rollback); then pings stop. In the new process a dedicated reader thread reads
@@ -356,7 +362,10 @@ unit, which also ends the draining process (its sessions end with `stop`), then 
 The old process keeps its sessions until each ends normally, or until `drain_handoff_deadline` (counted from the
 switch). It never exits before the handover in step 7 is done, even when its last session ends earlier. Then it
 releases its devices and other resources as described below and exits with status 0. Sessions it ends at the deadline
-get reason `drain-deadline`.
+get reason `drain-deadline`. The exit is bounded like a signal-initiated shutdown: once its sessions are ended and its
+devices released, the draining process arms the same 10 s forced-shutdown limit before it stops its servers, so a
+server thread that cannot finish cannot keep a draining process alive. On expiry it logs an Error naming the stop that did not finish and exits. A draining process that never
+exits would refuse every later reload and `/api/restart`.
 
 ### Stopping, restarting and quitting
 - `systemctl stop` sends `SIGTERM` to both processes. A draining process ends its sessions at once with reason `stop`
