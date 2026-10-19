@@ -172,7 +172,17 @@ namespace system_tray {
     }
 
     /**
+     * @brief Production backend `poll`: deliver pending Qt events without blocking.
+     */
+    void backend_poll_default() {
+      (void) tray_loop(0);
+    }
+
+    /**
      * @brief The backend entry points with the production defaults filled in.
+     *
+     * `poll` takes the production value only together with the production `loop`, so a fake backend that sets no `poll`
+     * never reaches Qt.
      *
      * Call it with the lifecycle mutex held; use the returned copy after releasing the mutex.
      *
@@ -180,6 +190,9 @@ namespace system_tray {
      */
     tray_backend_t effective_backend_locked() {
       tray_backend_t backend = lifecycle().backend;
+      if (!backend.poll && !backend.loop) {
+        backend.poll = &backend_poll_default;
+      }
       if (!backend.init) {
         backend.init = &init_tray;
       }
@@ -1056,17 +1069,15 @@ namespace system_tray {
     void complete_suspend(std::unique_lock<std::mutex> &lock, bool from_exec) {
       auto &state = lifecycle();
       const auto backend = effective_backend_locked();
-      const bool production_loop = state.backend.loop == nullptr;
       state.command = tray_command_e::none;
       lock.unlock();
 
       // A suspend from another thread queued an exit event to the Qt thread. When the loop did not just return from
       // `exec()` (a pre-loop suspend), that event is still in the queue and the next `exec()` after a resume would
-      // deliver it to the NEW icon and tear it down. Drain the queue while the old icon still exists: a non-blocking
-      // `tray_loop(0)` (processEvents) delivers the stale event. The backend table has no non-blocking entry (a fake
-      // `loop` may block), so only the production backend is drained.
-      if (!from_exec && production_loop) {
-        (void) tray_loop(0);
+      // deliver it to the NEW icon and tear it down. Drain the queue while the old icon still exists: the backend's
+      // non-blocking `poll` (processEvents) delivers the stale event.
+      if (!from_exec && backend.poll) {
+        backend.poll();
       }
 
       tray_initialized_state().store(false);
