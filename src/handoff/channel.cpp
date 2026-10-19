@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstring>
+#include <iterator>
 #include <poll.h>
 #include <string>
 #include <string_view>
@@ -221,5 +222,50 @@ namespace handoff {
   int channel_t::fd() const {
     const int fd = std::atomic_ref<int> {const_cast<int &>(_fd)}.load();
     return fd < 0 ? -1 : fd;
+  }
+
+  std::uint64_t request_tracker_t::begin() {
+    std::lock_guard lock {_mutex};
+    const std::uint64_t id = _next_id++;
+    _pending.emplace(id, std::nullopt);
+    return id;
+  }
+
+  bool request_tracker_t::deliver(std::uint64_t request_id, protocol::message_t reply) {
+    std::lock_guard lock {_mutex};
+    const auto it = _pending.find(request_id);
+    if (it == _pending.end() || it->second.has_value()) {
+      return false;
+    }
+    it->second = std::move(reply);
+    _cv.notify_all();
+    return true;
+  }
+
+  std::optional<protocol::message_t> request_tracker_t::wait(std::uint64_t request_id, std::chrono::milliseconds timeout) {
+    std::unique_lock lock {_mutex};
+    if (_pending.find(request_id) == _pending.end()) {
+      return std::nullopt;
+    }
+    // Woken by a delivered reply, or by `fail_all()` erasing the unanswered entry.
+    _cv.wait_for(lock, timeout, [&]() {
+      const auto it = _pending.find(request_id);
+      return it == _pending.end() || it->second.has_value();
+    });
+    std::optional<protocol::message_t> result;
+    if (const auto it = _pending.find(request_id); it != _pending.end()) {
+      result = std::move(it->second);
+      _pending.erase(it);  // forget the id whatever the outcome, so a late reply is dropped
+    }
+    return result;
+  }
+
+  void request_tracker_t::fail_all() {
+    std::lock_guard lock {_mutex};
+    ++_fail_generation;
+    for (auto it = _pending.begin(); it != _pending.end();) {
+      it = it->second.has_value() ? std::next(it) : _pending.erase(it);
+    }
+    _cv.notify_all();
   }
 }  // namespace handoff
