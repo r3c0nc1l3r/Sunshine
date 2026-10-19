@@ -298,26 +298,66 @@ TEST(AuthRateLimiterTest, FloodOfNewSourcesNeverEvictsLockedSource) {
 }
 
 /**
- * @brief Test: when the table is full, an entry whose window has ended is dropped before any live entry.
+ * @brief Test: on insert into a full table, every expired entry is dropped before any live entry is evicted.
  *
- * The table holds an expired unlocked source and a live unlocked source. Adding a third source must drop the expired one,
- * so the live source keeps its count: its next failures still reach the threshold on the second failure after the insert.
+ * The table holds two expired locked sources (the oldest), one live unlocked source and one live locked source. The time of
+ * insert is the end of the expired windows. Both expired sources go, so the size drops to two before the new source is
+ * added. The live unlocked source keeps its one failure, so one more failure starts its lockout.
  */
-TEST(AuthRateLimiterTest, ExpiredEntriesAreDroppedBeforeLiveEntries) {
-  confighttp::auth_rate_limiter_t limiter(std::size_t {3}, DEFAULT_WINDOW, std::size_t {2});
+TEST(AuthRateLimiterTest, ExpiredEntriesAreDroppedBeforeAnyLiveEntry) {
+  confighttp::auth_rate_limiter_t limiter(std::size_t {2}, DEFAULT_WINDOW, std::size_t {4});
   const auto t0 = std::chrono::steady_clock::now();
   const auto insert_time = t0 + DEFAULT_WINDOW;
+  const std::string_view expired_a {"192.0.2.31"};
+  const std::string_view expired_b {"192.0.2.32"};
+  const std::string_view live_locked {"192.0.2.5"};
+  const std::string_view new_source {"192.0.2.33"};
 
-  EXPECT_FALSE(limiter.on_failure("192.0.2.31", t0)) << "Expired at insert time";
-  EXPECT_FALSE(limiter.on_failure(SOURCE_B, t0 + std::chrono::seconds {100})) << "Still live at insert time";
-  ASSERT_EQ(limiter.size(), 2U);
+  ASSERT_EQ(record_failures(limiter, expired_a, 2, t0), 1U);
+  ASSERT_EQ(record_failures(limiter, expired_b, 2, t0), 1U);
+  ASSERT_EQ(record_failures(limiter, SOURCE_B, 1, t0 + std::chrono::seconds {10}), 0U);
+  ASSERT_EQ(record_failures(limiter, live_locked, 2, t0 + std::chrono::seconds {20}), 1U);
+  ASSERT_EQ(limiter.size(), 4U);
 
-  EXPECT_FALSE(limiter.on_failure("192.0.2.33", insert_time));
-  EXPECT_EQ(limiter.size(), 2U);
+  EXPECT_FALSE(limiter.on_failure(new_source, insert_time));
+  EXPECT_EQ(limiter.size(), 3U) << "Both expired entries must be dropped, not only the oldest";
+  EXPECT_FALSE(limiter.blocked(expired_a, insert_time));
+  EXPECT_FALSE(limiter.blocked(expired_b, insert_time));
 
-  EXPECT_FALSE(limiter.on_failure(SOURCE_B, insert_time)) << "The live source must still hold its first failure (count two)";
   EXPECT_TRUE(limiter.on_failure(SOURCE_B, insert_time))
-    << "The live source must still hold its earlier failures, so its third one starts a lockout";
+    << "The live unlocked source must keep its earlier failure, so its second failure starts a lockout";
+}
+
+/**
+ * @brief Test: on insert into a full table, expired locked entries are dropped and a live locked entry keeps its lockout and Retry-After.
+ *
+ * The table holds two expired locked sources and one live locked source. The new source is inserted at the end of the expired
+ * windows. The live lockout must still block its source and report the time left (100 seconds), and the expired sources must
+ * report no lockout.
+ */
+TEST(AuthRateLimiterTest, ExpiredLockedEntriesAreDroppedButLiveLockedEntryKeepsRetryAfter) {
+  confighttp::auth_rate_limiter_t limiter(std::size_t {2}, DEFAULT_WINDOW, std::size_t {3});
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto insert_time = t0 + DEFAULT_WINDOW;
+  const std::string_view expired_a {"192.0.2.31"};
+  const std::string_view expired_b {"192.0.2.32"};
+  const std::string_view live_locked {"192.0.2.5"};
+  const std::string_view new_source {"192.0.2.33"};
+
+  ASSERT_EQ(record_failures(limiter, expired_a, 2, t0), 1U);
+  ASSERT_EQ(record_failures(limiter, expired_b, 2, t0), 1U);
+  ASSERT_EQ(record_failures(limiter, live_locked, 2, t0 + std::chrono::seconds {100}), 1U);
+  ASSERT_EQ(limiter.size(), 3U);
+
+  EXPECT_FALSE(limiter.on_failure(new_source, insert_time));
+  EXPECT_EQ(limiter.size(), 2U) << "Both expired entries must be dropped, leaving the live locked entry and the new source";
+  EXPECT_FALSE(limiter.blocked(expired_a, insert_time));
+  EXPECT_FALSE(limiter.retry_after(expired_a, insert_time).has_value());
+  EXPECT_FALSE(limiter.blocked(expired_b, insert_time));
+  EXPECT_FALSE(limiter.retry_after(expired_b, insert_time).has_value());
+
+  EXPECT_TRUE(limiter.blocked(live_locked, insert_time)) << "A live lockout must survive the insert";
+  EXPECT_EQ(limiter.retry_after(live_locked, insert_time), std::optional<std::chrono::seconds> {std::chrono::seconds {100}});
 }
 
 /**
