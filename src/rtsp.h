@@ -15,6 +15,8 @@
 
 // local includes
 #include "crypto.h"
+#include "handoff/types.h"
+#include "stream_liveness.h"
 #include "thread_safe.h"
 
 namespace stream {
@@ -80,9 +82,32 @@ namespace rtsp_stream {
   int session_count();
 
   /**
-   * @brief Terminates all running streaming sessions.
+   * @brief Map a handoff shutdown reason to the reason that session stops record.
+   *
+   * `terminated` maps to `stop_reason_e::terminated` and `stop` maps to `stop_reason_e::stop`. Shared code calls it with
+   * `handoff::hooks::shutdown_reason()`, so a normal shutdown keeps recording `terminated`.
+   *
+   * @param reason Shutdown reason from `handoff::hooks::shutdown_reason()`.
+   * @return The matching session stop reason. Pure; callable from any thread.
    */
-  void terminate_sessions();
+  stream::stop_reason_e to_stop_reason(handoff::shutdown_reason_e reason);
+
+  /**
+   * @brief Terminates all running streaming sessions.
+   *
+   * Every session present when the call starts is stopped with `reason` and joined, as `clear(true)` does. A session
+   * that is already stopping keeps the reason it recorded first (`stream::session::stop` semantics), so the reason is
+   * only the one recorded when this call is the first to stop the session. The application is not touched here; the
+   * gamepad teardown is the same as before.
+   *
+   * Thread-safety: as before; takes the clear lock and then the slots lock, joins outside the slots lock. Never call it
+   * while holding the clear lock or the slots lock.
+   *
+   * @param reason Stop reason to record. The default `stop_reason_e::terminated` keeps the existing behaviour for every
+   *               caller in the tree (web UI, unpair, `/cancel`, shutdown without a handoff); `stop` is for a draining
+   *               process that was stopped, and `drain_deadline` for the drain deadline.
+   */
+  void terminate_sessions(stream::stop_reason_e reason = stream::stop_reason_e::terminated);
   /**
    * @brief Terminate active sessions associated with a client certificate.
    *
@@ -154,9 +179,15 @@ namespace rtsp_stream {
     /**
      * @brief Run the RTSP server's `clear()`.
      *
+     * The sessions that are ended (all of them with `all`, otherwise the stopping ones) are stopped with `reason`, which
+     * defaults to `terminated`, the reason `clear()` recorded before the parameter existed. A session that is already
+     * stopping keeps its first recorded reason. The reason of each ended session is then visible through
+     * `stream::session::stop_reason()` on the `shared_ptr` that `insert_fake_session` returned.
+     *
      * @param all `true` to end every session, `false` to end only stopping ones.
+     * @param reason Stop reason to record for the sessions this call stops.
      */
-    void clear(bool all);
+    void clear(bool all, stream::stop_reason_e reason = stream::stop_reason_e::terminated);
 
     /**
      * @brief Remove every session from the slots without joining them.

@@ -35,6 +35,41 @@ namespace net {
   std::uint16_t map_port(int port);
 
   /**
+   * @brief Map a UDP port of this process's UDP base.
+   *
+   * The UDP base is the one `handoff::hooks::udp_base()` returns: the configured `port` in a normal start, or the base
+   * the drain handoff gave this process (`port + drain_handoff_udp_offset`, or the base an in-place restart kept). The
+   * TCP ports keep using `map_port`, which always adds to the configured `port`.
+   *
+   * Callers: the video, control and audio UDP ports in `stream::start_broadcast`, the `server_port` of
+   * RTSP SETUP replies (`rtsp.cpp`, audio, video and control), and the UDP entries of the UPnP mappings. Each reply
+   * advertises the port the sockets actually use, so a client follows the base of the process that answers.
+   *
+   * Default (no handoff setting, no `SUNSHINE_UDP_BASE`): `map_udp_port(n)` returns the same value as `map_port(n)`,
+   * including the same out-of-range warning, so a normal start is unchanged.
+   *
+   * Environment round trip: `SUNSHINE_UDP_BASE` is read once by `handoff::runtime().early_init()` at the start of
+   * `main()` (decimal, 1 to 65535). A value that does not parse, or is out of range, is ignored, and the base stays
+   * the configured `port`. The variable is removed from the environment before any app or thread can inherit it.
+   * An in-place restart (`/api/restart`, the tray restart) sets it again just before `execv`, through
+   * `handoff::hooks::restart_environment()`, only when the base differs from the configured `port`, and unsets it
+   * when it does not. A handoff child gets its base from `SUNSHINE_HANDOFF_UDP_BASE` instead, which is invalid
+   * (refused, exit 1) when it does not parse or is out of range. Nothing validates an override against the TCP
+   * ports or the other base here; that check is for `handoff::validate` on the configured offset only.
+   *
+   * Thread-safety: reads only the handoff runtime's override, which is fixed after `early_init()` (except the test
+   * seam). Callable from any thread.
+   *
+   * @param offset The port as an offset from the UDP base (for example 9 for video, 10 for control, 11 for audio).
+   * @return The mapped port, `hooks::udp_base() + offset` as an unsigned 16-bit value. It warns when the result is
+   *         outside 1024-65535, as `map_port` does.
+   * @examples
+   * std::uint16_t video_port = net::map_udp_port(stream::VIDEO_STREAM_PORT);
+   * @examples_end
+   */
+  std::uint16_t map_udp_port(int offset);
+
+  /**
    * @brief Owning ENet host pointer released with `enet_host_destroy`.
    */
   using host_t = util::safe_ptr<ENetHost, free_host>;

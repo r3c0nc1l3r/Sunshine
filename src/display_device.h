@@ -42,6 +42,21 @@ namespace display_device {
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init(const std::filesystem::path &persistence_filepath, const config::video_t &video_config);
 
   /**
+   * @brief Whether `init()` created a settings manager, that is, whether display configuration is active.
+   *
+   * Drain handoff refuses to enable when this is `true` (`handoff::check_enable`), because the display settings
+   * manager cannot be shared with the other process. It is read once at startup, after `init()` returned.
+   *
+   * Thread-safety: call from the main thread after `init()` and before any display thread starts. It takes no lock and
+   * reads the state that `init()` set up. It is `false` before `init()`, and again after the deinit guard from `init()`
+   * has been destroyed.
+   *
+   * @return `true` when a settings manager instance exists; `false` otherwise (including when `init()` was never
+   *         called, and on platforms that never create one).
+   */
+  [[nodiscard]] bool has_settings_manager();
+
+  /**
    * @brief Map the output name to a specific display.
    * @param output_name The user-configurable output name.
    * @returns Mapped display name or empty string if the output name could not be mapped.
