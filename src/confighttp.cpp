@@ -1284,7 +1284,7 @@ namespace confighttp {
     print_req(request);
 
 #ifdef __linux__
-    if (!handoff::allows_terminate(handoff::terminate_app(handoff::request_terminate_budget, "close app"))) {
+    if (!handoff::allows_terminate(handoff::terminate_app(handoff::request_budget(), "close app"))) {
       constexpr auto code = SimpleWeb::StatusCode::server_error_service_unavailable;
 
       nlohmann::json refused_tree;
@@ -1435,7 +1435,7 @@ namespace confighttp {
 
         if (rtsp_stream::total_session_count() == 0 && proc::proc.running() > 0) {
 #ifdef __linux__
-          handoff::terminate_app(handoff::request_terminate_budget, "update client");
+          handoff::terminate_app(handoff::request_budget(), "update client");
 #else
           proc::proc.terminate();
 #endif
@@ -1490,7 +1490,7 @@ namespace confighttp {
 
       if (removed && nvhttp::get_all_clients().empty()) {
 #ifdef __linux__
-        handoff::terminate_app(handoff::request_terminate_budget, "unpair");
+        handoff::terminate_app(handoff::request_budget(), "unpair");
 #else
         proc::proc.terminate();
 #endif
@@ -1524,7 +1524,7 @@ namespace confighttp {
 
     nvhttp::erase_all_clients();
 #ifdef __linux__
-    handoff::terminate_app(handoff::request_terminate_budget, "unpair all");
+    handoff::terminate_app(handoff::request_budget(), "unpair all");
 #else
     proc::proc.terminate();
 #endif
@@ -1644,6 +1644,22 @@ namespace confighttp {
     nlohmann::json output_tree;
     output_tree["status"] = true;
     send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Register the app and client routes on the admin web UI server.
+   *
+   * Registers exactly `POST /api/apps/close`, `/api/clients/unpair`, `/api/clients/unpair-all` and
+   * `/api/clients/update` with their production handlers. `start()` calls this, so tests can exercise the production
+   * route table.
+   *
+   * @param server Admin web UI HTTPS server.
+   */
+  void register_app_client_routes(https_server_t &server) {
+    server.resource["^/api/apps/close$"]["POST"] = closeApp;
+    server.resource["^/api/clients/unpair$"]["POST"] = unpair;
+    server.resource["^/api/clients/unpair-all$"]["POST"] = unpairAll;
+    server.resource["^/api/clients/update$"]["POST"] = updateClient;
   }
 
   /**
@@ -2609,11 +2625,8 @@ namespace confighttp {
     server.resource["^/api/apps$"]["GET"] = getApps;
     server.resource["^/api/apps$"]["POST"] = saveApp;
     server.resource["^/api/apps/([0-9]+)$"]["DELETE"] = deleteApp;
-    server.resource["^/api/apps/close$"]["POST"] = closeApp;
     server.resource["^/api/clients/list$"]["GET"] = getClients;
-    server.resource["^/api/clients/unpair$"]["POST"] = unpair;
-    server.resource["^/api/clients/unpair-all$"]["POST"] = unpairAll;
-    server.resource["^/api/clients/update$"]["POST"] = updateClient;
+    register_app_client_routes(server);
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
     server.resource["^/api/configLocale$"]["GET"] = getLocale;
