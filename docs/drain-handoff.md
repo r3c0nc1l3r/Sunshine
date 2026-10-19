@@ -17,8 +17,8 @@ or system service.
 - For video, audio and control, moonlight-common-c takes the UDP port from each stream's RTSP `SETUP` reply
   (`Transport: server_port=<n>`). The well-known ports (47998, 48000, 47999) are only fallbacks for a missing header.
   Sunshine always sends the header. Clients that do not use moonlight-common-c must be checked separately.
-- So a process that owns the RTSP listener can put its sessions' UDP media on any ports. Two processes can stream at once
-  if they use different UDP bases. The TCP ports stay the same, because the new process inherits the listening
+- So a process that owns the RTSP listener can put its sessions' UDP media on any ports. Two processes can stream at
+  once if they use different UDP bases. The TCP ports stay the same, because the new process inherits the listening
   sockets and both processes share their accept queues.
 
 ## Terms
@@ -40,7 +40,9 @@ or system service.
 | `drain_handoff_binary` | path Sunshine was started from | Binary to execute for the new process. |
 
 Config validation rejects an offset that would make any UDP port of either base overlap a TCP port, overlap the
-other base, or leave 1024-65535, and a cooldown shorter than the rollback window.
+other base, or leave 1024-65535, a cooldown shorter than the rollback window, and a deadline shorter than the
+rollback window. The feature refuses to enable under the `FRESH_STATE` flag (state is then never saved [C29], so
+pairings would not reach the new process).
 
 ## Ports
 The TCP ports do not change (the sockets are inherited). Only the UDP media ports move. With the default `port` 47989
@@ -74,8 +76,9 @@ answers the helper with the reason, keeps running unchanged) when:
 - the feature is disabled (then there is no control socket at all, and the helper fails to connect);
 - a handoff is in progress, a draining instance exists (known from the open channel and the instance files), or the
   cooldown has not passed;
-- an application with a running process is active (`proc_t` not in placebo mode [C11]), because the new process
-  cannot adopt a child process. A desktop-style app (placebo mode) is adopted, see "App ownership and prep commands";
+- an application with a running process is active (`proc_t` not in placebo mode [C11]; this needs a new read accessor),
+  because the new process cannot adopt a child process. A desktop-style app (placebo mode) is adopted, see "App
+  ownership and prep commands";
 - a pairing is in progress: after `expire_pair_sessions` [C14], the pairing session map is not empty (a
   `getservercert` request can wait for its PIN, so the handoff does not wait for it);
 - a launch is pending: the RTSP server holds a raised launch session (`launch_event`) whose client has not started
@@ -83,22 +86,29 @@ answers the helper with the reason, keeps running unchanged) when:
 - the process is not a systemd service with readiness (`NOTIFY_SOCKET` unset), or systemd is older than 254 (checked
   with `systemctl --version`), or the unit name cannot be found from `/proc/self/cgroup`.
 
+The app, pairing and pending-launch checks are repeated at the switch (step 5), because the old process keeps serving
+until then.
+
 ### 2. Spawn
 The old process creates a socketpair (the handoff channel, `SOCK_SEQPACKET | SOCK_CLOEXEC`) and starts
 `drain_handoff_binary` with the same arguments, using `posix_spawn` (or `fork` plus only async-signal-safe calls before
 `exec`). In the child only, the listening sockets are placed at fds 3-6 and the channel at fd 7, and every other fd is
-closed (`close_range`/`closefrom`). The child's environment adds:
+closed (`close_range`/`closefrom`). To avoid collisions while placing them, the sources are first duplicated to high
+fds (`F_DUPFD_CLOEXEC`, 100 or above), then `dup2`'d to 3-7 (which clears `FD_CLOEXEC` on the targets). The child's
+environment adds:
 
 - `SUNSHINE_HANDOFF_FDS=https:3,http:4,webui:5,rtsp:6` and `SUNSHINE_HANDOFF_CHANNEL=7`;
-- `SUNSHINE_HANDOFF_UDP_BASE` (the base the old process does not use),
-  `SUNSHINE_HANDOFF_NEXT_SESSION_ID` (launch session ids stay unique across both processes), and
-  `SUNSHINE_HANDOFF_GENERATION` (keeps virtual device ids unique).
+- `SUNSHINE_HANDOFF_UDP_BASE` (the base the old process does not use) and `SUNSHINE_HANDOFF_GENERATION` (keeps
+  virtual device ids unique). The next launch session id is sent in `GO` (step 5), because the old process keeps
+  allocating ids until the switch [C28].
 
 The systemd `LISTEN_FDS`/`LISTEN_PID` convention is not used: the child's pid is not known before the spawn.
 
-Right after the spawn, the old process opens a pidfd for the child (it is the parent and has not reaped it, so the pid
-cannot be reused yet) and uses it to watch the child for the rest of the handoff. It keeps reaping the child
-(`waitpid`) for as long as it lives, so a dead new process never stays a zombie.
+The old process gets a pidfd for the child from the spawn itself (`pidfd_spawn`, glibc 2.39 or newer; or `clone3`
+with `CLONE_PIDFD`), so no pid lookup can race with pid reuse, and uses it to watch the child for the rest of the
+handoff. A dead child is reaped with `waitid(P_PIDFD, ...)`. Sunshine already reaps any child with
+`waitpid(-1, WNOHANG)` whenever it checks the app [C27], so that call can find the child already reaped (`ECHILD`):
+the death is still seen through the pidfd (it becomes readable), and the exit status is then logged as unknown.
 
 ### 3. New process start (handoff mode)
 - Before any other thread starts, it sets `FD_CLOEXEC` on fds 3-7 and unsets every `SUNSHINE_HANDOFF_*` variable, so
@@ -110,10 +120,11 @@ cannot be reused yet) and uses it to watch the child for the rest of the handoff
   `READY`. The old process's `HELLO` carries its encoder probe results (the HEVC, AV1 and 4:4:4 capability flags that
   `/serverinfo` reports) with a probe identity (build id, GPU render node and vendor/device id, driver version). The new
   process uses them only when the identity matches its own, and only for `/serverinfo` (see "GPU"). The old process's
-  `HELLO` also carries its cooldown deadline, which the new process inherits.
+  `HELLO` also carries its cooldown deadline, which the new process inherits. The app state is not sent here: the old
+  process keeps serving until the switch, so it is sent in `GO`.
 - It adopts the sockets instead of binding them (this needs small patches: Simple-Web-Server `start()` must accept an
   existing listening socket, and the RTSP acceptor in `rtsp.cpp` must adopt one instead of `bind`/`listen`), starts its
-  servers with accepting paused, and sends `READY` (or a failed `READY` with a reason).
+  servers with accepting paused (see "Pausing accept"), and sends `READY` (or a failed `READY` with a reason).
 - If the channel reports end-of-file or an error before `GO`, the new process exits with status 1.
 
 ### 4. Failed start
@@ -124,30 +135,57 @@ answers the helper with a non-zero result, and keeps serving. It never stopped a
 ### 5. Switch
 On `READY` the old process, in this order:
 
-1. pauses accepting on all four sockets (`acceptor.cancel()` / pausing the server's accept loop; never closing the
-   server, which would close live connections);
+1. pauses accepting on all four sockets (see "Pausing accept"; never closing a server, which would close live
+   connections);
 2. sets the 503 gate: from now on every request that arrives on an already open (keep-alive) connection, to `/launch`,
-   `/resume`, `/cancel`, pairing and the web UI API, gets 503 and `Connection: close`, and new RTSP requests on open
-   RTSP connections are refused; RTSP connections of its own live sessions are unaffected. `/serverinfo` is still
-   answered on keep-alive connections and reports the old process's `currentgame` (harmless; documented);
+   `/resume`, `/cancel`, pairing and the web UI API, gets 503 and `Connection: close`. RTSP needs no gate: each RTSP
+   request has its own connection [C15], so pausing accept is enough. `/serverinfo` is still answered on keep-alive
+   connections and reports the old process's `currentgame` (harmless; documented);
 3. waits for the state-changing requests already in progress to finish. These are tracked by route, not by method
    (all client routes are GETs [C13]): `/pair`, `/launch`, `/resume`, `/cancel` and the web UI write APIs each
    increment an in-flight counter on entry and decrement it on exit (an RAII guard, so every return path decrements).
-   Only these counters are waited on. A launch that answers during this wait raises a launch session whose RTSP
-   connection arrives after the switch; it follows the straddle rule (fails once, the client retries). The wait is
-   bounded (5 s). If it times out, the handoff fails: the old process lifts the 503 gate, resumes accepting, kills and
-   reaps the new process, removes the new process's instance file, and answers the helper non-zero. Clients that got
-   a 503 during the attempt retry;
-4. writes `sunshine_state.json` and `apps.json` once more, under `client_auth_mutex`, so a pairing that completed
-   just before the switch is on disk;
-5. freezes its state: it writes neither file again unless it rolls back;
-6. withdraws its mDNS service (see "mDNS");
-7. sends `GO`, and answers the helper: switched (exit 0).
+   Order matters, because the HTTP, HTTPS and web UI servers run on separate threads: a handler first increments the
+   counter, then checks the gate (and if it is set, decrements and answers 503); the switcher first sets the gate,
+   then waits for zero (sequentially consistent atomics). Only these counters are waited on. A launch that answers
+   during this wait raises a launch session whose RTSP connection arrives after the switch; it follows the straddle
+   rule (fails once, the client retries). The wait is bounded (5 s). If it times out, the handoff fails: the old
+   process lifts the 503 gate, resumes accepting, kills and reaps the new process, removes the new process's instance
+   file, and answers the helper non-zero. Clients that got a 503 during the attempt retry;
+4. repeats the step-1 checks that can have changed since then: an app with a running process fails the handoff as in
+   step 3. A pairing session (the map holds it while it waits for the PIN, after `/pair` has answered [C14]) or a
+   pending launch [C5] can only end now, because the gate refuses new ones: the old process waits for them to finish
+   or expire, up to `ping_timeout`, and fails the handoff as in step 3 if one remains;
+5. writes `sunshine_state.json` and `apps.json` once more, under `client_auth_mutex`, so a pairing that completed
+   just before the switch is on disk (`save_state` is called directly; `FRESH_STATE`, which skips it [C29], is refused
+   at startup);
+6. freezes its state: it writes neither file nor the credentials file again unless it rolls back;
+7. withdraws its mDNS service (see "mDNS") and removes its tray icon;
+8. sends `GO` with a snapshot taken now: its running placebo app or none (see "App ownership and prep commands"), its
+   current `host_audio` setting (the value `/resume` uses [C28]), and the next launch session id [C28];
+9. waits for the new process's `GO_ACK` (5 s). On `ok` it releases the app and answers the helper: switched (exit 0).
+   On a failed `GO_ACK` (with a reason), a timeout or a dead new process, it rolls back as in step 6 (it is still the
+   main process) and answers the helper non-zero.
 
-The new process writes neither state file before `GO`. On `GO` it reloads `sunshine_state.json` and `apps.json` under
-`client_auth_mutex` and rebuilds its TLS context's trusted client certificates from the reloaded state, resumes
-accepting, and publishes mDNS. It sends nothing to systemd yet: the old process stays the unit's main process until the
-handover (step 7).
+The new process writes no state file before `GO`. On `GO` it reloads `sunshine_state.json` (`load_state` also rebuilds
+the trusted client certificate chain [C30]), the credentials file and `apps.json`, all under `client_auth_mutex`. Only
+after the `apps.json` reload does it adopt the app from the snapshot (a reload replaces the whole `proc_t` [C31]), and
+it takes `host_audio` and the session id counter. Then it sends `GO_ACK ok` (or a reason), resumes accepting,
+publishes mDNS and starts its tray icon. It sends nothing to systemd yet: the old process stays the unit's main process
+until the handover (step 7).
+
+**Pausing accept.** Today the RTSP server treats every accept error as fatal: it logs an Error and calls `clear()`,
+which ends every session [C23]. Cancelling the acceptor completes the pending accept with `operation_aborted`, so the
+change must:
+
+- pause and resume on the RTSP server's own thread (posted to its `io_context`, the switcher waits for confirmation),
+  with a flag that makes the `operation_aborted` completion of a pause neither log an Error nor call `clear()`;
+- keep a work guard on the `io_context`, because the RTSP loop calls `run_one()` when no launch is raised [C23]; with
+  no pending work that returns at once and leaves the `io_context` stopped, so the loop would spin and a resume would
+  need `restart()`;
+- re-arm `async_accept` on resume.
+
+Simple-Web-Server's accept loops (HTTP, HTTPS, web UI) need the same: a pause that neither stops their `io_context`
+nor closes the acceptor (to be checked against its source when the patch is written).
 
 ### 6. Rollback window
 - The new process serves normally. The old process sends `PING <seq>` over the channel every 2 s from the switch until
@@ -161,7 +199,8 @@ handover (step 7).
   step 7 keeps failing), a dead or hung new process triggers a rollback.
 - A death of the new process between `READY` and `GO` is handled as a full rollback too.
 - On a dead or hung new process: the old process resumes accepting on its socket copies,
-  answers requests normally again, reloads both state files before any write, publishes mDNS, and leaves drain mode.
+  answers requests normally again, reloads both state files and the credentials file before any write, publishes
+  mDNS, restores its tray icon, and leaves drain mode.
   systemd sees no main-process exit, so the unit and the old process's sessions are not affected. The new process's
   sessions are lost; apps it launched and `do` commands it ran are not undone (logged as a Warning), and its instance
   file is removed by the old process. After a rollback the old process takes back app ownership (see "App ownership
@@ -180,12 +219,17 @@ handover (step 7).
    handover every 10 s. The rollback rule of step 6 applies throughout. The process does not exit while it is the main
    process: past the drain deadline it keeps retrying, logs an Error every 10 s, and shows the state as
    `handover_failed` in its instance file and in `/api/sessions` responses (the top-level `handoff` field, see
-   "Visibility and control"). The escape hatch is `systemctl restart` (or `stop`) of the unit, which ends both processes.
+   "Visibility and control"). The escape hatch is `systemctl restart` (or `stop`) of the unit, which ends both
+   processes.
 
 Notifications use raw sockets, not libsystemd: `MAINPID=` and the barrier are sent to `NOTIFY_SOCKET` as datagrams;
 `BARRIER=1` carries the write end of a pipe as `SCM_RIGHTS`, and the barrier is complete when the read end reports
 end-of-file. The read-back runs `systemctl [--user] show -p MainPID --value <unit>` with `XDG_RUNTIME_DIR` set (user
 units) and a 5 s timeout.
+
+If the read-back times out although systemd has already applied `MAINPID=`, the old process still acts as the main
+process. A later death of the new process is then a main-process exit for systemd: the unit stops and `Restart=`
+applies, as in "the new process dies after the handover" below. No state is lost beyond that.
 
 From the handover on, the new process is the main process and sends any later notifications (`STATUS=`, `STOPPING=1`).
 A dead new process after the handover is a normal main-process exit: with `KillMode=control-group` systemd stops the
@@ -228,11 +272,12 @@ get reason `drain-deadline`.
 - Messages are length-checked (at most 64 KiB) and parsed strictly. Unknown types are ignored. A malformed message or
   an error closes the channel and logs an Error.
 - Messages (requests carry a request id; replies echo it): `HELLO` (version, capabilities, probe results and identity,
-  cooldown deadline, adopted app), `READY` (ok or reason), `GO`, `MAIN` (handover done), `PING`/`PONG`,
-  `SESSIONS?`/`SESSIONS` (list), `CLOSE <id>`/`CLOSED <result>`, `END_ALL`/`ENDED` (see "App ownership and prep
-  commands"), and the draining process's unsolicited `HANDOFF_STATE <state>`. Requests from the active process
-  (`SESSIONS?`, `CLOSE`) time out after 500 ms, `END_ALL` after 15 s (it waits for session joins, which have a 10 s
-  hang guard); they are sent only from request handlers, never while holding a lock.
+  cooldown deadline), `READY` (ok or reason), `MAIN` (handover done), `PING`/`PONG`,
+  `SESSIONS?`/`SESSIONS` (list), `CLOSE <id>`/`CLOSED <result>`, `CLOSE_CERT <hash>`/`CLOSED <count>`, `END_ALL`/`ENDED`
+  (see "App ownership and prep commands"), `GO` (with the snapshot)/`GO_ACK <ok|reason>`, and the draining process's
+  unsolicited `HANDOFF_STATE <state>`. Requests from the active process (`SESSIONS?`, `CLOSE`, `CLOSE_CERT`) time out
+  after 500 ms (late replies are dropped by request id), `END_ALL` after 15 s (it waits for session joins, which have a
+  10 s hang guard); they are sent only from request handlers, never while holding a lock.
 - When the channel closes after `GO`, neither side ends any session: the draining process keeps draining, the active
   process keeps serving. The active process then no longer lists or closes the draining sessions (it logs a Warning)
   and keeps refusing handoffs while the draining instance file exists.
@@ -299,20 +344,26 @@ the app ends every session of the process, because the control loop stops when n
 
 - Handoffs are refused while an app with a real child process runs (step 1). A desktop-style app runs in placebo mode
   (no child process [C11]).
-- The old process's `HELLO` describes its running placebo app, or none: the app id and name, the number of applied
-  prep commands (`_app_prep_it - _app_prep_begin`), a digest of its merged prep list (each entry's `do`, `undo` and
-  `elevated`), and the launch environment the commands ran with (the `SUNSHINE_*` variables set by `execute` [C18]).
-- The new process adopts the app only when its own `apps.json` has the same id and name and its merged prep list has
-  the same digest. It then marks the app as running in placebo mode with the same number of prep commands applied and
-  the received launch environment. So `currentgame` and the `/launch` refusal behave as before, a second client's
-  `/resume` runs no `do` command, and a later terminate runs each applied `undo` once, in reverse, with the same
-  environment as today.
-- If the old process has an app and adoption fails (unknown id, other name, other prep list), the new process sends a
-  failed `READY` with the reason ("app or prep commands changed while an app runs; cancel the app first") and the
-  handoff fails (step 4). Without an app, there is nothing to adopt and the old process has no sessions [C22].
-- At the switch the old process **releases** the app: it keeps reporting the app id to its own control loop, so its
-  sessions keep streaming [C22], but it never runs the app's `undo` commands, neither at a terminate nor at its exit
-  [C10]. A draining process has no route that terminates apps (the 503 gate and no web UI).
+- The snapshot in `GO` (step 5) describes the old process's running placebo app, or none: the app id and name, the
+  number of applied prep commands (`_app_prep_it - _app_prep_begin`), a digest of its merged prep list (each entry's
+  `do`, `undo` and `elevated`), and the launch environment the commands ran with (the `SUNSHINE_*` variables set by
+  `execute` [C18]). It is taken after the gate is up and the in-flight requests have finished, so no launch or
+  cancel can change it afterwards.
+- The new process adopts the app only when its freshly reloaded `apps.json` has the same id and name and its merged
+  prep list has the same digest. Adoption is a new `proc_t` method (the fields are private): it sets the app id, the
+  app (from its own `apps.json`, which also gives `get_last_run_app_name()`), `_app_prep_begin` and `_app_prep_it`
+  (begin plus the applied count), placebo mode, and the environment from the snapshot, and opens the app's `output`
+  file for appending if one is set. It runs before the new process accepts any request, so no lock is needed. So
+  `currentgame` and the `/launch` refusal behave as before, a second client's `/resume` runs no `do` command, and a
+  later terminate runs each applied `undo` once, in reverse, with the same environment as today.
+- If the old process has an app and adoption fails (unknown id, other name, other prep list), the new process
+  answers `GO_ACK` with the reason ("app or prep commands changed while an app runs; cancel the app first") and the
+  old process rolls back (step 5). Without an app, there is nothing to adopt and the old process has no sessions
+  [C22].
+- After `GO_ACK ok` the old process **releases** the app: an atomic flag that `running()` ignores, so its control loop
+  still sees the app and its sessions keep streaming [C22], while `terminate()` then clears the app state without
+  running any `undo` command, at a terminate or at its exit [C10]. A draining process has no route that terminates
+  apps (the 503 gate and no web UI).
 - Before the active process terminates the app on any path [C21], it sends `END_ALL` over the channel when a draining
   process exists. The draining process ends all its sessions (reason `terminated`, as a terminate ends every
   session today [C22]), waits for them to be joined, gives up its claim on the app, and answers `ENDED`. Only then
@@ -325,9 +376,15 @@ the app ends every session of the process, because the control loop stops when n
 - As a guard, the active process answers `/launch` with 503 while a draining process reports sessions (with the rules
   above this cannot happen: an adopted app makes `/launch` refused [C7], and without an app the old process has no
   sessions).
-- On rollback the old process takes the app back (with its prep state) only if it has not answered `ENDED`. If it has,
-  the new process may already have run the `undo` commands, so the old process does not take the app back, does not
-  run `undo`, and logs a Warning.
+- On rollback the old process reloads `apps.json` and then takes the app back (it clears the release flag, or
+  re-adopts its own snapshot if the reload replaced its `proc_t` [C31]) only if it has not answered `ENDED` and the
+  prep digest still matches. If it has answered `ENDED`, the new process may already have run the `undo` commands, so
+  the old process does not take the app back, runs no `undo`, and logs a Warning. The new process can change its app
+  only through a terminate, which needs `ENDED` first, or by starting one when it adopted none, in which case the old
+  process had no sessions and no app to take back.
+- Today an `apps.json` save through the web UI replaces the whole `proc_t` and so forgets a running app without
+  running its `undo` commands [C31]. This spec keeps that behaviour; in the active process the `/launch` guard above
+  still stops a `do` command from running while the old process streams.
 
 ### Other resources
 | Resource | Rule |
@@ -336,6 +393,9 @@ the app ends every session of the process, because the control loop stops when n
 | Virtual input devices | In handoff mode the new process creates keyboard, mouse, touch and pen devices at its first session, not at startup. Device stable ids and gamepad MAC addresses include the generation, so the two processes never create devices with the same ids. A draining process destroys all of its devices before it exits. A client that reconnects after a handoff gets gamepads with new MAC addresses, so the host may see them as new controllers. |
 | App state and prep commands | See "App ownership and prep commands". A draining process never runs `do` or `undo` commands and never terminates apps. |
 | `sunshine_state.json`, `apps.json` | Only the active process writes them (the old process stops at the switch, the new one reloads both after `GO`, the old one reloads both on rollback). Writes use a temporary file and rename. |
+| Session counts, instance file, `HANDOFF_STATE` | Updated from a separate notifier thread that reads an atomic session count (like `running_sessions` [C25]). Never from inside a session join or while holding the RTSP slots lock or the clear lock (lb.2): those paths would deadlock with `session_count()` or `clear()` [C16]. The new stop reasons need a reason parameter where the code hard-codes `terminated` today [C26]. |
+| Web UI CSRF tokens | Per process [C32]. After a switch the first web UI write from an already open page fails (403) until the page reloads; documented. |
+| Tray icon | Only the active process shows one (removed at the switch, restored on rollback). |
 | Log file | In handoff mode the new process appends to the log without rotating it. Every line of a draining process carries a `[drain]` tag. |
 | mDNS | Only the active process publishes. `publish.cpp` has only start and deinit today; the change adds withdraw and republish. The old process withdraws at the switch and waits up to 5 s for Avahi to drop the entry. If Avahi still renames the new process's service on a collision (for example to "name #2"), the new process resets it to the configured name once the old entry is gone. On rollback the old process republishes. |
 | UPnP | Only the active process maps ports. A draining process never unmaps the shared TCP ports, and unmaps only its own UDP base when it exits and the active process does not use that base. |
@@ -351,6 +411,13 @@ the app ends every session of the process, because the control loop stops when n
 - `POST /api/sessions/<id>/close` closes either kind; for a draining session the request goes over the channel. The
   audit line is unchanged and is written by the active process.
 - `/serverinfo` `currentgame` and `/cancel` refer to the active process's app only.
+- Revoking a client reaches both processes. Today, disabling a client ends its sessions [C24]. The active process
+  also sends `CLOSE_CERT <SHA-256 of the client certificate>` over the channel, and the draining process ends that
+  client's sessions (reason `terminated`). As a backstop that needs no channel, the draining process re-reads
+  `sunshine_state.json` (read-only) whenever it changes (inotify on its directory, checked at least every 2 s) and
+  ends the sessions of any client that is disabled there or no longer paired (stricter than today, where unpairing
+  alone ends no session). So a revoked client cannot keep
+  streaming on the draining process until the drain deadline.
 - Each process writes its own `Session ended: reason=<r>, active sessions=<N>` line; N counts that process's sessions.
 - New stop reasons: `drain-deadline` (ended at the drain deadline) and `stop` (a draining session ended because the
   service or the draining process was stopped).
@@ -420,9 +487,18 @@ RuntimeDirectory=sunshine
 - **Unit (blind):**
   - config validation of the options;
   - parsing and validation of `SUNSHINE_HANDOFF_FDS` (wrong port, family, not listening);
-  - the channel protocol over a socketpair: `HELLO` version mismatch, probe identity mismatch and app adoption data,
-    `READY` failure reasons, `GO`, `PING`/`PONG` with sequence numbers and the miss rule, list and close requests with
-    request ids and the 500 ms timeout, `HANDOFF_STATE`, early close, oversized and malformed messages;
+  - the channel protocol over a socketpair: `HELLO` version mismatch and probe identity mismatch, `READY` failure
+    reasons, `GO` with the snapshot and `GO_ACK` (ok, reason, timeout), `PING`/`PONG` with sequence numbers and the
+    miss rule, list, close and `CLOSE_CERT` requests with request ids, the 500 ms timeout and dropped late replies,
+    `END_ALL`/`ENDED` and its 15 s timeout, `HANDOFF_STATE`, early close, oversized and malformed messages;
+  - pausing and resuming the RTSP acceptor ends no session, logs no Error, and leaves the RTSP loop idle (no spin);
+  - the in-flight counter order: a handler that enters while the gate is being set is either counted or refused,
+    never missed (stress test);
+  - the switch re-checks: an app process, a pairing session or a pending launch that appears after step 1 delays or
+    fails the switch;
+  - the spawn fd placement when the sources already sit at fds 3-7, and a child reaped by another `waitpid(-1)`;
+  - the draining process's revocation backstop: a disabled or removed client in a rewritten state file ends its
+    sessions;
   - app adoption: matching id, name and prep digest adopts in placebo mode with the same number of prep commands
     applied and the received environment; any mismatch is a failed `READY`; a terminate after adoption runs each
     applied `undo` once, in reverse, with the received environment; a released app runs no `undo` at terminate or
@@ -496,7 +572,16 @@ RuntimeDirectory=sunshine
       `undo` lines written by the new process's pid while no session of the old process streams, and no line from
       the old process's exit. A variant cancels while A still streams on the old process: A's session ends with
       `terminated` before the `undo` lines appear. A second variant has the global prep command with a `do` only (no
-      `undo`): exactly one `do` line, no other line.
+      `undo`): exactly one `do` line, no other line;
+  32. a placebo app launched, or cancelled, on the old process after `READY` and before the switch is adopted as it
+      is at the switch (or not adopted after a cancel): no second `do`, no second `undo`;
+  33. a pairing started after the step-1 check and before the switch either completes on the old process before
+      `GO` or makes the switch fail; it is never cut by the switch;
+  34. disabling a client on the active process ends its session on the draining process within 2 s, also with the
+      channel closed;
+  35. the new process cancels the adopted app and then dies inside the window: the old process rolls back without
+      taking the app back, and no `undo` line appears twice;
+  36. the RTSP loop of a draining process uses no measurable CPU while idle, and a rollback accepts RTSP again.
 
 ## Out of scope
 - Moving a live session from one process to another (not possible without client support).
@@ -519,10 +604,10 @@ Base: fork branch `lanternbox` at `75612545`. Line numbers are for that commit.
 | C8 | `/serverinfo` reports the running app as `currentgame` and the busy state. | `src/nvhttp.cpp:1266-1267` |
 | C9 | At the last session's end, a running app is left running (only the tray is updated); with no app, gamepads end and the (no-op) revert runs. | `src/stream.cpp:2346-2363` |
 | C10 | Process shutdown terminates the app (`proc.terminate()` in the deinit guard). | `src/process.cpp:57-60` |
-| C11 | An app without a child process runs in placebo mode; `running()` reports it. | `src/process.cpp:267`, `:287-310` |
+| C11 | An app without a child process runs in placebo mode; `running()` reports it. An `auto-detach` app whose command exits with 0 within 5 s also becomes placebo (no child process left). `placebo` is private. | `src/process.cpp:267`, `:287-310` (auto-detach at `:306-310`) |
 | C12 | `terminate()` runs the applied prep `undo` commands in reverse, from `_app_prep_it` back to `_app_prep_begin`. | `src/process.cpp:322-369` (loop at 330) |
 | C13 | Every client route, including the state-changing `/pair`, `/launch`, `/resume`, `/cancel`, is a GET. | `src/nvhttp.cpp:1691-1712` |
-| C14 | Pairing sessions live in `map_id_sess`; `expire_pair_sessions` drops expired ones under its mutex. | `src/nvhttp.cpp:186`, `:635-643` |
+| C14 | Pairing sessions live in `map_id_sess`; `expire_pair_sessions` drops expired ones under its mutex. | `src/nvhttp.cpp:186`, `:635-638` |
 | C15 | Each RTSP request is handled on its own TCP connection, shut down after the reply. | `src/rtsp.cpp:530-541` |
 | C16 | Lock order today: `clear()` joins sessions under the RTSP slots lock, and `rtsp_stream::session_count()` calls `clear(false)`. lb.2 (`fix/lb2-session-api-hardening`, issue #13) moves the join out of the slots lock. This spec adds no lock that is taken while the slots lock is held, and channel requests are never sent while holding any lock. | `src/rtsp.cpp:654-667`, `:827-832` |
 | C17 | Sunshine's sockets are created without `SOCK_CLOEXEC`; app launches use Boost.Process `limit_handles`; the in-place restart closes fds above stderr. | Boost.Asio `socket_ops.ipp` (`socket`, `accept`); `src/platform/linux/misc.cpp:443-462`, `:591-594` |
@@ -531,3 +616,13 @@ Base: fork branch `lanternbox` at `75612545`. Line numbers are for that commit.
 | C20 | When the apps are loaded, the global prep commands are put first in each app's prep list unless the app sets `exclude-global-prep-cmd`, followed by the app's own. | `src/process.cpp:690`, `:701-713`, `:715-730`, `:781` |
 | C21 | `proc.terminate()` callers: `/cancel`; the web UI's close-app; update-client when no session runs and an app runs; unpair when no client remains; unpair-all; process shutdown. | `src/nvhttp.cpp:1563-1564`; `src/confighttp.cpp:1198`, `:1321-1322`, `:1372-1373`, `:1403`; `src/process.cpp:57-59` |
 | C22 | The control loop stops when no app runs (and no session waits for its peer), then ends every session of the process. | `src/stream.cpp:1404-1407`, `:1411-1440` (reason `terminated`) |
+| C23 | Any accept error, including a cancelled accept, makes the RTSP server log an Error and `clear()` all sessions; the RTSP loop calls `run_one_for(500ms)` while a launch is raised and `run_one()` otherwise. | `src/rtsp.cpp:547-553`, `:766-772` |
+| C24 | Disabling a client ends its sessions (`terminate_sessions_by_cert` → `clear_by_cert`); unpair does not end sessions unless it removes the last client (then the app is terminated). | `src/confighttp.cpp:1315-1320`, `:1372-1373`; `src/rtsp.cpp:675`, `:850-851` |
+| C25 | `running_sessions` is an atomic count of running sessions. | `src/stream.cpp:2222` |
+| C26 | `clear()`, `clear_by_cert()` and the control loop's shutdown stop sessions with the hard-coded reason `terminated`. | `src/rtsp.cpp:660`, `:680`; `src/stream.cpp:1439` |
+| C27 | `proc_t::running()` reaps any child (`waitpid(-1, WNOHANG)`) on each call. | `src/process.cpp:287-296` |
+| C28 | Launch session ids come from a per-process counter; `host_audio` is one per-process value, set by `/launch` and used by `/resume`. | `src/nvhttp.cpp:472`; `:1624`, `:1377`, `:1491` |
+| C29 | Under `FRESH_STATE`, state is neither loaded at startup nor saved after a pairing. | `src/nvhttp.cpp:1612-1616`, `:456-457` |
+| C30 | `load_state` rebuilds the trusted client certificate chain. | `src/nvhttp.cpp:366`, `:431` |
+| C31 | `proc::refresh` replaces the whole `proc_t`; the web UI's app save and delete call it. | `src/process.cpp:801-807`; `src/confighttp.cpp:1169`, `:1245` |
+| C32 | CSRF tokens live in a per-process map. | `src/confighttp.cpp:194-200` |
