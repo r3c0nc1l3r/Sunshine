@@ -9,6 +9,7 @@
 #include <string>
 
 // local includes
+#include "src/logging.h"
 #include "wayland_stats.h"
 
 namespace wl::stats {
@@ -19,14 +20,26 @@ namespace wl::stats {
     std::atomic<std::uint64_t> cancelled_total {0};  ///< Cancelled screencopy requests.
     std::atomic<std::uint64_t> overwritten_total {0};  ///< Live objects found where a new one was stored.
 
+    std::atomic<bool> bo_underflow_logged {false};  ///< Set once the BO underflow has been logged.
+    std::atomic<bool> wl_buffer_underflow_logged {false};  ///< Set once the wl_buffer underflow has been logged.
+    std::atomic<bool> params_underflow_logged {false};  ///< Set once the pending-params underflow has been logged.
+
     /**
      * @brief Decrement a live count, never letting it go below 0.
      *
+     * A decrement that would go below 0 means a destroy happened without a matching create. The count is still
+     * clamped at 0, and the imbalance is logged once per counter kind at debug level.
+     *
      * @param value Live count to decrement.
+     * @param logged Flag that is set after the first underflow of this counter has been logged.
+     * @param name Counter name used in the log message.
      */
-    void decrement_clamped(std::atomic<std::int64_t> &value) {
+    void decrement_clamped(std::atomic<std::int64_t> &value, std::atomic<bool> &logged, const char *name) {
       auto current = value.load();
       while (current > 0 && !value.compare_exchange_weak(current, current - 1)) {}
+      if (current <= 0 && !logged.exchange(true)) {
+        BOOST_LOG(debug) << "[wayland] capture stats: " << name << " count would go negative";
+      }
     }
   }  // namespace
 
@@ -35,7 +48,7 @@ namespace wl::stats {
   }
 
   void bo_destroyed() {
-    decrement_clamped(bos_live);
+    decrement_clamped(bos_live, bo_underflow_logged, "bo");
   }
 
   void wl_buffer_created() {
@@ -43,7 +56,7 @@ namespace wl::stats {
   }
 
   void wl_buffer_destroyed() {
-    decrement_clamped(wl_buffers_live);
+    decrement_clamped(wl_buffers_live, wl_buffer_underflow_logged, "wl_buffer");
   }
 
   void params_pending() {
@@ -51,7 +64,7 @@ namespace wl::stats {
   }
 
   void params_resolved() {
-    decrement_clamped(pending_params_live);
+    decrement_clamped(pending_params_live, params_underflow_logged, "pending params");
   }
 
   void request_cancelled() {
