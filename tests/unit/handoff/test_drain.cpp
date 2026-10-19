@@ -16,18 +16,21 @@
   #include <algorithm>
   #include <atomic>
   #include <chrono>
+  #include <filesystem>
   #include <functional>
   #include <memory>
   #include <mutex>
   #include <optional>
   #include <string>
   #include <thread>
+  #include <unistd.h>
   #include <vector>
 
   // local includes
   #include "src/config.h"
   #include "src/handoff/drain.h"
   #include "src/handoff/hooks.h"
+  #include "src/handoff/peer_link.h"
   #include "src/handoff/runtime.h"
   #include "src/stream.h"
   #include "src/upnp.h"
@@ -39,6 +42,9 @@ namespace {
   using handoff::drain_phase_e;
   using handoff::mode_e;
   using handoff::state_e;
+
+  std::atomic<bool> g_global_notifier_started {false};  ///< The process-wide notifier was started by a test here.
+  std::atomic<bool> g_global_notifier_may_have_ended {false};  ///< A shutdown request ran while it was running.
 
   /**
    * @brief Poll a predicate until it holds or the limit passes.
@@ -720,12 +726,13 @@ TEST_F(HandoffDrainControllerTest, LimitExpiryIsNoOpWhileSessionsAreStillEnding)
 // ---------------------------------------------------------------------------------------------------------------------
 
 TEST_F(HandoffDrainControllerTest, ShutdownRequestedBeforeExitStartsMeansNoSequence) {
-  // Control: without a shutdown request the same scenario exits.
+  // Control: without a shutdown request the same scenario runs the whole sequence.
   rig.sessions = 0;
   begin_now();
   ctrl->handed_over();
   advance(1500);
   ASSERT_TRUE(saw("exit_graceful")) << "Control: the scenario without a shutdown request must exit.";
+  ASSERT_EQ(rig.count("end_sessions"), 1) << "Control: the sequence ends the sessions.";
 
   rig.reset();
   rig.clock_ms = 0;
@@ -734,9 +741,15 @@ TEST_F(HandoffDrainControllerTest, ShutdownRequestedBeforeExitStartsMeansNoSeque
   begin_now();
   ctrl->handed_over();
   advance(11000, 1000);
-  EXPECT_TRUE(stays_silent()) << "When a shutdown was requested, the controller must run none of its exit sequence "
-                                 "(no end_sessions, release_devices, second limit or exit): the signal path owns the exit.";
+  ASSERT_TRUE(saw("ensure_unmap_scope")) << "On the shutdown path the unmap scope must still be ensured first.";
+  std::this_thread::sleep_for(60ms);
+  EXPECT_EQ(rig.count("ensure_unmap_scope"), 1) << "The unmap scope must be ensured exactly once.";
+  EXPECT_EQ(rig.count("end_sessions"), 0) << "A shutdown request: the signal path ends the sessions, not the controller.";
+  EXPECT_EQ(rig.count("release_devices"), 0) << "A shutdown request: no device release by the controller.";
   EXPECT_EQ(rig.count("arm_limit"), 0) << "The controller must never arm a second limit after a shutdown request.";
+  EXPECT_EQ(rig.count("exit_graceful"), 0) << "A shutdown request: the signal path owns the exit.";
+  EXPECT_EQ(rig.count("force_exit"), 0);
+  EXPECT_EQ(rig.snapshot().size(), 1u) << "ensure_unmap_scope must be the only effect on the shutdown path.";
 }
 
 TEST_F(HandoffDrainControllerTest, CancelFromShutdownPathJoinsTheThread) {
@@ -745,11 +758,15 @@ TEST_F(HandoffDrainControllerTest, CancelFromShutdownPathJoinsTheThread) {
   begin_now();
   ctrl->handed_over();
   advance(1500);
-  ASSERT_TRUE(stays_silent(20ms));
+  ASSERT_TRUE(saw("ensure_unmap_scope"));
+  std::this_thread::sleep_for(30ms);
+  EXPECT_EQ(rig.snapshot(), std::vector<std::string>({"ensure_unmap_scope"}))
+    << "On the shutdown path the only effect is ensure_unmap_scope, once.";
   // SPEC-QUESTION: the phase after the controller ended because of a shutdown request is not stated by the spec
   // (drain.h says the controller ends); only the result of cancel() is asserted.
   EXPECT_TRUE(ctrl->cancel()) << "cancel() from the shutdown path must join the thread and return true when the exit "
                                  "sequence never started.";
+  EXPECT_EQ(rig.count("ensure_unmap_scope"), 1) << "cancel() must not ensure the scope again.";
 }
 
 TEST_F(HandoffDrainControllerTest, DestructorWhileDrainingEndsWithoutEffects) {
@@ -794,8 +811,9 @@ namespace {
      *
      * @return `true` when the exit sequence reached the exit seam.
      */
-    bool run_exit() {
+    bool run_exit(bool shutdown = false) {
       rig_t rig;
+      rig.shutdown = shutdown;
       auto ops = rig.ops();
       ops.ensure_unmap_scope = nullptr;  // production default
       handoff::drain_timing_t timing;
@@ -807,12 +825,12 @@ namespace {
       for (int i = 0; i < 50; ++i) {
         rig.clock_ms += 20;
         std::this_thread::sleep_for(3ms);
-        if (rig.count("exit_graceful") > 0) {
+        if (shutdown ? upnp::unmap_scope() != upnp::unmap_scope_e::all : rig.count("exit_graceful") > 0) {
           return true;
         }
       }
       return wait_until([&] {
-        return rig.count("exit_graceful") > 0;
+        return shutdown ? upnp::unmap_scope() != upnp::unmap_scope_e::all : rig.count("exit_graceful") > 0;
       });
     }
 
@@ -828,6 +846,13 @@ TEST_F(HandoffDrainDefaultUnmapScopeTest, ScopeAllIsNarrowedBeforeExit) {
   // the default offset of 100 the bases differ, so `udp_only` is asserted; the test only requires "not all" strictly.
   EXPECT_NE(upnp::unmap_scope(), upnp::unmap_scope_e::all)
     << "The default ensure_unmap_scope must narrow a scope that is still all (the exit must never unmap the shared TCP ports).";
+  EXPECT_EQ(upnp::unmap_scope(), upnp::unmap_scope_e::udp_only);
+}
+
+TEST_F(HandoffDrainDefaultUnmapScopeTest, ShutdownPathNarrowsScopeAll) {
+  upnp::set_unmap_scope(upnp::unmap_scope_e::all);
+  ASSERT_TRUE(run_exit(true)) << "When a shutdown request ends the sequence, the default ensure_unmap_scope must still "
+                                 "narrow a scope of all before the controller ends.";
   EXPECT_EQ(upnp::unmap_scope(), upnp::unmap_scope_e::udp_only);
 }
 
@@ -1230,6 +1255,9 @@ TEST_F(HandoffDrainNotifierTest, EqualPeerStateIsNotWritten) {
 TEST_F(HandoffDrainNotifierTest, ShutdownRequestMakesLastPassAndEnds) {
   start_and_settle();
   const auto before = notifier->passes();
+  if (g_global_notifier_started.load()) {
+    g_global_notifier_may_have_ended = true;
+  }
   handoff::runtime().request_shutdown();
   ASSERT_TRUE(wait_until([&] {
     return notifier->passes() > before;
@@ -1240,6 +1268,114 @@ TEST_F(HandoffDrainNotifierTest, ShutdownRequestMakesLastPassAndEnds) {
   notifier->poke();
   std::this_thread::sleep_for(50ms);
   EXPECT_EQ(notifier->passes(), ended) << "After the shutdown the notifier stays ended.";
+}
+
+namespace {
+  /**
+   * @brief A draining-peer double with a settable existence and announced state.
+   */
+  class fake_session_peer_t: public handoff::session_peer_t {
+  public:
+    bool exists() override {
+      return present.load();
+    }
+
+    bool gone() override {
+      return !present.load();
+    }
+
+    reply_e end_all(std::chrono::milliseconds) override {
+      return reply_e::no_reply;
+    }
+
+    std::optional<std::vector<handoff::protocol::session_entry_t>> list(std::chrono::milliseconds) override {
+      return std::nullopt;
+    }
+
+    std::optional<rtsp_stream::close_result_e> close(std::uint32_t, std::chrono::milliseconds) override {
+      return std::nullopt;
+    }
+
+    std::optional<std::uint32_t> close_cert(std::string_view, std::chrono::milliseconds) override {
+      return std::nullopt;
+    }
+
+    state_e state() override {
+      return announced.load();
+    }
+
+    std::atomic<bool> present {true};  ///< `exists()`.
+    std::atomic<state_e> announced {state_e::none};  ///< `state()`.
+  };
+}  // namespace
+
+TEST(HandoffDrainDefaultPeerTest, DefaultPeerStateMirrorsSessionPeerIntoInstanceFile) {
+  handoff::runtime().reset_for_test();
+  const auto dir = std::filesystem::temp_directory_path() / ("sunshine-drain-peer-" + std::to_string(::getpid()));
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  handoff::instance_t initial;
+  initial.pid = ::getpid();
+  initial.start_time = 1;
+  initial.role = handoff::role_e::active;
+  initial.udp_base = 47989;
+  ASSERT_TRUE(handoff::runtime().open_instance(dir, initial));
+
+  auto peer = std::make_shared<fake_session_peer_t>();
+  peer->announced = state_e::draining;
+  handoff::runtime().set_peer(peer);
+
+  // Only the session count is faked; current_state, write_state and peer_state take their production defaults.
+  std::atomic<int> sessions {0};
+  handoff::notifier_ops_t ops;
+  ops.sessions = [&sessions] {
+    return sessions.load();
+  };
+  handoff::notifier_timing_t timing;
+  timing.period = 5000ms;
+  auto current = [] {
+    const auto i = handoff::runtime().instance_current();
+    return i ? i->handoff : state_e::none;
+  };
+  {
+    handoff::session_notifier_t notifier(ops, timing);
+    notifier.start();
+    ASSERT_TRUE(wait_until([&] {
+      return notifier.passes() >= 1;
+    }));
+    EXPECT_EQ(current(), state_e::draining) << "The default peer_state must read the session peer's announced state "
+                                               "and the default write_state must put it in the instance file.";
+
+    peer->announced = state_e::handover_failed;
+    notifier.poke();
+    EXPECT_TRUE(wait_until([&] {
+      return current() == state_e::handover_failed;
+    }))
+      << "A changed announced state must follow into the file.";
+
+    peer->present = false;
+    notifier.poke();
+    EXPECT_TRUE(wait_until([&] {
+      return current() == state_e::none;
+    }))
+      << "A peer that no longer exists reads none, which returns the file to none.";
+
+    handoff::runtime().set_peer(nullptr);
+    handoff::runtime().instance_set_state(state_e::kill_pending);
+    const auto before = notifier.passes();
+    notifier.poke();
+    ASSERT_TRUE(wait_until([&] {
+      return notifier.passes() > before;
+    }));
+    EXPECT_EQ(current(), state_e::kill_pending) << "With no peer the state the old side set itself must be kept.";
+    notifier.stop();
+  }
+  // SPEC-QUESTION: the default mapping for a peer that is a plain drain_peer_t (no session_peer_t) is not asserted:
+  // drain.h's default text reads `peer->state()` and does not say what a plain double reports.
+  handoff::runtime().set_peer(nullptr);
+  handoff::runtime().instance_remove();
+  handoff::runtime().reset_for_test();
+  std::filesystem::remove_all(dir, ec);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1318,9 +1454,14 @@ TEST(HandoffDrainHooksTest, SessionsChangedWakesTheDrainNotifier) {
   handoff::runtime().reset_for_test();
   auto &notifier = handoff::session_notifier();
   notifier.start();
-  // SPEC-QUESTION: whether the process-wide notifier may be started again after stop() (the header says only that a
-  // shutdown makes it stay ended). The test stops it at the end (a shutdown request in a later test would end it for
-  // good) and starts it again when the test repeats.
+  // The process-wide notifier is never stopped here: after stop() it stays stopped and start() does nothing, so
+  // stopping it would break a repeat. start() is idempotent while it runs.
+  // SPEC-QUESTION: a shutdown request made by another test while this notifier runs ends it for good ("it stays
+  // ended"). g_global_notifier_may_have_ended records that case in this file; the test is skipped then.
+  if (g_global_notifier_may_have_ended.load()) {
+    GTEST_SKIP() << "The process-wide notifier was ended by a shutdown request in an earlier test.";
+  }
+  g_global_notifier_started = true;
   ASSERT_TRUE(wait_until([&] {
     return notifier.passes() >= 1;
   }))
@@ -1335,7 +1476,6 @@ TEST(HandoffDrainHooksTest, SessionsChangedWakesTheDrainNotifier) {
     },
     300ms
   )) << "hooks::sessions_changed() must wake the session notifier for a pass right now.";
-  notifier.stop();
   handoff::runtime().reset_for_test();
 }
 
