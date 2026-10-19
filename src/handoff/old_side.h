@@ -251,7 +251,8 @@ namespace handoff {
    * Rollback (whatever the child does): `end_all.decide_rollback()` first; then `kill_and_reap(reap)` until the
    * child is gone, and after the first `timeout` `set_state(kill_pending)` (and, if the helper was not yet answered,
    * answer it `kill_pending`); when gone, answer a still-waiting helper `failed <reason>`; then, only for the steps
-   * that happened: `wait_in_flight(-1)` if the gate was raised, `reload_after_rollback()` and `unfreeze()` if frozen,
+   * that happened: `wait_in_flight(-1)` and then `reload_after_rollback()` and `unfreeze()` if frozen (the unbounded
+   * wait only protects the reload and app-list swap, so a failure before the freeze does not wait),
    * `set_released(false)` for `take_back` or `drop_app()` for `drop` if released, `remove_new_instance_file()`,
    * `start_upnp_cleanup(new_base)` if `COMMIT` was sent, `lower_gate()` if raised, `resume_accept()` if paused,
    * `publish_mdns()` and `restore_tray()` if withdrawn, `leave_drain_mode()` and `set_role(active)` if
