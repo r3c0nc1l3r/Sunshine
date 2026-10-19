@@ -617,7 +617,7 @@ namespace {
   }
 
   /**
-   * @brief Stops and joins a flood thread when it leaves scope, so an early `ASSERT` cannot leave it joinable.
+   * @brief Stops and joins a flood thread on every exit path, including exceptions, so it is never left joinable.
    */
   struct flood_joiner_t {
     std::atomic<bool> &stop;  ///< Stop flag polled by the flood loop.
@@ -866,6 +866,7 @@ namespace {
     struct flood_result_t {
       std::chrono::steady_clock::time_point seen;  ///< When the pump saw `MAIN`, or when it stopped (EOF or the deadline).
       int sent {0};  ///< Sends that succeeded (the whole datagram was sent), out of the target.
+      bool threw {false};  ///< The flood thread threw an exception.
     };
 
     /**
@@ -875,26 +876,32 @@ namespace {
      * retries only when `send()` fails with `EAGAIN` or `EWOULDBLOCK` (the socket is full); any other failure ends
      * the flood. The test thread keeps pumping, so PINGs are answered however slow the sends are (sanitizer builds).
      * The flood is stopped as soon as the pump sees `MAIN` or end of channel, or when the 1500 ms deadline passes, so
-     * it never sends after `MAIN`. The flood thread is stopped and joined before this returns.
+     * it stops promptly after `MAIN` (a concurrent sender may slip in a few sends before the flag is seen). The flood
+     * thread is stopped and joined before this returns. An exception in the flood thread is recorded in `threw`.
      *
      * @param message Message sent repeatedly.
      * @param sent_target Number of successful sends to aim for.
      * @return `seen` is the time the pump stopped (MAIN, EOF or the deadline); `sent` is the number of successful
-     *         sends made before the flood stopped.
+     *         sends made before the flood stopped; `threw` is true when the flood thread threw.
      */
     flood_result_t flood_until_main(const protocol::message_t &message, int sent_target) {
       std::atomic<bool> stop_flood {false};
       std::atomic<int> sent {0};
-      std::thread flooder([this, &message, sent_target, &stop_flood, &sent]() {
-        while (!stop_flood && sent < sent_target) {
-          errno = 0;
-          if (peer->send(message)) {
-            ++sent;
-          } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            std::this_thread::yield();  // socket full: the old side has not drained it yet
-          } else {
-            break;  // closed channel or encoding failure: retrying cannot help
+      std::atomic<bool> threw {false};
+      std::thread flooder([this, &message, sent_target, &stop_flood, &sent, &threw]() {
+        try {
+          while (!stop_flood && sent < sent_target) {
+            errno = 0;
+            if (peer->send(message)) {
+              ++sent;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+              std::this_thread::yield();  // socket full: the old side has not drained it yet
+            } else {
+              break;  // closed channel or encoding failure: retrying cannot help
+            }
           }
+        } catch (...) {
+          threw = true;  // recorded for the test to assert; an escaping exception would terminate the binary
         }
       });
       flood_joiner_t joiner {stop_flood, flooder};
@@ -909,6 +916,7 @@ namespace {
       stop_flood = true;  // no send after MAIN, EOF or the deadline
       flooder.join();
       result.sent = sent.load();
+      result.threw = threw.load();
       return result;
     }
 
@@ -1952,23 +1960,22 @@ TEST_F(HandoffOldSideTest, FloodOfDrainRequestsWithBlockedHandlerDoesNotDelayHan
   handler_blocks = true;
   start();
   ASSERT_TRUE(to_committed());
-  const auto committed_at = std::chrono::steady_clock::now();
   const protocol::message_t request = protocol::sessions_request_t {7};
   // The flood aims for 2000 requests, more than the drain queue bounds. The queue-full path usually runs and logs a
   // Warning, but the contract does not expose that, so the test does not assert it.
   const auto flood = flood_until_main(request, 2000);
   const auto seen = flood.seen;
+  ASSERT_FALSE(flood.threw) << "the flood thread threw an exception while sending";
   EXPECT_EQ(1, peer->mains) << "MAIN must still arrive while the drain handler is blocked and requests flood in (sends that succeeded: " << flood.sent
                             << ")";
   // Measured from the first blocked handler call, not from the start of the flood: a handover that waited for the
   // handler would arrive about 700 ms after that call (the handler's cap), while a correct one arrives about the
   // rollback window (200 ms) after COMMIT.
-  std::chrono::steady_clock::time_point base = committed_at;
+  std::chrono::steady_clock::time_point base;
   {
     std::lock_guard lock {handler_mutex};
-    if (!handled.empty()) {
-      base = first_handled_at;
-    }
+    ASSERT_FALSE(handled.empty()) << "the drain handler must have been called while the flood ran, so the blocked-handler path is exercised";
+    base = first_handled_at;
   }
   const auto elapsed = seen - base;
   EXPECT_LT(elapsed, 650ms) << "the handover must not wait for the blocked drain handler (it would take until the handler's 700 ms cap after its first call)";
@@ -1989,6 +1996,7 @@ TEST_F(HandoffOldSideTest, FloodOfPongsDoesNotDelayPingsOrHandover) {
   const auto committed_at = std::chrono::steady_clock::now();
   const protocol::message_t pong = protocol::pong_t {100000};
   const auto flood = flood_until_main(pong, 2000);
+  ASSERT_FALSE(flood.threw) << "the flood thread threw an exception while sending";
   const auto elapsed = flood.seen - committed_at;
   EXPECT_EQ(1, peer->mains) << "MAIN must arrive after a flood of PONGs (sends that succeeded: " << flood.sent << ")";
   EXPECT_LT(elapsed, 900ms) << "the handover must happen about rollback_window after COMMIT despite the flood";
