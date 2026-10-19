@@ -81,7 +81,8 @@ namespace stream {
     /**
      * @brief Stop a streaming session and record why it ended.
      *
-     * The reason is recorded only if the session has none yet, so the first reason wins.
+     * The reason is recorded only by the call that moves the session from running to stopping, so the first reason
+     * wins. Stopping a session that is not running records nothing.
      *
      * @param session Active streaming or pairing session for the request.
      * @param reason Why the session is being stopped.

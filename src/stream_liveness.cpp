@@ -6,6 +6,8 @@
 // standard includes
 #include <algorithm>
 #include <limits>
+#include <mutex>
+#include <utility>
 
 // local includes
 #include "stream_liveness.h"
@@ -15,8 +17,6 @@ namespace stream {
     switch (reason) {
       case stop_reason_e::disconnect:
         return "disconnect";
-      case stop_reason_e::enet_timeout:
-        return "enet-timeout";
       case stop_reason_e::ping_timeout:
         return "ping-timeout";
       case stop_reason_e::media_ping_timeout:
@@ -27,6 +27,8 @@ namespace stream {
         return "protocol-error";
       case stop_reason_e::api_close:
         return "api-close";
+      case stop_reason_e::stream_ended:
+        return "stream-ended";
       case stop_reason_e::terminated:
         return "terminated";
       case stop_reason_e::unknown:
@@ -73,6 +75,58 @@ namespace stream {
 
     bool media_liveness_t::expired(std::chrono::steady_clock::time_point now, std::chrono::milliseconds timeout) const {
       return _armed && now - _last_ping >= timeout;
+    }
+
+    void shared_media_liveness_t::on_ping(std::chrono::steady_clock::time_point now) {
+      std::lock_guard lg {_mutex};
+      _tracker.on_ping(now);
+    }
+
+    bool shared_media_liveness_t::armed() const {
+      std::lock_guard lg {_mutex};
+      return _tracker.armed();
+    }
+
+    bool shared_media_liveness_t::expired(std::chrono::steady_clock::time_point now, std::chrono::milliseconds timeout) const {
+      std::lock_guard lg {_mutex};
+      return _tracker.expired(now, timeout);
+    }
+
+    void media_ping_registry_t::add(const std::string &key, std::shared_ptr<shared_media_liveness_t> tracker) {
+      if (!tracker) {
+        return;
+      }
+
+      std::lock_guard lg {_mutex};
+      _trackers.insert_or_assign(key, std::move(tracker));
+    }
+
+    void media_ping_registry_t::remove(const std::shared_ptr<shared_media_liveness_t> &tracker) {
+      std::lock_guard lg {_mutex};
+      std::erase_if(_trackers, [&](const auto &entry) {
+        return entry.second == tracker;
+      });
+    }
+
+    bool media_ping_registry_t::on_ping(const std::string &key, std::chrono::steady_clock::time_point now) {
+      std::shared_ptr<shared_media_liveness_t> tracker;
+      {
+        std::lock_guard lg {_mutex};
+        auto it = _trackers.find(key);
+        if (it == _trackers.end()) {
+          return false;
+        }
+        tracker = it->second;
+      }
+
+      // Update outside the registry lock so a slow tracker never blocks other keys.
+      tracker->on_ping(now);
+      return true;
+    }
+
+    std::size_t media_ping_registry_t::size() const {
+      std::lock_guard lg {_mutex};
+      return _trackers.size();
     }
   }  // namespace liveness
 }  // namespace stream

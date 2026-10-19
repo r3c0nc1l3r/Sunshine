@@ -349,16 +349,6 @@ namespace stream {
    */
   using message_queue_queue_t = std::shared_ptr<safe::queue_t<std::tuple<socket_e, av_session_id_t, message_queue_t>>>;
 
-  /**
-   * @brief Media-ping liveness of one session, shared between the UDP receive thread and the control thread.
-   */
-  struct media_ping_t {
-    std::mutex mutex;  ///< Guards `liveness`; held only for the duration of one `on_ping()` or `expired()` call.
-    liveness::media_liveness_t liveness;  ///< Tracker of the client's periodic video and audio pings.
-  };
-
-  using media_ping_registry_t = sync_util::sync_t<std::map<av_session_id_t, std::shared_ptr<media_ping_t>>>;  ///< Running sessions' media-ping state, keyed like the ping message queues.
-
   // return bytes written on success
   // return -1 on error
   static inline int encode_audio(bool encrypted, const audio::buffer_t &plaintext, uint8_t *destination, crypto::aes_t &iv, crypto::cipher::cbc_t &cbc) {
@@ -487,7 +477,7 @@ namespace stream {
     std::jthread audio_thread;  ///< Thread that sends encoded audio packets.
     std::jthread control_thread;  ///< Thread that runs the ENet control server.
 
-    media_ping_registry_t media_pings;  ///< Media-ping state of started sessions; the UDP receive thread records post-start pings here.
+    liveness::media_ping_registry_t media_pings;  ///< Media-ping trackers of started sessions, keyed by ping payload or client address; the UDP receive thread records post-start pings here.
 
     asio::io_context io_context;  ///< Asio context used by the UDP broadcast sockets.
 
@@ -513,7 +503,7 @@ namespace stream {
     std::chrono::steady_clock::time_point pingTimeout;  ///< Deadline for receiving the next client ping.
     std::chrono::steady_clock::time_point last_enet_ping;  ///< Time of the last explicit ENet ping; touched only by the control broadcast thread.
 
-    std::shared_ptr<media_ping_t> media_ping {std::make_shared<media_ping_t>()};  ///< Post-start video and audio ping tracking, shared with the broadcast context registry.
+    std::shared_ptr<liveness::shared_media_liveness_t> media_ping {std::make_shared<liveness::shared_media_liveness_t>()};  ///< Post-start video and audio ping tracking, shared with the broadcast context registry.
     std::atomic<stop_reason_e> stop_reason {stop_reason_e::unknown};  ///< First reason recorded for ending the session.
 
     // Immutable after `session::alloc()`, so they may be read from any thread.
@@ -1360,13 +1350,7 @@ namespace stream {
 
           // The client may keep the control stream alive while no longer sending its video/audio pings
           if (session->state.load(std::memory_order_acquire) == session::state_e::RUNNING) {
-            bool media_expired;
-            {
-              std::lock_guard media_lg {session->media_ping->mutex};
-              media_expired = session->media_ping->liveness.expired(now, config::stream.ping_timeout);
-            }
-
-            if (media_expired) {
+            if (session->media_ping->expired(now, config::stream.ping_timeout)) {
               auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
               BOOST_LOG(info) << address << ": Media Ping Timeout"sv;
               session::stop(*session, stop_reason_e::media_ping_timeout);
@@ -1451,8 +1435,8 @@ namespace stream {
         }
       }
 
-      auto expected_reason = stop_reason_e::unknown;
-      session->stop_reason.compare_exchange_strong(expected_reason, stop_reason_e::terminated);
+      // Records `terminated` only if this call stops a running session; an already stopping session keeps its reason.
+      session::stop(*session, stop_reason_e::terminated);
 
       session->shutdown_event->raise(true);
       session->controlEnd.raise(true);
@@ -1532,26 +1516,11 @@ namespace stream {
 
         // Record post-start pings; the message queues below only serve the initial ping.
         {
-          std::optional<av_session_id_t> media_id;
           if (bytes == 4) {
-            media_id = peer.address();
+            ctx.media_pings.on_ping(peer.address().to_string(), std::chrono::steady_clock::now());
           } else if (bytes >= sizeof(SS_PING)) {
             auto ping = (PSS_PING) buf[buf_elem].data();
-            media_id = std::string {ping->payload, sizeof(ping->payload)};
-          }
-
-          std::shared_ptr<media_ping_t> media_ping;
-          if (media_id) {
-            auto lg = ctx.media_pings.lock();
-            auto it = ctx.media_pings->find(*media_id);
-            if (it != ctx.media_pings->end()) {
-              media_ping = it->second;
-            }
-          }
-
-          if (media_ping) {
-            std::lock_guard media_lg {media_ping->mutex};
-            media_ping->liveness.on_ping(std::chrono::steady_clock::now());
+            ctx.media_pings.on_ping(std::string {ping->payload, sizeof(ping->payload)}, std::chrono::steady_clock::now());
           }
         }
 
@@ -2202,7 +2171,7 @@ namespace stream {
   void videoThread(session_t *session) {
     platf::set_thread_name("session::video");
     auto fg = util::fail_guard([&]() {
-      session::stop(*session);
+      session::stop(*session, stop_reason_e::stream_ended);
     });
 
     while_starting_do_nothing(session->state);
@@ -2230,7 +2199,7 @@ namespace stream {
   void audioThread(session_t *session) {
     platf::set_thread_name("session::audio");
     auto fg = util::fail_guard([&]() {
-      session::stop(*session);
+      session::stop(*session, stop_reason_e::stream_ended);
     });
 
     while_starting_do_nothing(session->state);
@@ -2285,9 +2254,16 @@ namespace stream {
      * @brief Stop a streaming session and record why it ended.
      */
     void stop(session_t &session, stop_reason_e reason) {
-      auto expected = stop_reason_e::unknown;
-      session.stop_reason.compare_exchange_strong(expected, reason);
-      stop(session);
+      while_starting_do_nothing(session.state);
+      auto expected = state_e::RUNNING;
+      if (!session.state.compare_exchange_strong(expected, state_e::STOPPING)) {
+        return;
+      }
+
+      // Only the call that moved the session to STOPPING records the reason. It is stored before the shutdown
+      // event is raised, so the workers (and the join that follows) always observe it.
+      session.stop_reason.store(reason);
+      session.shutdown_event->raise(true);
     }
 
     /**
@@ -2386,16 +2362,9 @@ namespace stream {
         platf::streaming_will_stop();
       }
 
-      // Stop receiving media pings for this session. Only remove entries that still belong to it.
+      // Stop receiving media pings for this session. Only entries routed to its own tracker are removed.
       if (session.broadcast_ref) {
-        auto lg = session.broadcast_ref->media_pings.lock();
-        for (auto it = session.broadcast_ref->media_pings->begin(); it != session.broadcast_ref->media_pings->end();) {
-          if (it->second == session.media_ping) {
-            it = session.broadcast_ref->media_pings->erase(it);
-          } else {
-            ++it;
-          }
-        }
+        session.broadcast_ref->media_pings.remove(session.media_ping);
       }
 
       BOOST_LOG(debug) << "Session ended"sv;
@@ -2416,12 +2385,9 @@ namespace stream {
       BOOST_LOG(debug) << "Expecting incoming session connections from "sv << addr_string;
 
       // Route the client's post-start video and audio pings to this session
-      {
-        auto lg = session.broadcast_ref->media_pings.lock();
-        if (!(session.config.mlFeatureFlags & ML_FF_SESSION_ID_V1)) {
-          session.broadcast_ref->media_pings->emplace(boost::asio::ip::make_address(addr_string), session.media_ping);
-        }
-        session.broadcast_ref->media_pings->emplace(std::string {session.video.ping_payload}, session.media_ping);
+      session.broadcast_ref->media_pings.add(std::string {session.video.ping_payload}, session.media_ping);
+      if (!(session.config.mlFeatureFlags & ML_FF_SESSION_ID_V1)) {
+        session.broadcast_ref->media_pings.add(boost::asio::ip::make_address(addr_string).to_string(), session.media_ping);
       }
 
       // Insert this session into the session list

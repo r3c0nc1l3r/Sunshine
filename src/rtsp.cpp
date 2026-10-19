@@ -712,15 +712,24 @@ namespace rtsp_stream {
      * code path currently enters, so holding the slots lock for the call cannot block the RTSP loop for long.
      *
      * @param id Launch session id.
-     * @return `true` when a session with this id was found and asked to stop.
+     * @return `true` when the session is running and was asked to stop by this call, or is already stopping.
+     *         `false` for an unknown id or a session that has not started yet.
      */
     bool close(std::uint32_t id) {
       auto lg = _session_slots.lock();
       for (const auto &slot : *_session_slots) {
-        if (stream::session::id(*slot) == id) {
-          stream::session::stop(*slot, stream::stop_reason_e::api_close);
-          return true;
+        if (stream::session::id(*slot) != id) {
+          continue;
         }
+
+        // Sessions that are not started (or already finished) are not closable. This also avoids the stop() wait.
+        const auto state = stream::session::state(*slot);
+        if (state != stream::session::state_e::RUNNING && state != stream::session::state_e::STOPPING) {
+          return false;
+        }
+
+        stream::session::stop(*slot, stream::stop_reason_e::api_close);
+        return stream::session::state(*slot) == stream::session::state_e::STOPPING;
       }
       return false;
     }
