@@ -397,7 +397,7 @@ get reason `drain-deadline`.
   back (step 6); after `MAIN` the rule below applies.
 - Messages (requests carry a request id; replies echo it): `HELLO` (version, capabilities, probe results and identity,
   cooldown deadline; the old process's `HELLO` also attaches its own pidfd), `READY` (ok or reason), `MAIN` (handover
-  done), `PING`/`PONG`, `SESSIONS?`/`SESSIONS` (list), `CLOSE <id>`/`CLOSED <result>`, `CLOSE_CERT <hash>`/`CLOSED
+  done), `PING`/`PONG`, `SESSIONS?`/`SESSIONS` (list), `CLOSE <id>`/`CLOSED <result>`, `CLOSE_CERT <hash>`/`CLOSED_CERT
   <count>`, `END_ALL`/`ENDED` or `END_REJECTED` (see "App ownership and prep commands"), `GO` (with the
   snapshot)/`GO_ACK <ok|reason>`, `COMMIT`, and the draining process's unsolicited `HANDOFF_STATE <state>`. Requests
   from the active process (`SESSIONS?`, `CLOSE`, `CLOSE_CERT`) time out after 500 ms (late replies are dropped by
