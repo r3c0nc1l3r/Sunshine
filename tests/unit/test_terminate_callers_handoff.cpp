@@ -7,31 +7,13 @@
  * Every test installs a fake `handoff::session_peer_t` through `handoff::runtime().set_peer()` and a fake terminate
  * through `handoff::set_terminate_for_test()`, so no app is started or killed and no real process or channel exists.
  *
- * Three groups:
- * - `HandoffTerminateCallersTest`: always compiled (Linux). The building blocks the callers use, observed through the
- *   documented public functions: `terminate_app`, `terminate_gate`, `draining_session_count`, `launch_refusal`,
- *   `rtsp_stream::total_session_count` and `cert_sha256_hex`, with the fake peer. These pin the rules the HTTP tests
- *   below rely on.
- * - `HandoffCallersConfigHttpTest`: the HTTP handlers of the web UI, behind `SUNSHINE_P16B_CALLER_SEAMS`.
- * - `HandoffCallersNvhttpTest`: `/cancel`, `/launch` and `/resume`, behind `SUNSHINE_P16B_NVHTTP_SEAMS`.
+ * Groups:
+ * Three groups: `HandoffTerminateCallersTest` (the building blocks), `HandoffCallersConfigHttpTest` (the web UI
+ * handlers through `confighttp::register_app_client_routes`) and `HandoffCallersNvhttpTest` (`/cancel`, `/launch` and
+ * `/resume` through `nvhttp::test_support::*_https`). Every test sets a short `handoff::set_request_budget_for_test`.
  *
- * SPEC-QUESTION (missing seams, found by reading the headers only): `closeApp`, `updateClient`, `unpair` and
- * `unpairAll` are not declared in `src/confighttp.h`, and `/cancel`, `/launch` and `/resume` are not declared in
- * `src/nvhttp.h`; the existing fixtures (`test_confighttp.cpp`, `test_session_api.cpp`) can only reach declared
- * handlers or `register_session_routes`. The request paths also wait the full 15 s budget on a refusal
- * (`request_terminate_budget` is a constant and `terminate_app` takes the budget from the caller), which no test can
- * afford. The gated groups therefore assume these test seams, which do not exist yet and are listed in the report:
- * - `confighttp::register_app_client_routes(https_server_t &)`: registers the production handlers of
- *   `POST /api/apps/close`, `POST /api/clients/unpair`, `POST /api/clients/unpair-all` and `POST /api/clients/update`
- *   with their production authentication and CSRF checks (like `register_session_routes`).
- * - `handoff::set_request_budget_for_test(std::chrono::milliseconds)` (inside `SUNSHINE_TESTS`): the budget the
- *   request-path callers pass to `terminate_app` / `terminate_gate`; a value of 0 or less restores
- *   `request_terminate_budget`.
- * - `nvhttp::test_support::cancel_https`, `launch_https` and `resume_https(response, request)` (inside
- *   `SUNSHINE_TESTS`): dispatch an HTTPS request through the production `/cancel`, `/launch` and `/resume` handlers;
- *   `response` and `request` are `std::shared_ptr<SimpleWeb::ServerBase<nvhttp::SunshineHTTPS>::Response>` and
- *   `::Request`.
- * When the seams exist, define the macros named above for this file in the build.
+ * SPEC-QUESTION: the query argument names of `/launch` and `/cancel`, and the `updateClient` body `{uuid, enabled}`,
+ * are guesses from upstream and the web UI script.
  */
 
 // test includes
@@ -87,6 +69,9 @@ namespace {
 
   /// Short budget for the gate when a test passes it directly.
   constexpr std::chrono::milliseconds short_budget {120};
+
+  /// Request budget set in every test, so a refusal waits only this long.
+  constexpr std::chrono::milliseconds request_test_budget {150};
 
   /**
    * @brief Fake draining process with session knowledge. Records every request; replies come from public fields.
@@ -277,6 +262,7 @@ protected:
     reset_globals();
     peer = std::make_shared<fake_session_peer_t>();
     terminate_calls = 0;
+    handoff::set_request_budget_for_test(request_test_budget);
     handoff::set_terminate_for_test([this] {
       ++terminate_calls;
     });
@@ -360,6 +346,7 @@ protected:
    * @brief Reset the runtime, the terminate seam, the app and the sessions.
    */
   static void reset_globals() {
+    handoff::set_request_budget_for_test(0ms);
     handoff::set_terminate_for_test({});
     handoff::runtime().set_peer(nullptr);
     handoff::runtime().reset_for_test();
@@ -573,12 +560,7 @@ TEST_F(HandoffTerminateCallersTest, ConcurrentTerminatesAreSerialisedAndEachCoun
   EXPECT_EQ(peer->end_all_calls.load(), 4) << "each concurrent caller sends its own END_ALL";
 }
 
-  #ifdef SUNSHINE_P16B_CALLER_SEAMS
-
 namespace {
-  /// The request budget used by the HTTP tests (a refusal waits this long).
-  constexpr std::chrono::milliseconds http_budget {150};
-
   /**
    * @brief Authorization header for the web UI test credentials.
    *
@@ -713,15 +695,12 @@ protected:
     };
     client = std::make_unique<SimpleWeb::Client<SimpleWeb::HTTPS>>(std::format("localhost:{}", port), false);
     client->config.timeout = 5;
-
-    handoff::set_request_budget_for_test(http_budget);
   }
 
   /**
    * @brief Stop the server and restore configuration and client state.
    */
   void TearDown() override {
-    handoff::set_request_budget_for_test(0ms);
     if (server) {
       server->stop();
     }
@@ -1067,10 +1046,6 @@ TEST_F(HandoffCallersConfigHttpTest, UnpairAllWithoutPeerBehavesAsUpstream) {
   EXPECT_EQ(terminate_calls.load(), 1) << "without a peer unpair-all terminates as before";
 }
 
-  #endif  // SUNSHINE_P16B_CALLER_SEAMS
-
-  #ifdef SUNSHINE_P16B_NVHTTP_SEAMS
-
 /**
  * @brief Fixture with a real HTTPS server on the production `/cancel`, `/launch` and `/resume` handlers (seams
  * `nvhttp::test_support::cancel_https`, `launch_https` and `resume_https`).
@@ -1134,14 +1109,12 @@ protected:
     ASSERT_NE(port, 0) << "the test server failed to start";
     client = std::make_unique<SimpleWeb::Client<SimpleWeb::HTTPS>>(std::format("localhost:{}", port), false);
     client->config.timeout = 5;
-    handoff::set_request_budget_for_test(http_budget);
   }
 
   /**
    * @brief Stop the server and restore configuration.
    */
   void TearDown() override {
-    handoff::set_request_budget_for_test(0ms);
     if (server) {
       server->stop();
     }
@@ -1327,7 +1300,5 @@ TEST_F(HandoffCallersNvhttpTest, ResumeIsNotGuarded) {
   EXPECT_NE(status_code(tree), 503) << "/resume must not be guarded";
   EXPECT_EQ(peer->list_calls.load(), 0) << "/resume must not ask the peer for sessions";
 }
-
-  #endif  // SUNSHINE_P16B_NVHTTP_SEAMS
 
 #endif  // __linux__
