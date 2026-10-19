@@ -20,6 +20,11 @@
 namespace handoff {
   namespace {
     /**
+     * @brief Largest UDP base accepted from the environment: base + 11 (the audio port) must stay within 65535.
+     */
+    constexpr unsigned MAX_UDP_BASE = 65524;
+
+    /**
      * @brief Parse a strictly decimal unsigned number within a range.
      *
      * @param text Text; no sign, no spaces, no trailing characters.
@@ -115,7 +120,7 @@ namespace handoff {
       auto generation_var = read_var(env, "SUNSHINE_GENERATION");
 
       if (base_var) {
-        if (auto base = parse_decimal(*base_var, 1, 65535)) {
+        if (auto base = parse_decimal(*base_var, 1, MAX_UDP_BASE)) {
           _udp_base = static_cast<int>(*base);
         }
       }
@@ -144,7 +149,7 @@ namespace handoff {
 
     std::optional<unsigned> base;
     if (udp_base_var) {
-      base = parse_decimal(*udp_base_var, 1, 65535);
+      base = parse_decimal(*udp_base_var, 1, MAX_UDP_BASE);
     }
     if (!base) {
       return "SUNSHINE_HANDOFF_UDP_BASE is missing or invalid";

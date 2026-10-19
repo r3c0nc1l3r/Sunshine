@@ -1170,11 +1170,11 @@ namespace rtsp_stream {
 
     std::uint16_t port;
     if (type == "audio"sv) {
-      port = net::map_port(stream::AUDIO_STREAM_PORT);
+      port = net::map_udp_port(stream::AUDIO_STREAM_PORT);
     } else if (type == "video"sv) {
-      port = net::map_port(stream::VIDEO_STREAM_PORT);
+      port = net::map_udp_port(stream::VIDEO_STREAM_PORT);
     } else if (type == "control"sv) {
-      port = net::map_port(stream::CONTROL_PORT);
+      port = net::map_udp_port(stream::CONTROL_PORT);
     } else {
       cmd_not_found(sock, session, std::move(req));
 
