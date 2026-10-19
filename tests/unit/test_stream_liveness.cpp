@@ -20,6 +20,9 @@
 
 // lib includes
 #include <enet/enet.h>
+#ifndef _WIN32
+  #include <netinet/in.h>
+#endif
 
 // local includes
 #include <src/stream_liveness.h>
@@ -525,33 +528,32 @@ namespace {
      * @return `true` when both sides saw CONNECT.
      */
     bool connect_pair() {
+      // moonlight-common-c's ENet fork: sockaddr-based ENetAddress and an address-family argument
       ENetAddress server_addr {};
-      server_addr.host = ENET_HOST_ANY;
-      server_addr.port = 0;
-      server_ = enet_host_create(&server_addr, 8, 2, 0, 0);
+      if (enet_address_set_host(&server_addr, "127.0.0.1") != 0 || enet_address_set_port(&server_addr, 0) != 0) {
+        return false;
+      }
+      server_ = enet_host_create(AF_INET, &server_addr, 8, 2, 0, 0);
       if (server_ == nullptr) {
         return false;
       }
 
-      std::uint16_t port = server_->address.port;
+      // enet_host_create() stores the bound address (getsockname) in host->address
+      const auto *bound = reinterpret_cast<const sockaddr_in *>(&server_->address.address);
+      const std::uint16_t port = ntohs(bound->sin_port);
       if (port == 0) {
-        ENetAddress bound {};
-        if (enet_socket_get_address(server_->socket, &bound) != 0) {
-          return false;
-        }
-        port = bound.port;
+        return false;
       }
 
-      client_ = enet_host_create(nullptr, 1, 2, 0, 0);
+      client_ = enet_host_create(AF_INET, nullptr, 1, 2, 0, 0);
       if (client_ == nullptr) {
         return false;
       }
 
       ENetAddress target {};
-      if (enet_address_set_host(&target, "127.0.0.1") != 0) {
+      if (enet_address_set_host(&target, "127.0.0.1") != 0 || enet_address_set_port(&target, port) != 0) {
         return false;
       }
-      target.port = port;
       client_peer_ = enet_host_connect(client_, &target, 2, 0);
       if (client_peer_ == nullptr) {
         return false;
@@ -654,9 +656,9 @@ TEST_F(EnetLivenessTest, TickDisconnectedPeerReturnsFalse) {
  */
 TEST_F(EnetLivenessTest, TickUnconnectedPeerSlotReturnsFalse) {
   ENetAddress addr {};
-  addr.host = ENET_HOST_ANY;
-  addr.port = 0;
-  server_ = enet_host_create(&addr, 1, 1, 0, 0);
+  ASSERT_EQ(enet_address_set_host(&addr, "127.0.0.1"), 0);
+  ASSERT_EQ(enet_address_set_port(&addr, 0), 0);
+  server_ = enet_host_create(AF_INET, &addr, 1, 1, 0, 0);
   ASSERT_NE(server_, nullptr);
   ASSERT_NE(server_->peers, nullptr);
 
