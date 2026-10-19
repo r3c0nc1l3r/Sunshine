@@ -1714,7 +1714,7 @@ namespace handoff {
 
     att->stop_fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (att->stop_fd < 0) {
-      att->early_kill(*child);
+      early_kill(*att->child);
       return fail("cannot create the shutdown watcher"s);
     }
 
@@ -1746,7 +1746,7 @@ namespace handoff {
       if (att->watcher.joinable()) {
         att->stop_watcher();
       }
-      att->early_kill(*child);
+      early_kill(*att->child);
       return fail(refused_by_stop ? std::string(coordinator_reason::shutting_down) : "cannot start the handoff thread"s);
     }
 
