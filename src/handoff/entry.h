@@ -122,6 +122,9 @@
  * - H: the callbacks call `ops.server_listening()` instead of `arrive()`, and nothing sends `READY=1` from the latch: a
  *   handoff-started process sends nothing to systemd until `MAIN`, where `sunshine_new_ops_t::on_main()` sends the one
  *   `READY=1` (`new_ops.h`).
+ * UPnP in H: the handoff-started process starts UPnP at `COMMIT` (`map_upnp()`) with `upnp::set_unmap_scope(udp_only)`
+ * until `MAIN`, then `all` (`on_main()`). It never calls `upnp::remove_ports_async`; only the old process does, after a
+ * rollback that killed it past `COMMIT` (`coordinator.h`).
  * A server that fails to listen never arrives, so `READY=1` is not sent (as upstream: a failed bind is fatal there).
  * The callbacks never block and never call a pause or resume function.
  *
@@ -143,8 +146,10 @@
  * ## 7. Destruction order of `main`
  *
  * Locals are destroyed in reverse declaration order, so declare, in this order, from first to last: the
- * `upnp_unmap` and `mDNS` variables (existing), `handoff_process`, `proc_deinit_guard` (existing), `input_deinit_guard`
- * (existing). Then the guards run as: input devices, then the `proc` deinit guard, then `handoff_process`.
+ * `upnp_unmap` and `mDNS` variables (existing), `handoff_process`, the `coordinator_t` (with the control server it serves),
+ * `proc_deinit_guard` (existing), `input_deinit_guard` (existing). Then the guards run as: input devices, then the `proc`
+ * deinit guard, then the coordinator's teardown (`request_shutdown()`, control server stop, `stop()`; `coordinator.h` requires
+ * `stop()` after the `proc` guard in an active process), then `handoff_process`.
  * - The `proc` guard's terminate (`terminate_app(shutdown_terminate_budget, ..., true)`, `terminate.h`) needs the peer
  *   link, the channel reader and the channel, so `handoff_process` (which owns `post_commit_t`) outlives it. A refused
  *   terminate skips `terminate()` only for an adopted app; an app this process launched is terminated as upstream. The
@@ -154,8 +159,9 @@
  *   is harmless when the exit sequence is the thing that is shutting the process down), `mdns_holder().stop()` (in every
  *   process that may have published, also a draining one; idempotent), `runtime().instance_remove()`, the shutdown
  *   watcher. The coordinator's own teardown (control server stop after `old_side_t::request_shutdown()`, the old
- *   side's thread join, the responder and revocation poller stop) is in `coordinator.h` and happens before
- *   `~handoff_process_t`.
+ *   side's thread join, the responder and revocation poller stop) is in `coordinator.h`; it runs after the `proc` guard
+ *   and before `~handoff_process_t`. In a draining process the drain exit has already ended the sessions (`drain.h`) before
+ *   `exit_graceful()` starts this order, so `stop()` finds no session to wait for.
  * - `register_device_release(f)` is called right after `input::init()` with a closure that resets `input_deinit_guard`
  *   once (a `std::once_flag`), so the drain exit may release the devices earlier (`drain.h`) and the local destructor
  *   becomes a no-op.
@@ -173,7 +179,7 @@
  * |---|---|---|---|
  * | `starting`, `ready` (before `READY` was sent, or waiting for `GO`) | The watcher calls `abort()`: the channel is half-closed, `run_new_side` returns `exit_failure`, `exit_failure()` exits with 1. No `END_ALL`, no `undo` (no app), nothing published, mapped or shown. | Sees the channel end or the process die and rolls back (kill-first), keeping its sessions and taking the app back. | 1 |
  * | `go` (an op of the `GO` handler may be running) | The running op finishes (they are short and do not wait for the old process); the next channel wait sees the half-closed channel and `run_new_side` returns `exit_failure`. Nothing is installed, so no `END_ALL` and no `undo`. | As above. | 1 |
- * | `committing` (`COMMIT` was read in time) | `abort()` is a no-op (the channel is needed). If the shutdown beat `install_adoption`'s mutex section, nothing is installed and `commit_failed()` is set (exit 1 after the wiring). Otherwise the `COMMIT` effects finish, `run_new_side` returns `committed`, `post_commit_t` starts, and the shutdown guard (section 7) terminates the adopted app: it first sends `END_ALL` (ends the old process's sessions), then `undo` runs at most once. | Sees the new process die before `MAIN` and rolls back with no app and no sessions. | 0 for the normal shutdown, 1 for `commit_failed()` |
+ * | `committing` (`COMMIT` was read in time) | `abort()` is a no-op (the channel is needed). If the shutdown beat `install_adoption`'s mutex section, nothing is installed and `commit_failed()` is set (exit 1 after the wiring). Otherwise the `COMMIT` effects finish, `run_new_side` returns `committed`, `post_commit_t` starts, and the shutdown guard (section 7) terminates the adopted app: it first sends `END_ALL` (ends the old process's sessions), then `undo` runs at most once. | Sees the new process die before `MAIN` and rolls back with no app and no sessions; after the reap it removes the new base's UDP UPnP mappings on a background task (skipped when UPnP is off). | 0 for the normal shutdown, 1 for `commit_failed()` |
  * | `committed` (waiting for `MAIN`) | Normal shutdown as above. Quit and restart are refused while `new_active` (`hooks`); the tray entries are disabled. | As above. | 0 |
  * | `main` | A normal shutdown of the active process; the draining process, if still there, gets `SIGTERM` from systemd or is asked with `END_ALL` by the guard. | Draining process ends its sessions with `stop` (`drain.h`). | 0 |
  *

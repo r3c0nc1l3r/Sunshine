@@ -166,8 +166,10 @@ namespace handoff {
     std::function<bool()> publish_mdns;
 
     /**
-     * @brief Start UPnP. Default: `upnp::start(hooks::udp_base())`. The returned guard (null when UPnP is off) is
-     * stored in the slot given to the constructor.
+     * @brief Start UPnP. Default: `upnp::set_unmap_scope(upnp::unmap_scope_e::udp_only)` and then
+     * `upnp::start(hooks::udp_base())`, in this order, so the guard never exists with scope `all` before `MAIN`: a
+     * graceful exit between `COMMIT` and `MAIN` (the rollback path) never unmaps the TCP ports shared with the old
+     * process. The returned guard (null when UPnP is off) is stored in the slot given to the constructor.
      */
     std::function<std::unique_ptr<platf::deinit_t>()> start_upnp;
 
@@ -351,7 +353,9 @@ namespace handoff {
 
     /**
      * @brief Fourth `COMMIT` effect: `start_upnp` seam; the guard goes into the slot. A handoff-started process starts
-     * UPnP here and nowhere else. Does nothing after a failed `resume_accept()`, and does not touch the slot when the
+     * UPnP here and nowhere else, with the unmap scope `udp_only` from this moment until `MAIN` (see `on_main()`). This
+     * process never calls `upnp::remove_ports_async`: the cleanup of a killed new process's mappings is done by the OLD
+     * process after the rollback (`coordinator.h`, `start_upnp_cleanup`). Does nothing after a failed `resume_accept()`, and does not touch the slot when the
      * seam returns null (UPnP off).
      */
     void map_upnp() override;
@@ -374,7 +378,8 @@ namespace handoff {
      * @brief The `MAIN` message was read (called by the post-`COMMIT` reader, never by `run_new_side`).
      *
      * Idempotent (a second call does nothing). In this order: `runtime().transition(new_active, normal)` and
-     * `runtime().set_main(true)`; `enable_tray_entries`; `notify_ready` (the only `READY=1` a handoff-started process
+     * `runtime().set_main(true)`; `upnp::set_unmap_scope(upnp::unmap_scope_e::all)` (the process now owns every mapping;
+     * the old process is only draining); `enable_tray_entries`; `notify_ready` (the only `READY=1` a handoff-started process
      * ever sends); `start_control_server`; stage `main`. A call before the stage is `committed` is ignored with a
      * Warning (a `MAIN` cannot precede `COMMIT`; a confused peer must not turn the process into the main process).
      * Takes no lock while it calls a seam.

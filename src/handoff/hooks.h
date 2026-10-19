@@ -211,6 +211,16 @@ namespace handoff::hooks {
    * @return The condition above. Non-Linux: false.
    */
   bool startup_probe_skipped();
+
+  /**
+   * @brief The number of running sessions may have changed: ask the session notifier for a pass.
+   *
+   * Called in `stream.cpp` right next to each change of the running-session counter (`++running_sessions` when a
+   * session starts, `--running_sessions` when it stops), so the instance file's `sessions` field follows without waiting
+   * for the notifier's period. Lock-free (`session_notifier().poke()`); safe under any lock, including the slots lock.
+   * Does nothing observable besides the poke.
+   */
+  void sessions_changed();
 #else
   /**
    * @brief Whether the feature is on in this process.
@@ -359,6 +369,12 @@ namespace handoff::hooks {
    */
   inline bool startup_probe_skipped() {
     return false;
+  }
+
+  /**
+   * @brief The number of running sessions may have changed. Does nothing on this platform.
+   */
+  inline void sessions_changed() {
   }
 #endif
 }  // namespace handoff::hooks

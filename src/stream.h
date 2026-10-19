@@ -129,6 +129,17 @@ namespace stream {
      * @return Current lifecycle state for the stream session.
      */
     state_e state(session_t &session);
+
+    /**
+     * @brief Number of sessions of this process that are running.
+     *
+     * A lock-free read of the running-session counter (`running_sessions`, changed when a session starts and when it
+     * stops). It takes no lock, never joins and never waits, so it is safe under any lock and from any thread. The
+     * handoff's session notifier and drain controller read it instead of `rtsp_stream::session_count()`.
+     *
+     * @return The current count.
+     */
+    int running_session_count();
     /**
      * @brief Return the paired client certificate for a stream session.
      *

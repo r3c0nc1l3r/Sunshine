@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace audio {
@@ -173,6 +174,19 @@ namespace audio {
    * @return `true` when the default sink was switched back to the virtual sink; otherwise `false`.
    */
   bool reassert_virtual_sink(audio_ctx_t &ctx, int sessions);
+
+  /**
+   * @brief The host's own default sink as this process recorded it, for the child that a handoff starts.
+   *
+   * Linux: the `platf::sink_t::host` of the last stream start; when no stream started in this process, the sink that
+   * `handoff::hooks::host_sink()` supplies for a process that was itself started by a handoff. The old process passes
+   * the result to its child as `SUNSHINE_HANDOFF_HOST_SINK`. Takes no audio lock that a capture holds across a blocking
+   * call; callable from any thread.
+   *
+   * @return The sink name, or `std::nullopt` when none is recorded (an empty name counts as none). Other platforms:
+   *         always `std::nullopt`.
+   */
+  std::optional<std::string> recorded_host_sink();
 
 #ifdef SUNSHINE_TESTS
   namespace testing {

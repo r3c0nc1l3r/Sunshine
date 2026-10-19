@@ -372,6 +372,8 @@ list(APPEND PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/handoff/drain.h"
         "${CMAKE_SOURCE_DIR}/src/handoff/entry.cpp"
         "${CMAKE_SOURCE_DIR}/src/handoff/entry.h"
+        "${CMAKE_SOURCE_DIR}/src/handoff/coordinator.cpp"
+        "${CMAKE_SOURCE_DIR}/src/handoff/coordinator.h"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/publish.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/graphics.h"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/graphics.cpp"

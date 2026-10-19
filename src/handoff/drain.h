@@ -297,7 +297,7 @@ namespace handoff {
      * Default: when `upnp::unmap_scope()` is still `all`, set it to `udp_only` (to `none` when the UDP base of this
      * process equals `other_udp_base(...)` of the configuration, that is, when both processes share one base), and log
      * a Warning "UPnP unmap scope was not set at the switch". It never changes a scope that is already `udp_only` or
-     * `none`. The coordinator's `enter_drain_mode()` sets the scope at the switch; this is the second guard.
+     * `none`. The coordinator sets the scope in `freeze()` (before `COMMIT` can be sent, so it holds on every exit after the switch) and asserts it again in `enter_drain_mode()` and after the handover; this check is a second guard. `unfreeze()` and `leave_drain_mode()` (the rollback) restore `all`.
      */
     std::function<void()> ensure_unmap_scope;
 

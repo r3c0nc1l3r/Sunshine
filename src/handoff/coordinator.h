@@ -412,8 +412,9 @@ namespace handoff {
     std::function<bool(std::chrono::milliseconds)> barrier;  ///< `sd::barrier(notify_socket, t)`.
     std::function<std::optional<pid_t>(const std::string &, bool, std::chrono::milliseconds)> read_back;  ///<
                                                                                                           ///< `sd::read_back_mainpid(unit, user_unit, t)`.
-    std::function<void(std::chrono::seconds)> drain_begin;  ///< `drain_begin(deadline)` of `drain.h`.
-    std::function<void()> drain_abort;  ///< `drain_abort()` of `drain.h`.
+    std::function<void(std::chrono::steady_clock::time_point)> drain_begin;  ///< `drain_controller().begin(now)`.
+    std::function<void()> drain_cancel;  ///< `drain_controller().cancel()`.
+    std::function<void()> session_poke;  ///< `session_notifier().poke()`.
   };
 #endif
 
@@ -436,8 +437,7 @@ namespace handoff {
    *   Error; the listeners after it are not touched. Returns an empty string when all four confirmed. The old side
    *   treats a non-empty result as a failed switch: the rollback resumes every listener (`resume_accept()` is idempotent
    *   on a listener that was never paused) and the helper is answered `failed <reason>`. The worst wait of a failed
-   *   pause is one `server_op_timeout`. REQUIRES the change to `old_side.h` and `old_side.cpp` in the wave D report
-   *   (`pause_accept()` returns the reason).
+   *   pause is one `server_op_timeout`. `old_side_ops_t::pause_accept()` returns this reason string (`old_side.h`).
    * - `resume_accept()`: `listeners().resume(kind, server_op_timeout)` for all four, in the same order, never stopping at
    *   a failure. A `false` logs an Error naming the server ("the <name> server did not confirm the resume in time") and the
    *   loop goes on; nothing is thrown and the rollback continues. Worst wait: four timeouts, only when all four servers
@@ -474,17 +474,23 @@ namespace handoff {
    * - `enter_drain_mode()`: (1) `runtime().transition(mode_e::normal, mode_e::draining)` (an Error log when it is refused;
    *   the steps go on); (2) `logging::set_process_tag(runtime().process_tag())`; (3) the control socket is closed with
    *   `control.close_listener()` (never `stop()`); (4) the UPnP scope is set again as in `freeze()` (idempotent);
-   *   (5) `drain_begin(deadline)` of `drain.h` with `runtime().settings().deadline_s` seconds, which starts the deadline
-   *   timer (counted from this call, the switch) and the notifier, and forbids the exit until `drain_handover_done()`.
-   *   `leave_drain_mode()`: (1) `drain_abort()`; (2) `runtime().transition(mode_e::draining, mode_e::normal)`;
+   *   (5) `drain_controller().begin(now())` of `drain.h` (the deadline, `runtime().settings().deadline_s` seconds, is
+   *   counted from this call, the switch), which starts the deadline timer and forbids the exit until
+   *   `drain_controller().handed_over()`; then `session_notifier().poke()` so the instance file shows the draining state
+   *   at once. `leave_drain_mode()`: (1) `drain_controller().cancel()` (joins the controller thread; it returns `true`
+   *   because the exit cannot have started before the handover); (2) `runtime().transition(mode_e::draining, mode_e::normal)`;
    *   (3) the process tag is cleared; (4) the UPnP scope is `all`; (5) `control.reopen_listener()`; a failure is an Error
    *   log, never a failure of the rollback.
    * - `set_role(r)`: `runtime().instance_set_role(r)`. `set_state(s)`: `runtime().instance_set_state(s)`, and, when the
    *   instance file's role is `draining` (the old side calls `set_role(draining)` first), a best-effort
    *   `HANDOFF_STATE <name>` on the channel (`runtime().channel()->send`; a failed send is a Debug line).
    * - `remove_new_instance_file()`: `remove_instance_file(<instances dir>, <child pid>)`.
-   * - `start_upnp_cleanup(new_base)`: `upnp::remove_ports_async(upnp_ports_to_remove(new_base, own_base,
-   *   config::sunshine.port))`; returns at once; skipped (a Debug line) when the set is empty.
+   * - `start_upnp_cleanup(new_base)`: called by the old side only in the rollback, after `COMMIT` was sent and after the
+   *   killed new process was reaped (spec, "Other resources", UPnP row). This OLD process (the only active one again)
+   *   calls `upnp::remove_ports_async(handoff::upnp_ports_to_remove(new_base, own_base, config::sunshine.port))`, which
+   *   runs the removal on a background task. It returns at once and never delays accept, mDNS or the helper's answer.
+   *   It is skipped (a Debug line) when UPnP is off (`config::sunshine.flags[config::flag::UPNP]` unset) or when the set
+   *   is empty. The active process never calls `remove_ports_async` after `MAIN`, and the new process never calls it.
    * - `handover(new_pid)`: reads `NOTIFY_SOCKET` now (the process environment is never scrubbed of it), and
    *   `sd::notify(socket, sd::mainpid_payload(new_pid))`; then `sd::barrier(socket, handover_step_timeout)`; then
    *   `sd::read_back_mainpid(unit, sd::is_user_unit(cgroup), handover_step_timeout)` with the unit from
@@ -605,7 +611,7 @@ namespace handoff {
     std::function<std::unique_ptr<drain_responder_t>(channel_t &, end_all_machine_t &)> make_responder;  ///<
                                                                                                          ///< `std::make_unique<drain_responder_t>` (production operations).
     std::function<std::unique_ptr<revocation_poller_t>()> make_poller;  ///< `std::make_unique<revocation_poller_t>`.
-    std::function<void()> drain_handover_done;  ///< `drain_handover_done()` of `drain.h`.
+    std::function<void()> drain_handed_over;  ///< `drain_controller().handed_over()`.
     std::function<void(upnp::unmap_scope_e)> set_unmap_scope;  ///< `upnp::set_unmap_scope`.
   };
 #endif
@@ -694,7 +700,8 @@ namespace handoff {
    *
    * ## Failed attempts
    *
-   * After any failure after step 7 the coordinator, in this order, with no lock held: stops the responder and the shutdown
+   * After any failure after step 7 the coordinator, in this order, with no lock held: stops the responder (it is discarded: a later attempt constructs a new one,
+   * and `end_all.reset()` runs only after it was stopped) and the shutdown
    * watcher, closes the channel and `runtime().set_channel(nullptr)`, re-arms the cooldown, `runtime().
    * set_handoff_in_progress(false)`, releases the claim. The old side has already done the rollback effects
    * (`old_side_t::run()` does them before it returns). A failure before the run thread starts answers the helper
@@ -708,7 +715,7 @@ namespace handoff {
    * process; (2) `runtime().set_handoff_in_progress(false)`; (3) stops the shutdown watcher; (4) starts a
    * `channel_reader_t(channel, answer_pings=false, responder.handle, on_close)` where `on_close` logs a Warning ("the
    * channel to the active process closed; this process keeps draining") and ends no session; (5)
-   * `revocation_poller_t::start()` (`false` is an Error log; the drain goes on); (6) calls `drain_handover_done()` of
+   * `revocation_poller_t::start()` (`false` is an Error log; the drain goes on); (6) calls `drain_controller().handed_over()` of
    * `drain.h`, which allows the drain exit. The claim is never released: later `handle()` calls are refused with
    * `coordinator_reason::draining`. The reader, responder and poller live in the coordinator until `stop()`.
    *
@@ -725,8 +732,9 @@ namespace handoff {
    *   process shuts down as a draining process would (`runtime().shutdown_reason()` is `stop`), and the unit's stop
    *   ends both processes.
    * - After the handover: nothing is running; the draining process ends its sessions with `stop` (`drain.h`), and the
-   *   responder keeps answering `END_ALL` and the others until `stop()` (which `drain.h`'s exit path calls after the
-   *   sessions are ended and the devices released, and the active process's shutdown guard has had its answer).
+   *   responder keeps answering `END_ALL` and the others until `stop()` (which `main`'s shutdown order calls, `entry.h`
+   *   section 7, after the drain exit ended the sessions, released the devices and started `exit_graceful()`, and after the
+   *   `proc` guard).
    * A refused terminate permission (`terminate.h`) skips `terminate()` only for an adopted app; this header changes
    * nothing there. `stop()` first marks the coordinator stopping (new `handle()` calls are refused), then forwards the
    * shutdown to a running attempt and joins its threads. The caller stops the control server after `request_shutdown()`
@@ -735,8 +743,9 @@ namespace handoff {
    * ## Recorded host sink
    *
    * `SUNSHINE_HANDOFF_HOST_SINK` carries the host's own default sink as this process recorded it. Production reads it with
-   * `audio::recorded_host_sink()` (new accessor, see the wave D report), which returns the `sink_t::host` of the last stream
-   * start, else `hooks::host_sink()` for a process that was itself started by a handoff, else an empty string.
+   * `audio::recorded_host_sink()` (declared in `audio.h`), which returns the `sink_t::host` of the last stream
+   * start, else `hooks::host_sink()` for a process that was itself started by a handoff, else `std::nullopt`; the
+   * coordinator treats `std::nullopt` and an empty name alike (no variable).
    *
    * ## Thread-safety
    *

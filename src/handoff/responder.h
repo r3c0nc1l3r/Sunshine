@@ -6,21 +6,26 @@
  * See `docs/drain-handoff.md`, "App ownership and prep commands" (the terminate rule, `END_ALL` on its own thread),
  * "The handoff channel" and "Visibility and control".
  *
- * Use: after `old_side_t::run()` returned `handed_over`, the coordinator constructs one `drain_responder_t` over the
- * same `channel_t` and the same `end_all_machine_t` that `old_side_t` used, and passes `handle` as the message handler
- * of a `channel_reader_t` (with `answer_pings` false). `handle` is therefore called on that reader's worker thread, one
- * message at a time, in arrival order. It never blocks that thread: `SESSIONS?` and `CLOSE` are answered inline, while
+ * Use: the coordinator constructs one `drain_responder_t` over the `channel_t` and the `end_all_machine_t` BEFORE
+ * `old_side_t::run()` and passes `handle` as `run()`'s `on_drain_request`, because `END_ALL`, `SESSIONS?`, `CLOSE` and
+ * `CLOSE_CERT` can arrive in the rollback window (a new process shut down after `COMMIT`). After `run()` returned
+ * `handed_over`, the same responder is driven by a `channel_reader_t` (with `answer_pings` false) whose message handler is
+ * `handle`; `handle` is then called on that reader's worker thread, one message at a time, in arrival order. In both
+ * phases `handle` never blocks its caller: `SESSIONS?` and `CLOSE` are answered inline, while
  * `END_ALL` and `CLOSE_CERT` run on their own threads, because they join sessions (up to the 10 s hang guard each).
+ * After a rollback (or any failed attempt) the responder is discarded: the coordinator calls `stop()`, then destroys it,
+ * and a later attempt constructs a new one.
  * The inline operations (`list_sessions`, `close_session`) take only the RTSP slots lock (briefly), never the clear
  * lock, and never wait for a session join (lb.2 [C16]). The threaded operations (`close_cert`, `end_and_join`) may take
  * the clear lock and the slots lock and wait for joins. So `SESSIONS?` and `CLOSE` stay answerable for as long as an
  * `END_ALL` or `CLOSE_CERT` waits.
  *
- * Lifetime: the `channel_reader_t` that calls `handle` must be stopped and joined (`channel_reader_t::stop()`) before
- * the responder is destroyed, or the responder must outlive the reader. After `stop()` has returned, `handle()` stays
+ * Lifetime: the caller of `handle` (`old_side_t`'s run thread, then the `channel_reader_t`) must be stopped and joined
+ * (`channel_reader_t::stop()`) before the responder is destroyed, or the responder must outlive it. After `stop()` has returned, `handle()` stays
  * safe to call for as long as the object lives: it only closes an attached fd and ignores the message. The channel and
- * the machine must outlive the responder. The coordinator calls `end_all_machine_t::reset()` (a new handoff) only after
- * `stop()` has returned, because `reset()` must not run while `handle_end_all` runs.
+ * the machine must outlive the responder. The coordinator calls `end_all_machine_t::reset()` (a new handoff) only after the reader
+ * is stopped and the responder's `stop()` has returned, so that no `handle` call runs, because `reset()` must not run
+ * while `handle_end_all` runs.
  *
  * The responder does not check the runtime mode: constructing it is the coordinator's statement that this process is
  * draining. It starts no thread until the first `END_ALL` or `CLOSE_CERT` arrives.
