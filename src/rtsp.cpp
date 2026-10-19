@@ -12,14 +12,30 @@ extern "C" {
 // standard includes
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
 #include <format>
+#include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifdef __linux__
+  // platform includes
+  #include <fcntl.h>
+  #include <sys/socket.h>
+  #include <unistd.h>
+#endif
 
 // lib includes
 #include <boost/asio.hpp>
@@ -36,6 +52,10 @@ extern "C" {
 #include "stream.h"
 #include "sync.h"
 #include "video.h"
+
+#ifdef __linux__
+  #include "handoff/terminate.h"
+#endif
 
 namespace asio = boost::asio;
 
@@ -470,11 +490,36 @@ namespace rtsp_stream {
   };
 
   /**
+   * @brief Lowercase hexadecimal SHA-256 of a client certificate string.
+   *
+   * @param cert Certificate PEM string.
+   * @return 64 lowercase hexadecimal characters.
+   */
+  std::string cert_hash_hex(std::string_view cert) {
+    const auto digest = crypto::hash(cert);
+    std::string hex;
+    hex.reserve(digest.size() * 2);
+    for (const auto byte : digest) {
+      hex += std::format("{:02x}", static_cast<unsigned>(byte));
+    }
+    return hex;
+  }
+
+  /**
+   * @brief Set while the listening callback runs on the thread that called `start()`; there the commands that wait for
+   * the loop thread refuse at once, as they do on the loop thread.
+   */
+  thread_local bool in_listening_callback = false;
+
+  /**
    * @brief RTSP listener that matches incoming clients to pending launch sessions.
    */
   class rtsp_server_t {
   public:
     ~rtsp_server_t() {
+#ifdef SUNSHINE_TESTS
+      test_stop_loop();
+#endif
       clear();
     }
 
@@ -512,15 +557,250 @@ namespace rtsp_stream {
         return -1;
       }
 
-      next_socket = std::make_shared<socket_t>(io_context, [this](tcp::socket &sock, launch_session_t &session, msg_t &&msg) {
-        handle_msg(sock, session, std::move(msg));
-      });
+      return 0;
+    }
 
-      acceptor.async_accept(next_socket->sock, [this](const auto &ec) {
-        handle_accept(ec);
-      });
+#ifdef __linux__
+    /**
+     * @brief Take over a listening socket that already exists instead of binding one (drain handoff).
+     *
+     * Works on a close-on-exec duplicate of `fd`; the caller's descriptor is never closed or changed. On any failure
+     * the duplicate is closed again and the acceptor is left unchanged.
+     *
+     * @param fd A bound, listening, stream TCP socket (`AF_INET` or `AF_INET6`).
+     * @param ec Error code set on failure.
+     * @return 0 on success, -1 on failure.
+     */
+    int adopt(int fd, boost::system::error_code &ec) {
+      const int dup_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+      if (dup_fd < 0) {
+        ec.assign(errno, boost::system::system_category());
+        return -1;
+      }
+
+      auto fail = [&](int err) {
+        ::close(dup_fd);
+        ec.assign(err, boost::system::system_category());
+        return -1;
+      };
+
+      int type = 0;
+      socklen_t type_len = sizeof(type);
+      if (::getsockopt(dup_fd, SOL_SOCKET, SO_TYPE, &type, &type_len) < 0) {
+        return fail(errno);
+      }
+      if (type != SOCK_STREAM) {
+        return fail(ESOCKTNOSUPPORT);
+      }
+
+      int listening = 0;
+      socklen_t listening_len = sizeof(listening);
+      if (::getsockopt(dup_fd, SOL_SOCKET, SO_ACCEPTCONN, &listening, &listening_len) < 0) {
+        return fail(errno);
+      }
+      if (!listening) {
+        return fail(EINVAL);
+      }
+
+      sockaddr_storage addr {};
+      socklen_t addr_len = sizeof(addr);
+      if (::getsockname(dup_fd, reinterpret_cast<sockaddr *>(&addr), &addr_len) < 0) {
+        return fail(errno);
+      }
+
+      tcp protocol = tcp::v4();
+      if (addr.ss_family == AF_INET6) {
+        protocol = tcp::v6();
+      } else if (addr.ss_family != AF_INET) {
+        return fail(EAFNOSUPPORT);
+      }
+
+      // On failure asio does not take ownership of the descriptor.
+      acceptor.assign(protocol, dup_fd, ec);
+      if (ec) {
+        ::close(dup_fd);
+        return -1;
+      }
 
       return 0;
+    }
+#endif
+
+    /**
+     * @brief Finish setting up a listener that `bind` or `adopt` created, and start accepting unless paused.
+     *
+     * Takes the work guard, publishes the listener descriptor, calls the listening callback (on the calling thread,
+     * where the loop-thread-only commands refuse to wait) and arms the first accept when not paused.
+     *
+     * @param paused Whether accepting starts paused.
+     */
+    void begin_listening(bool paused) {
+      _work_guard.emplace(boost::asio::make_work_guard(io_context));
+      _paused.store(paused);
+      _listener_fd.store(acceptor.native_handle());
+      _listener_state.store(listener_open);
+
+      std::function<void(unsigned short)> callback;
+      {
+        std::lock_guard lg {_state_lock};
+        callback = _listening_callback;
+      }
+      if (callback) {
+        boost::system::error_code port_ec;
+        const auto port = acceptor.local_endpoint(port_ec).port();
+        in_listening_callback = true;
+        try {
+          callback(port);
+        } catch (...) {
+          in_listening_callback = false;
+          throw;
+        }
+        in_listening_callback = false;
+      }
+
+      if (!paused) {
+        arm_accept();
+      }
+    }
+
+    /**
+     * @brief Record a listener adoption request for `start()`.
+     *
+     * @param fd Descriptor to adopt.
+     * @param paused Whether accepting starts paused.
+     * @return `true` when recorded.
+     */
+    bool record_adoption(int fd, bool paused) {
+      std::lock_guard lg {_state_lock};
+      if (fd < 0 || _adopt_fd >= 0 || _started) {
+        return false;
+      }
+      _adopt_fd = fd;
+      _adopt_paused = paused;
+      return true;
+    }
+
+    /**
+     * @brief Mark `start()` as begun and fetch the adoption request.
+     *
+     * @param fd Receives the descriptor to adopt, or -1.
+     * @param paused Receives the paused flag.
+     */
+    void begin_start(int &fd, bool &paused) {
+      std::lock_guard lg {_state_lock};
+      _started = true;
+      fd = _adopt_fd;
+      paused = _adopt_paused;
+    }
+
+    /**
+     * @brief Register the function called once the listener exists.
+     *
+     * @param callback Function to call; empty removes it.
+     */
+    void set_listening_callback(std::function<void(unsigned short)> callback) {
+      std::lock_guard lg {_state_lock};
+      _listening_callback = std::move(callback);
+    }
+
+    /**
+     * @brief The listening descriptor.
+     *
+     * @return The descriptor or -1.
+     */
+    int listener_fd() const {
+      return _listener_fd.load();
+    }
+
+    /**
+     * @brief Stop arming accepts and wait until the loop thread has done so.
+     *
+     * @param timeout Longest wait.
+     * @return See `rtsp_stream::pause_accept`.
+     */
+    bool pause_accept(std::chrono::milliseconds timeout) {
+      if (_listener_state.load() != listener_open) {
+        return false;
+      }
+      return run_command(timeout, [this] {
+        _paused.store(true);
+        cancel_outstanding_silently();
+        return acceptor.is_open();
+      });
+    }
+
+    /**
+     * @brief Arm accepting again.
+     *
+     * @param timeout Longest wait.
+     * @return See `rtsp_stream::resume_accept`.
+     */
+    bool resume_accept(std::chrono::milliseconds timeout) {
+      if (_listener_state.load() != listener_open) {
+        return false;
+      }
+      return run_command(timeout, [this] {
+        if (!acceptor.is_open()) {
+          return false;
+        }
+        _paused.store(false);
+        // At most one accept is outstanding: while one is, its completion handler arms the next one.
+        if (_outstanding.load() == 0) {
+          arm_accept();
+        }
+        return true;
+      });
+    }
+
+    /**
+     * @brief Close this process's copy of the listening socket.
+     *
+     * @param timeout Longest wait.
+     * @return See `rtsp_stream::close_listener`.
+     */
+    bool close_listener(std::chrono::milliseconds timeout) {
+      const auto state = _listener_state.load();
+      if (state == listener_none || _stopped.load()) {
+        return false;
+      }
+      if (state == listener_closed) {
+        return true;
+      }
+      return run_command(timeout, [this] {
+        _paused.store(true);
+        cancel_outstanding_silently();
+        boost::system::error_code ec;
+        acceptor.close(ec);
+        _listener_fd.store(-1);
+        _listener_state.store(listener_closed);
+        return true;
+      });
+    }
+
+    /**
+     * @brief Whether a launch session is pending.
+     *
+     * @return `true` while one is.
+     */
+    bool has_pending_launch() {
+      std::lock_guard lg {_launch_mutex};
+      return static_cast<bool>(launch_event.view(0s));
+    }
+
+    /**
+     * @brief Drop the pending launch session and cancel its expiry timer.
+     *
+     * @return `true` when a pending launch existed.
+     */
+    bool drop_pending_launch() {
+      std::lock_guard lg {_launch_mutex};
+      raised_timer.cancel();
+      auto dropped = launch_event.pop(0s);
+      if (dropped) {
+        BOOST_LOG(debug) << "Dropped pending launch session: "sv << dropped->unique_id;
+        return true;
+      }
+      return false;
     }
 
     /**
@@ -547,8 +827,33 @@ namespace rtsp_stream {
      *
      * @param ec Error code returned by the asynchronous operation.
      */
-    void handle_accept(const boost::system::error_code &ec) {
+    void handle_accept(boost::system::error_code ec, std::uint64_t generation) {
+      if (generation <= _stale_below.load()) {
+        // Completion of an accept armed before the last test reset.
+        return;
+      }
+      _outstanding.store(0);
+
+#ifdef SUNSHINE_TESTS
+      {
+        std::lock_guard lg {_state_lock};
+        if (_injected_ec) {
+          ec = *_injected_ec;
+          _injected_ec.reset();
+        }
+      }
+#endif
+
       if (ec) {
+        if (ec == boost::asio::error::operation_aborted && generation == _silent_generation.load()) {
+          // The accept that a pause or close cancelled: not an error. Arm the next one if accepting resumed meanwhile.
+          if (!_paused.load() && acceptor.is_open()) {
+            arm_accept();
+          }
+          return;
+        }
+
+        _accept_errors.fetch_add(1);
         BOOST_LOG(error) << "Couldn't accept incoming connections: "sv << ec.message();
 
         // Stop server
@@ -556,6 +861,7 @@ namespace rtsp_stream {
         return;
       }
 
+      _accepted.fetch_add(1);
       auto socket = std::move(next_socket);
 
       auto launch_session {launch_event.view(0s)};
@@ -572,13 +878,10 @@ namespace rtsp_stream {
         socket->sock.close(ec);
       }
 
-      // Queue another asynchronous accept for the next incoming connection
-      next_socket = std::make_shared<socket_t>(io_context, [this](tcp::socket &sock, launch_session_t &session, msg_t &&msg) {
-        handle_msg(sock, session, std::move(msg));
-      });
-      acceptor.async_accept(next_socket->sock, [this](const auto &ec) {
-        handle_accept(ec);
-      });
+      // Queue another asynchronous accept for the next incoming connection, unless accepting is paused
+      if (!_paused.load() && acceptor.is_open()) {
+        arm_accept();
+      }
     }
 
     /**
@@ -598,21 +901,29 @@ namespace rtsp_stream {
      * @param launch_session Streaming session information.
      */
     void session_raise(std::shared_ptr<launch_session_t> launch_session) {
+      // The launch event and its timer are serialised by one mutex (never held across a wait or a callback).
+      std::lock_guard lg {_launch_mutex};
+
       // If a launch event is still pending, don't overwrite it.
       if (launch_event.view(0s)) {
         return;
       }
 
       // Raise the new launch session to prepare for the RTSP handshake
-      launch_event.raise(std::move(launch_session));
+      launch_event.raise(launch_session);
 
       // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
-      raised_timer.async_wait([this](const boost::system::error_code &ec) {
+      raised_timer.async_wait([this, armed = std::move(launch_session)](const boost::system::error_code &ec) {
         if (!ec) {
-          auto discarded = launch_event.pop(0s);
-          if (discarded) {
-            BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+          // Compare and pop in one step, so a drop or a newer raise cannot be undone by this late expiry.
+          std::lock_guard lg {_launch_mutex};
+          auto current = launch_event.view(0s);
+          if (current && current == armed) {
+            auto discarded = launch_event.pop(0s);
+            if (discarded) {
+              BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+            }
           }
         }
       });
@@ -623,6 +934,8 @@ namespace rtsp_stream {
      * @param launch_session_id The ID of the session to clear.
      */
     void session_clear(uint32_t launch_session_id) {
+      std::lock_guard lg {_launch_mutex};
+
       // We currently only support a single pending RTSP session,
       // so the ID should always match the one for that session.
       auto launch_session = launch_event.view(0s);
@@ -787,16 +1100,182 @@ namespace rtsp_stream {
       } else {
         io_context.run_one();
       }
+      _iterations.fetch_add(1);
     }
 
     /**
      * @brief Stop the RTSP server.
      */
     void stop() {
+      _stopped.store(true);
       acceptor.close();
+      _listener_fd.store(-1);
+      _work_guard.reset();
       io_context.stop();
       clear();
     }
+
+    /**
+     * @brief Clear the sessions of a client by the SHA-256 of its certificate.
+     *
+     * Locking is the same as for `clear()`. Sessions with an empty certificate never match.
+     *
+     * @param sha256_hex 64 lowercase hexadecimal characters.
+     * @param reason Stop reason to record.
+     * @param certs Receives the distinct certificates of the matched sessions.
+     * @return Number of sessions this call moved to stopping.
+     */
+    std::size_t clear_by_cert_hash(std::string_view sha256_hex, stream::stop_reason_e reason, std::set<std::string> &certs) {
+      std::lock_guard cg {_clear_lock};
+      return end_sessions(
+        [&](stream::session_t &slot) {
+          const auto &cert = stream::session::client_cert(slot);
+          if (cert.empty() || cert_hash_hex(cert) != sha256_hex) {
+            return false;
+          }
+          certs.insert(cert);
+          return true;
+        },
+        reason
+      );
+    }
+
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief Test seam: open the listener on a duplicate of a test-owned socket, as `start()` does for an adoption.
+     *
+     * @param fd Listening socket.
+     * @param paused Whether accepting starts paused.
+     * @return `true` on success.
+     */
+    bool test_open_listener(int fd, bool paused) {
+  #ifdef __linux__
+      if (fd < 0 || acceptor.is_open() || _listener_state.load() == listener_open) {
+        return false;
+      }
+      reset_counters();
+      boost::system::error_code ec;
+      if (adopt(fd, ec)) {
+        return false;
+      }
+      begin_listening(paused);
+      return true;
+  #else
+      (void) fd;
+      (void) paused;
+      return false;
+  #endif
+    }
+
+    /**
+     * @brief Test seam: start the loop thread.
+     */
+    void test_start_loop() {
+      if (_test_loop.joinable()) {
+        return;
+      }
+      _test_stop.store(false);
+      _test_loop = std::thread {[this] {
+        while (!_test_stop.load()) {
+          iterate();
+          clear(false);
+        }
+      }};
+    }
+
+    /**
+     * @brief Test seam: stop the loop thread, as the shutdown path does.
+     */
+    void test_stop_loop() {
+      _test_stop.store(true);
+      stop();
+      if (_test_loop.joinable()) {
+        _test_loop.join();
+      }
+    }
+
+    /**
+     * @brief Test seam: return the server to its state before `test_open_listener`.
+     */
+    void test_reset() {
+      test_stop_loop();
+      boost::system::error_code ec;
+      acceptor.close(ec);
+      _stale_below.store(_accept_generation.load());
+      io_context.restart();
+      // Run and discard the handlers left over from the stopped run, with the stale marker already set.
+      io_context.poll();
+      io_context.restart();
+      _work_guard.reset();
+      next_socket.reset();
+      {
+        std::lock_guard lg {_state_lock};
+        _adopt_fd = -1;
+        _adopt_paused = false;
+        _started = false;
+        _listening_callback = nullptr;
+        _injected_ec.reset();
+      }
+      drop_pending_launch();
+      remove_all();
+      _paused.store(false);
+      _stopped.store(false);
+      _outstanding.store(0);
+      _listener_fd.store(-1);
+      _listener_state.store(listener_none);
+      reset_counters();
+    }
+
+    /**
+     * @brief Test seam: make the next accept completion carry `ec`.
+     *
+     * @param ec Error code; none removes a pending injection.
+     */
+    void test_inject_accept_error(const boost::system::error_code &ec) {
+      std::lock_guard lg {_state_lock};
+      if (ec) {
+        _injected_ec = ec;
+      } else {
+        _injected_ec.reset();
+      }
+    }
+
+    /**
+     * @brief Number of times `iterate()` returned.
+     *
+     * @return The count.
+     */
+    std::uint64_t loop_iterations() const {
+      return _iterations.load();
+    }
+
+    /**
+     * @brief Number of successful accept completions handled.
+     *
+     * @return The count.
+     */
+    std::uint64_t accepted_connections() const {
+      return _accepted.load();
+    }
+
+    /**
+     * @brief Number of accept completions treated as errors.
+     *
+     * @return The count.
+     */
+    std::uint64_t accept_errors() const {
+      return _accept_errors.load();
+    }
+
+    /**
+     * @brief Number of accepts armed whose completion has not run.
+     *
+     * @return 0 or 1.
+     */
+    int outstanding_accepts() const {
+      return _outstanding.load();
+    }
+#endif
 
   private:
     using slots_t = std::set<std::shared_ptr<stream::session_t>>;  ///< Container type of the tracked sessions.
@@ -811,13 +1290,16 @@ namespace rtsp_stream {
      * @param reason Stop reason to record for the selected sessions; a session that is already stopping keeps its first reason.
      */
     template<class Select>
-    void end_sessions(Select &&select, stream::stop_reason_e reason = stream::stop_reason_e::terminated) {
+    std::size_t end_sessions(Select &&select, stream::stop_reason_e reason = stream::stop_reason_e::terminated) {
       std::vector<std::shared_ptr<stream::session_t>> ending;
+      std::size_t stopped = 0;
       {
         auto lg = _session_slots.lock();
         for (const auto &slot : *_session_slots) {
           if (select(*slot)) {
-            stream::session::stop(*slot, reason);
+            if (stream::session::stop(*slot, reason)) {
+              ++stopped;
+            }
             ending.push_back(slot);
           }
         }
@@ -834,6 +1316,8 @@ namespace rtsp_stream {
           BOOST_LOG(info) << "Session ended: reason="sv << stream::to_string(stream::session::stop_reason(*slot)) << ", active sessions="sv << _session_slots->size();
         }
       }
+
+      return stopped;
     }
 
     /**
@@ -851,6 +1335,113 @@ namespace rtsp_stream {
       );
     }
 
+    /// Lifecycle of the listener, as seen by the commands that need one.
+    enum listener_state_e {
+      listener_none,  ///< No listener was ever opened.
+      listener_open,  ///< The listener exists.
+      listener_closed  ///< The listener was closed by `close_listener`.
+    };
+
+    /**
+     * @brief Arm one accept on a fresh `next_socket`. Only for the thread that owns the acceptor state (the loop thread,
+     * or the thread that runs `start()` before the loop runs), and only when no accept is outstanding.
+     */
+    void arm_accept() {
+      next_socket = std::make_shared<socket_t>(io_context, [this](tcp::socket &sock, launch_session_t &session, msg_t &&msg) {
+        handle_msg(sock, session, std::move(msg));
+      });
+
+      const auto generation = _accept_generation.fetch_add(1) + 1;
+      _outstanding.store(1);
+      acceptor.async_accept(next_socket->sock, [this, generation](const auto &ec) {
+        handle_accept(ec, generation);
+      });
+    }
+
+    /**
+     * @brief Cancel the outstanding accept, if any, and mark its aborted completion as silent.
+     */
+    void cancel_outstanding_silently() {
+      if (_outstanding.load() != 0) {
+        _silent_generation.store(_accept_generation.load());
+        boost::system::error_code ec;
+        acceptor.cancel(ec);
+      }
+    }
+
+    /**
+     * @brief Whether the calling thread is the loop thread, or runs the listening callback.
+     *
+     * @return `true` when a command that waits for the loop thread would wait for itself.
+     */
+    bool on_loop_thread() {
+      return in_listening_callback || io_context.get_executor().running_in_this_thread();
+    }
+
+    /**
+     * @brief Run a function on the loop thread and wait for its result.
+     *
+     * The handlers run in posting order. The wait ends early when `stop()` runs.
+     *
+     * @param timeout Longest wait.
+     * @param command Function to run on the loop thread.
+     * @return The function's result; `false` on timeout, after `stop()`, or when called on the loop thread.
+     */
+    bool run_command(std::chrono::milliseconds timeout, std::function<bool()> command) {
+      if (_stopped.load() || on_loop_thread()) {
+        return false;
+      }
+
+      auto promise = std::make_shared<std::promise<bool>>();
+      auto result = promise->get_future();
+      boost::asio::post(io_context, [promise, command = std::move(command)]() {
+        promise->set_value(command());
+      });
+
+      const auto deadline = std::chrono::steady_clock::now() + timeout;
+      while (true) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+        if (result.wait_for(std::clamp(remaining, std::chrono::milliseconds {0}, std::chrono::milliseconds {10})) == std::future_status::ready) {
+          return result.get();
+        }
+        if (_stopped.load() || remaining <= std::chrono::milliseconds {0}) {
+          return false;
+        }
+      }
+    }
+
+    /**
+     * @brief Zero the observation counters.
+     */
+    void reset_counters() {
+      _iterations.store(0);
+      _accepted.store(0);
+      _accept_errors.store(0);
+    }
+
+    std::mutex _launch_mutex;  ///< Serialises the launch event and `raised_timer` (never held across a wait or a callback).
+    std::mutex _state_lock;  ///< Guards the adoption record, the listening callback and the injected error.
+    int _adopt_fd = -1;  ///< Descriptor recorded by `record_adoption`, or -1.
+    bool _adopt_paused = false;  ///< Paused flag recorded with the adoption.
+    bool _started = false;  ///< `start()` has begun.
+    std::function<void(unsigned short)> _listening_callback;  ///< Called once the listener exists.
+    std::atomic<int> _listener_fd {-1};  ///< Atomic copy of the listening descriptor.
+    std::atomic<int> _listener_state {listener_none};  ///< `listener_state_e`.
+    std::atomic<bool> _paused {false};  ///< Accepting is paused.
+    std::atomic<bool> _stopped {false};  ///< `stop()` ran.
+    std::atomic<int> _outstanding {0};  ///< Accepts armed whose completion has not run (0 or 1).
+    std::atomic<std::uint64_t> _accept_generation {0};  ///< Generation of the latest armed accept.
+    std::atomic<std::uint64_t> _silent_generation {0};  ///< Generation whose aborted completion is silent.
+    std::atomic<std::uint64_t> _stale_below {0};  ///< Completions of generations up to this are ignored.
+    std::atomic<std::uint64_t> _iterations {0};  ///< Times `iterate()` returned.
+    std::atomic<std::uint64_t> _accepted {0};  ///< Successful accept completions.
+    std::atomic<std::uint64_t> _accept_errors {0};  ///< Accept completions handled as errors.
+#ifdef SUNSHINE_TESTS
+    std::optional<boost::system::error_code> _injected_ec;  ///< Error for the next accept completion.
+    std::thread _test_loop;  ///< Loop thread of the test seam.
+    std::atomic<bool> _test_stop {false};  ///< Asks the test loop thread to end.
+#endif
+
     std::mutex _clear_lock;  ///< Serialises `clear()` and `clear_by_cert()`; taken before the slots lock, never while holding it.
 
     std::unordered_map<std::string_view, cmd_func_t> _map_cmd_cb;
@@ -862,6 +1453,8 @@ namespace rtsp_stream {
     boost::asio::steady_timer raised_timer {io_context};
 
     std::shared_ptr<socket_t> next_socket;
+
+    std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> _work_guard;  ///< Keeps the loop idle instead of spinning; declared after `io_context`, which it refers to.
   };
 
   rtsp_server_t server {};  ///< Singleton RTSP server used by GameStream launch sessions.
@@ -877,11 +1470,59 @@ namespace rtsp_stream {
     server.session_clear(launch_session_id);
   }
 
+  bool has_pending_launch() {
+    return server.has_pending_launch();
+  }
+
+  bool drop_pending_launch() {
+    return server.drop_pending_launch();
+  }
+
+  bool adopt_listener(int fd, bool paused) {
+#ifdef __linux__
+    return server.record_adoption(fd, paused);
+#else
+    (void) fd;
+    (void) paused;
+    return false;
+#endif
+  }
+
+  void set_listening_callback(std::function<void(unsigned short)> callback) {
+    server.set_listening_callback(std::move(callback));
+  }
+
+  int listener_fd() {
+    return server.listener_fd();
+  }
+
+  bool pause_accept(std::chrono::milliseconds timeout) {
+    return server.pause_accept(timeout);
+  }
+
+  bool resume_accept(std::chrono::milliseconds timeout) {
+    return server.resume_accept(timeout);
+  }
+
+  bool close_listener(std::chrono::milliseconds timeout) {
+    return server.close_listener(timeout);
+  }
+
   int session_count() {
     // Ensure session_count is up-to-date. If a clear is already joining sessions, it ends the stopped ones itself.
     server.clear_stopped_if_idle();
 
     return server.session_count();
+  }
+
+  int total_session_count() {
+    int total = session_count();
+#ifdef __linux__
+    // One SESSIONS? to the draining process, if there is one. An unknown answer counts as one session.
+    const auto draining = handoff::draining_session_count(handoff::peer_request_timeout);
+    total += draining ? static_cast<int>(*draining) : 1;
+#endif
+    return total;
   }
 
   std::vector<session_info_t> list_sessions() {
@@ -937,6 +1578,23 @@ namespace rtsp_stream {
   void terminate_sessions_by_cert(std::string_view cert) {
     server.clear_by_cert(cert);
     input::terminate_gamepads(cert);
+  }
+
+  std::size_t terminate_sessions_by_cert_hash(std::string_view sha256_hex, stream::stop_reason_e reason) {
+    const bool valid = sha256_hex.size() == 64 && std::ranges::all_of(sha256_hex, [](char c) {
+                         return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                       });
+    if (!valid) {
+      BOOST_LOG(debug) << "Ignoring a certificate hash that is not 64 lowercase hexadecimal characters"sv;
+      return 0;
+    }
+
+    std::set<std::string> certs;
+    const auto ended = server.clear_by_cert_hash(sha256_hex, reason, certs);
+    for (const auto &cert : certs) {
+      input::terminate_gamepads(cert);
+    }
+    return ended;
   }
 
   /**
@@ -1502,23 +2160,48 @@ namespace rtsp_stream {
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
 
-  void start() {
-    platf::set_thread_name("rtsp");
-    auto shutdown_event = mail::man->event<bool>(mail::shutdown);
-
+  /**
+   * @brief Register the RTSP command handlers on the server (repeated calls change nothing).
+   */
+  void register_commands() {
     server.map("OPTIONS"sv, &cmd_option);
     server.map("DESCRIBE"sv, &cmd_describe);
     server.map("SETUP"sv, &cmd_setup);
     server.map("ANNOUNCE"sv, &cmd_announce);
     server.map("PLAY"sv, &cmd_play);
+  }
+
+  void start() {
+    platf::set_thread_name("rtsp");
+    auto shutdown_event = mail::man->event<bool>(mail::shutdown);
+
+    register_commands();
+
+    int adopt_fd = -1;
+    bool adopt_paused = false;
+    server.begin_start(adopt_fd, adopt_paused);
 
     boost::system::error_code ec;
-    if (server.bind(net::af_from_enum_string(config::sunshine.address_family), net::map_port(rtsp_stream::RTSP_SETUP_PORT), ec)) {
-      BOOST_LOG(fatal) << "Couldn't bind RTSP server to port ["sv << net::map_port(rtsp_stream::RTSP_SETUP_PORT) << "], " << ec.message();
-      shutdown_event->raise(true);
+#ifdef __linux__
+    if (adopt_fd >= 0) {
+      if (server.adopt(adopt_fd, ec)) {
+        BOOST_LOG(fatal) << "Couldn't adopt the RTSP listener, "sv << ec.message();
+        shutdown_event->raise(true);
 
-      return;
+        return;
+      }
+    } else
+#endif
+    {
+      if (server.bind(net::af_from_enum_string(config::sunshine.address_family), net::map_port(rtsp_stream::RTSP_SETUP_PORT), ec)) {
+        BOOST_LOG(fatal) << "Couldn't bind RTSP server to port ["sv << net::map_port(rtsp_stream::RTSP_SETUP_PORT) << "], " << ec.message();
+        shutdown_event->raise(true);
+
+        return;
+      }
     }
+
+    server.begin_listening(adopt_fd >= 0 && adopt_paused);
 
     std::jthread rtsp_thread {[&shutdown_event] {
       platf::set_thread_name("rtsp::handler");
@@ -1545,6 +2228,47 @@ namespace rtsp_stream {
     server.stop();
     rtsp_thread.join();
   }
+
+#ifdef SUNSHINE_TESTS
+  namespace testing {
+    bool open_listener(int fd, bool paused) {
+      register_commands();
+      return server.test_open_listener(fd, paused);
+    }
+
+    void start_loop() {
+      server.test_start_loop();
+    }
+
+    void stop_loop() {
+      server.test_stop_loop();
+    }
+
+    void reset_server() {
+      server.test_reset();
+    }
+
+    std::uint64_t loop_iterations() {
+      return server.loop_iterations();
+    }
+
+    std::uint64_t accepted_connections() {
+      return server.accepted_connections();
+    }
+
+    std::uint64_t accept_errors() {
+      return server.accept_errors();
+    }
+
+    void inject_accept_error(const boost::system::error_code &ec) {
+      server.test_inject_accept_error(ec);
+    }
+
+    int outstanding_accepts() {
+      return server.outstanding_accepts();
+    }
+  }  // namespace testing
+#endif
 
   /**
    * @brief Write msg details to the log.
