@@ -1,6 +1,7 @@
 <script setup>
 import { ref } from 'vue'
 import PlatformLayout from '../../PlatformLayout.vue'
+import Checkbox from '../../Checkbox.vue'
 
 const props = defineProps([
   'platform',
@@ -114,6 +115,58 @@ const config = ref(props.config)
       </select>
       <div class="form-text">{{ $t('config.encoder_desc') }}</div>
     </div>
+
+    <!-- Drain handoff (Linux only, off by default) -->
+    <template v-if="platform === 'linux'">
+      <Checkbox class="mb-3"
+                id="drain_handoff"
+                locale-prefix="config"
+                v-model="config.drain_handoff"
+                default="false"
+      ></Checkbox>
+
+      <!-- Drain handoff UDP port offset -->
+      <div class="mb-3">
+        <label for="drain_handoff_udp_offset" class="form-label">{{ $t('config.drain_handoff_udp_offset') }}</label>
+        <input type="number" class="form-control" id="drain_handoff_udp_offset" placeholder="100" v-model="config.drain_handoff_udp_offset" />
+        <div class="form-text">{{ $t('config.drain_handoff_udp_offset_desc') }}</div>
+      </div>
+
+      <!-- Drain handoff deadline -->
+      <div class="mb-3">
+        <label for="drain_handoff_deadline" class="form-label">{{ $t('config.drain_handoff_deadline') }}</label>
+        <input type="number" min="1" max="86400" class="form-control" id="drain_handoff_deadline" placeholder="3600" v-model="config.drain_handoff_deadline" />
+        <div class="form-text">{{ $t('config.drain_handoff_deadline_desc') }}</div>
+      </div>
+
+      <!-- Drain handoff ready timeout -->
+      <div class="mb-3">
+        <label for="drain_handoff_ready_timeout" class="form-label">{{ $t('config.drain_handoff_ready_timeout') }}</label>
+        <input type="number" min="1" class="form-control" id="drain_handoff_ready_timeout" placeholder="30" v-model="config.drain_handoff_ready_timeout" />
+        <div class="form-text">{{ $t('config.drain_handoff_ready_timeout_desc') }}</div>
+      </div>
+
+      <!-- Drain handoff rollback window -->
+      <div class="mb-3">
+        <label for="drain_handoff_rollback_window" class="form-label">{{ $t('config.drain_handoff_rollback_window') }}</label>
+        <input type="number" min="1" class="form-control" id="drain_handoff_rollback_window" placeholder="60" v-model="config.drain_handoff_rollback_window" />
+        <div class="form-text">{{ $t('config.drain_handoff_rollback_window_desc') }}</div>
+      </div>
+
+      <!-- Drain handoff cooldown -->
+      <div class="mb-3">
+        <label for="drain_handoff_cooldown" class="form-label">{{ $t('config.drain_handoff_cooldown') }}</label>
+        <input type="number" min="1" class="form-control" id="drain_handoff_cooldown" placeholder="120" v-model="config.drain_handoff_cooldown" />
+        <div class="form-text">{{ $t('config.drain_handoff_cooldown_desc') }}</div>
+      </div>
+
+      <!-- Drain handoff binary -->
+      <div class="mb-3">
+        <label for="drain_handoff_binary" class="form-label">{{ $t('config.drain_handoff_binary') }}</label>
+        <input type="text" class="form-control" id="drain_handoff_binary" v-model="config.drain_handoff_binary" />
+        <div class="form-text">{{ $t('config.drain_handoff_binary_desc') }}</div>
+      </div>
+    </template>
 
   </div>
 </template>
