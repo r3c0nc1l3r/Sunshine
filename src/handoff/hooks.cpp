@@ -7,6 +7,7 @@
   #include "hooks.h"
 
   // local includes
+  #include "drain.h"
   #include "mdns_holder.h"
   #include "settings.h"
   #include "src/config.h"
@@ -151,6 +152,10 @@ namespace handoff::hooks {
 
   bool startup_probe_skipped() {
     return started_by_handoff() && video::handoff_probe_override().has_value();
+  }
+
+  void sessions_changed() {
+    session_notifier().poke();
   }
 }  // namespace handoff::hooks
 #endif
