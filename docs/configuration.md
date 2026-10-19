@@ -2283,6 +2283,203 @@ supported on the current platform.
     </tr>
 </table>
 
+#### Drain handoff
+
+The drain handoff options control upgrading or restarting Sunshine while clients are streaming. The feature is
+**Linux only** and **opt-in**: it is off by default, and a normal start behaves as before while it is off. See
+[Drain handoff](drain-handoff.md) for the full behaviour, the port layout and the requirements.
+
+### drain_handoff
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Turns the drain handoff feature on or off. Set to <code>enabled</code> to allow a new Sunshine process to
+            take over new sessions while existing sessions finish on the old process.
+            @note{Applies to Linux only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            drain_handoff = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### drain_handoff_udp_offset
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Offset added to <code>port</code> to get the second set of UDP media ports. Processes alternate between the
+            two sets. Both sets must be reachable through your firewall.
+            @note{Applies to Linux only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            100
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">Any non-zero integer that keeps both UDP port sets in 1024-65535 and free of overlaps with TCP
+            ports and with each other.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            drain_handoff_udp_offset = 100
+            @endcode</td>
+    </tr>
+</table>
+
+### drain_handoff_deadline
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Seconds a draining process may keep its remaining sessions, counted from the switch. At the deadline the
+            remaining sessions end and the process exits.
+            @note{Applies to Linux only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            3600
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">1-86400, and at least the rollback window.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            drain_handoff_deadline = 3600
+            @endcode</td>
+    </tr>
+</table>
+
+### drain_handoff_ready_timeout
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Seconds the new process has to report ready. If it does not, the handoff fails.
+            @note{Applies to Linux only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            30
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">At least 1.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            drain_handoff_ready_timeout = 30
+            @endcode</td>
+    </tr>
+</table>
+
+### drain_handoff_rollback_window
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Seconds after the switch during which the old process is still able to take the sockets back.
+            @note{Applies to Linux only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            60
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">At least 1.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            drain_handoff_rollback_window = 60
+            @endcode</td>
+    </tr>
+</table>
+
+### drain_handoff_cooldown
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Seconds after a handoff, or a failed attempt, before the next handoff is accepted.
+            @note{Applies to Linux only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            120
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">At least the rollback window.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            drain_handoff_cooldown = 120
+            @endcode</td>
+    </tr>
+</table>
+
+### drain_handoff_binary
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Path of the binary to execute for the new process. The path is not checked when the config is read. A bad
+            path fails the handoff when the process is started.
+            @note{Applies to Linux only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">The path Sunshine was started from.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            drain_handoff_binary = /usr/local/bin/sunshine
+            @endcode</td>
+    </tr>
+</table>
+
 ## NVIDIA NVENC Encoder
 
 ### nvenc_preset
