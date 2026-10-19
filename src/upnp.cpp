@@ -3,7 +3,12 @@
  * @brief Definitions for UPnP port mapping.
  */
 // standard includes
+#include <algorithm>
+#include <atomic>
+#include <deque>
+#include <mutex>
 #include <stddef.h>  // workaround for type_t error in miniupnpc 2.3.3, see https://github.com/miniupnp/miniupnp/commit/e263ab6f56c382e10fed31347ec68095d691a0e8
+#include <thread>
 
 // lib includes
 #include <miniupnpc/miniupnpc.h>
@@ -24,6 +29,93 @@
 using namespace std::literals;
 
 namespace upnp {
+
+  namespace {
+    /**
+     * @brief Process-wide UPnP state shared by `start()`, the shutdown guard and `remove_ports_async()`.
+     */
+    struct state_t {
+      std::mutex mutex;  ///< Guards every field below. The unmap scope is atomic and needs no lock.
+      bool started = false;  ///< `start()` has been called in this process; a second call is a programming error.
+      bool planned = false;  ///< `start()` made an own plan with UPnP on; `remove_ports_async()` acts only then.
+      std::vector<planned_mapping_t> own_plan;  ///< Mappings this process requested in `start()`; the second guard.
+      std::deque<std::vector<planned_mapping_t>> jobs;  ///< Removal jobs waiting for the worker, in call order.
+      bool worker_running = false;  ///< A removal worker thread is draining `jobs`.
+    };
+
+    /**
+     * @brief Access the shared UPnP state.
+     * @return Reference to the process-wide state.
+     */
+    state_t &state() {
+      // Intentionally never destroyed, so a detached removal worker never touches a destroyed mutex at exit.
+      static auto *instance = new state_t;
+      return *instance;
+    }
+
+    std::atomic<unmap_scope_e> g_unmap_scope {unmap_scope_e::all};  ///< Scope the guard applies when it is destroyed.
+  }  // namespace
+
+  std::vector<planned_mapping_t> plan_mappings(int port, int udp_base, bool web_ui_on_wan) {
+    // Same arithmetic as net::map_port (TCP, relative to `port`) and net::map_udp_port (UDP, relative to `udp_base`).
+    auto tcp = [port](int offset) {
+      return static_cast<std::uint16_t>(port + offset);
+    };
+    auto udp = [udp_base](int offset) {
+      return static_cast<std::uint16_t>(udp_base + offset);
+    };
+
+    std::vector<planned_mapping_t> plan {
+      {tcp(rtsp_stream::RTSP_SETUP_PORT), false, "Sunshine - RTSP"s},
+      {udp(stream::VIDEO_STREAM_PORT), true, "Sunshine - Video"s},
+      {udp(stream::AUDIO_STREAM_PORT), true, "Sunshine - Audio"s},
+      {udp(stream::CONTROL_PORT), true, "Sunshine - Control"s},
+      {tcp(nvhttp::PORT_HTTP), false, "Sunshine - Client HTTP"s},
+      {tcp(nvhttp::PORT_HTTPS), false, "Sunshine - Client HTTPS"s},
+    };
+
+    // Only plan the Web Manager port if it may be reached from the WAN
+    if (web_ui_on_wan) {
+      plan.push_back({tcp(confighttp::PORT_HTTPS), false, "Sunshine - Web UI"s});
+    }
+
+    return plan;
+  }
+
+  std::vector<planned_mapping_t> select_for_scope(const std::vector<planned_mapping_t> &plan, unmap_scope_e scope) {
+    std::vector<planned_mapping_t> selected;
+    for (const auto &entry : plan) {
+      // `all` keeps everything, `udp_only` keeps the UDP entries and `none` keeps nothing.
+      if (scope == unmap_scope_e::all || (scope == unmap_scope_e::udp_only && entry.udp)) {
+        selected.push_back(entry);
+      }
+    }
+    return selected;
+  }
+
+  std::vector<planned_mapping_t> removal_plan(const std::set<std::uint16_t> &requested, const std::vector<planned_mapping_t> &own_plan) {
+    std::vector<planned_mapping_t> removals;
+    // `requested` is a set, so the entries come out in ascending port order.
+    for (auto requested_port : requested) {
+      // Guard 2: never select a port this process maps itself, whether it is UDP or TCP.
+      auto is_own = std::any_of(own_plan.begin(), own_plan.end(), [requested_port](const planned_mapping_t &entry) {
+        return entry.port == requested_port;
+      });
+      if (!is_own) {
+        // The description is not sent to the gateway when a mapping is deleted, so it stays empty.
+        removals.push_back({requested_port, true, std::string {}});
+      }
+    }
+    return removals;
+  }
+
+  void set_unmap_scope(unmap_scope_e scope) {
+    g_unmap_scope.store(scope);
+  }
+
+  unmap_scope_e unmap_scope() {
+    return g_unmap_scope.load();
+  }
 
   /**
    * @brief UPnP port mapping description and lease state.
@@ -66,31 +158,28 @@ namespace upnp {
   }
 
   /**
+   * @brief Convert a planned mapping into the form the gateway calls take.
+   * @param entry The planned mapping.
+   * @return The mapping with WAN and LAN ports set to the planned port.
+   */
+  mapping_t to_mapping(const planned_mapping_t &entry) {
+    auto port = std::to_string(entry.port);
+    return mapping_t {{port, port, entry.udp ? "UDP"s : "TCP"s}, entry.description};
+  }
+
+  /**
    * @brief RAII helper that runs shutdown cleanup when destroyed.
    */
   class deinit_t: public platf::deinit_t {
   public:
-    deinit_t() {
-      auto rtsp = std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT));
-      auto video = std::to_string(net::map_port(stream::VIDEO_STREAM_PORT));
-      auto audio = std::to_string(net::map_port(stream::AUDIO_STREAM_PORT));
-      auto control = std::to_string(net::map_port(stream::CONTROL_PORT));
-      auto gs_http = std::to_string(net::map_port(nvhttp::PORT_HTTP));
-      auto gs_https = std::to_string(net::map_port(nvhttp::PORT_HTTPS));
-      auto wm_http = std::to_string(net::map_port(confighttp::PORT_HTTPS));
-
-      mappings.assign({
-        {{rtsp, rtsp, "TCP"s}, "Sunshine - RTSP"s},
-        {{video, video, "UDP"s}, "Sunshine - Video"s},
-        {{audio, audio, "UDP"s}, "Sunshine - Audio"s},
-        {{control, control, "UDP"s}, "Sunshine - Control"s},
-        {{gs_http, gs_http, "TCP"s}, "Sunshine - Client HTTP"s},
-        {{gs_https, gs_https, "TCP"s}, "Sunshine - Client HTTPS"s},
-      });
-
-      // Only map port for the Web Manager if it is configured to accept connection from WAN
-      if (net::from_enum_string(config::nvhttp.origin_web_ui_allowed) > net::LAN) {
-        mappings.emplace_back(mapping_t {{wm_http, wm_http, "TCP"s}, "Sunshine - Web UI"s});
+    /**
+     * @brief Start the mapping thread for the given plan.
+     * @param entries The mappings this process requests, as `plan_mappings` returns them.
+     */
+    explicit deinit_t(std::vector<planned_mapping_t> entries):
+        plan {std::move(entries)} {
+      for (const auto &entry : plan) {
+        mappings.push_back(to_mapping(entry));
       }
 
       // Start the mapping thread
@@ -283,24 +372,28 @@ namespace upnp {
     }
 
     /**
-     * @brief Unmaps all ports.
+     * @brief Unmaps the ports that the current unmap scope selects.
+     * @details The scope is read here, when the guard runs, so a draining process removes only its own UDP
+     *          mappings (`udp_only`), or nothing (`none`). The TCP ports are shared with the active process.
      * @param urls urls_t from UPNP_GetValidIGD()
      * @param data IGDdatas from UPNP_GetValidIGD()
      */
     void unmap_all_upnp_ports(const urls_t &urls, const IGDdatas &data) {
-      for (auto it = std::begin(mappings); it != std::end(mappings); ++it) {
+      for (const auto &entry : select_for_scope(plan, unmap_scope())) {
+        auto wan = std::to_string(entry.port);
+        auto proto = entry.udp ? "UDP" : "TCP";
         auto status = UPNP_DeletePortMapping(
           urls->controlURL,
           data.first.servicetype,
-          it->port.wan.c_str(),
-          it->port.proto.c_str(),
+          wan.c_str(),
+          proto,
           nullptr
         );
 
         if (status && status != 714) {  // NoSuchEntryInArray
-          BOOST_LOG(warning) << "Failed to unmap "sv << it->port.proto << ' ' << it->port.lan << ": "sv << status;
+          BOOST_LOG(warning) << "Failed to unmap "sv << proto << ' ' << wan << ": "sv << status;
         } else {
-          BOOST_LOG(debug) << "Successfully unmapped "sv << it->port.proto << ' ' << it->port.lan;
+          BOOST_LOG(debug) << "Successfully unmapped "sv << proto << ' ' << wan;
         }
       }
     }
@@ -372,18 +465,116 @@ namespace upnp {
       }
     }
 
+    std::vector<planned_mapping_t> plan;  ///< Planned mappings, kept in plan form for the unmap scope.
     std::vector<mapping_t> mappings;  ///< Port mappings Sunshine should keep registered with the gateway.
     std::jthread upnp_thread;  ///< Worker thread that refreshes mappings until shutdown.
   };
 
-  /**
-   * @brief Start UPnP port mapping and return its shutdown guard.
-   */
-  std::unique_ptr<platf::deinit_t> start() {
+  namespace {
+    /**
+     * @brief Delete the given UDP mappings on the gateway. Runs on the removal worker.
+     * @details Discovers the gateway as the mapping thread does. "No such entry" counts as removed; any other failure
+     *          is logged as a warning, with no retry.
+     * @param entries The UDP mappings to delete, from `removal_plan`.
+     */
+    void remove_entries(const std::vector<planned_mapping_t> &entries) {
+      int err = 0;
+      device_t device {upnpDiscover(2000, nullptr, nullptr, 0, IPv4, 2, &err)};
+      if (!device || err) {
+        BOOST_LOG(warning) << "Couldn't discover any IPv4 UPNP devices to remove ports from"sv;
+        return;
+      }
+
+      IGDdatas data;
+      urls_t urls;
+      std::array<char, INET6_ADDRESS_STRLEN> lan_addr;
+      auto status = UPNP_GetValidIGDStatus(device, &urls, &data, lan_addr);
+      if (status != 1 && status != 2) {
+        BOOST_LOG(warning) << "No valid IGD to remove UPnP ports from: "sv << status_string(status);
+        return;
+      }
+
+      for (const auto &entry : entries) {
+        auto wan = std::to_string(entry.port);
+        auto del_err = UPNP_DeletePortMapping(urls->controlURL, data.first.servicetype, wan.c_str(), "UDP", nullptr);
+        if (del_err && del_err != 714) {  // NoSuchEntryInArray
+          BOOST_LOG(warning) << "Failed to remove UDP "sv << wan << ": "sv << del_err;
+        } else {
+          BOOST_LOG(debug) << "Removed UDP "sv << wan;
+        }
+      }
+    }
+
+    /**
+     * @brief Worker loop for `remove_ports_async`: runs queued jobs in call order, then exits when the queue is empty.
+     */
+    void removal_worker() {
+      platf::set_thread_name("upnp_remove");
+      auto &shared = state();
+      while (true) {
+        std::vector<planned_mapping_t> job;
+        {
+          std::lock_guard lock {shared.mutex};
+          if (shared.jobs.empty()) {
+            shared.worker_running = false;
+            return;
+          }
+          job = std::move(shared.jobs.front());
+          shared.jobs.pop_front();
+        }
+        remove_entries(job);
+      }
+    }
+  }  // namespace
+
+  std::unique_ptr<platf::deinit_t> start(int udp_base) {
+    auto &shared = state();
+    {
+      std::lock_guard lock {shared.mutex};
+      if (shared.started) {
+        BOOST_LOG(error) << "upnp::start() called twice in one process; the second call maps nothing"sv;
+        return nullptr;
+      }
+      shared.started = true;
+    }
+
     if (!config::sunshine.flags[config::flag::UPNP]) {
       return nullptr;
     }
 
-    return std::make_unique<deinit_t>();
+    // Only plan the Web Manager port if it may be reached from the WAN
+    auto web_ui_on_wan = net::from_enum_string(config::nvhttp.origin_web_ui_allowed) > net::LAN;
+    auto plan = plan_mappings(config::sunshine.port, udp_base, web_ui_on_wan);
+
+    {
+      // This plan is the own_plan that `remove_ports_async` checks against, so it never removes these mappings.
+      std::lock_guard lock {shared.mutex};
+      shared.own_plan = plan;
+      shared.planned = true;
+    }
+
+    return std::make_unique<deinit_t>(std::move(plan));
+  }
+
+  void remove_ports_async(std::set<std::uint16_t> ports) {
+    auto &shared = state();
+    std::lock_guard lock {shared.mutex};
+
+    // Without a plan from `start()` (UPnP off, or not started here) there is no guard to check, so do nothing.
+    if (!shared.planned) {
+      return;
+    }
+
+    // Guard 2: `removal_plan` drops every port this process maps and keeps only UDP entries.
+    auto entries = removal_plan(ports, shared.own_plan);
+    if (entries.empty()) {
+      return;
+    }
+
+    shared.jobs.push_back(std::move(entries));
+    if (!shared.worker_running) {
+      shared.worker_running = true;
+      std::thread {removal_worker}.detach();
+    }
   }
 }  // namespace upnp
