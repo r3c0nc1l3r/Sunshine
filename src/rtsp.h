@@ -16,6 +16,9 @@
 #include <string_view>
 #include <vector>
 
+// lib includes
+#include <boost/system/error_code.hpp>
+
 // local includes
 #include "crypto.h"
 #include "handoff/types.h"
@@ -96,7 +99,8 @@ namespace rtsp_stream {
    * result equals `session_count()` and nothing is sent. On a platform other than Linux it always equals
    * `session_count()` (the Linux-only handoff code is not compiled there). With a draining process the call sends one `SESSIONS?` and
    * waits up to 500 ms for the reply; a reply with N entries adds N. A `SESSIONS?` that gets no reply in that time
-   * (timeout, lost channel, failed send) is unknown and adds 1, so the result is then at least 1 and "no sessions" is
+   * (timeout, lost channel, failed send), and a peer that is not a `handoff::session_peer_t` (no session knowledge),
+   * are unknown and add 1, so the result is then at least 1 and "no sessions" is
    * never claimed on a guess. A draining process that is found gone while the call runs adds 0.
    *
    * Thread-safety: any thread except the RTSP loop thread's own handlers; may block up to 500 ms; holds no lock while
@@ -225,10 +229,11 @@ namespace rtsp_stream {
    * `start()`). It only records the request and does no I/O, so it cannot block.
    *
    * What `start()` then does differently: it does not call `bind`, `listen` or `set_option(reuse_address)`; it takes
-   * `::dup(fd)`, finds the address family with `getsockname`, and assigns the duplicate to the acceptor
+   * `fcntl(fd, F_DUPFD_CLOEXEC, 0)` (a close-on-exec duplicate), finds the address family with `getsockname`, and assigns the duplicate to the acceptor
    * (`acceptor.assign(tcp::v4() or tcp::v6(), dup)`). The caller's `fd` is never closed or modified, so the caller keeps
-   * ownership and may close it after `start()` has returned or the process exits; the duplicate is owned by the
-   * server and closed by `stop()`, `close_listener()` or destruction. The open file description is shared with every
+   * ownership and closing it stays the caller's job (it may close it after `start()` has returned or the process exits; the duplicate is owned by the
+   * server and closed by `stop()`, `close_listener()` or destruction, and by `start()` itself if any step after the
+   * duplicate fails (the caller's fd is never touched on any path). The open file description is shared with every
    * other holder of the socket, so its accept queue is shared too. If `paused` is `true`, `start()` arms no accept and
    * the listener accepts nothing until `resume_accept()`; connections queue in the kernel backlog. If `paused` is
    * `false` the first accept is armed as in a normal start. Either way a work guard on the `io_context` is held (see
@@ -256,8 +261,9 @@ namespace rtsp_stream {
    * `start()`, from any thread; a second call replaces the first. `start()` calls it once, on the thread that runs
    * `start()`, right after the listener was bound (a normal start) or adopted (`adopt_listener`), and before the first
    * accept is armed and before the loop runs. It is not called when binding or adopting fails. The function must not
-   * block and must not call `pause_accept`, `resume_accept` or `close_listener` (it runs on the loop thread's setup path,
-   * where those return `false`).
+   * block and must not call `pause_accept`, `resume_accept` or `close_listener` (it runs on the thread that runs `start()`
+   * while the callback runs, and `pause_accept`, `resume_accept` and `close_listener` return `false` at once there, as
+   * they do on the loop thread).
    *
    * @param callback Called with the local TCP port of the listener. An empty function removes the registration.
    */
@@ -296,8 +302,11 @@ namespace rtsp_stream {
    * them. Accept is speculative, so a connection already queued may still be accepted by a handler that had completed;
    * the pause promises only that no further accept is armed.
    *
-   * Overlap rules. All of these hold for `pause_accept`, `resume_accept` and `close_listener`, which are executed in the
-   * order their handlers are posted:
+   * Overlap rules. All of these hold for `pause_accept`, `resume_accept` and `close_listener`, whose handlers are
+   * executed in posting order. "Posting order" means: for one thread, the order of its calls; across threads, the order
+   * in which the `post` calls returned (the handlers are queued in that order). After `stop()` has run, all three return
+   * `false` at once without posting. The aborted completion of an accept cancelled by `close_listener` arms nothing,
+   * whatever flags `resume_accept` could set (the listener is closed and `resume_accept` returns `false`):
    * - Pause while a pause is in progress (two threads): both calls return `true`; the second is a barrier on the loop
    *   thread and arms and cancels nothing a second time.
    * - Resume called while a pause has not completed: the commands run in posting order, so the later call decides the
@@ -379,8 +388,11 @@ namespace rtsp_stream {
    * a launch raised right after the drop is not removed by the expiry of the dropped one). The dropped session's own
    * state in `nvhttp` is not touched. Nothing else changes: sessions, the listener and the paused state stay as they were.
    *
-   * Runs on the calling thread, not on the loop thread, so it works when the loop is not running or is blocked, and it
-   * may be called from the loop thread. All operations on the launch event and its timer (`launch_session_raise`,
+   * Runs on the calling thread, not posted to the loop's `io_context` as the plan (R6) had it: the lead accepted this
+   * mutex design because it works when the loop is not running or is blocked, and it may be called from the loop
+   * thread. The expiry timer's completion handler takes the same launch mutex, and its comparison with the session it was
+   * armed for and the pop of that session are one atomic step under it, so a drop or a raise cannot interleave between
+   * them. All operations on the launch event and its timer (`launch_session_raise`,
    * `launch_session_clear`, the timer arming and cancelling, this call) are serialised by one internal mutex that is
    * never held across a wait or a callback, because the asio timer is not safe for concurrent use.
    *
@@ -435,12 +447,13 @@ namespace rtsp_stream {
      * @brief Prepare the RTSP server to accept on a test-owned listening socket, as `start()` would, without starting a
      * loop thread or registering handlers on the global shutdown event.
      *
-     * Does what `start()` does for `adopt_listener(fd, paused)` after the adoption has been recorded: `::dup(fd)`, assign
+     * Does what `start()` does for `adopt_listener(fd, paused)` after the adoption has been recorded: `fcntl(F_DUPFD_CLOEXEC)` duplicate of `fd`, assign
      * to the acceptor, create `next_socket`, take the work guard, store `paused`, publish `listener_fd()`, call the
      * listening callback, and arm the first accept unless `paused`. The caller's `fd` is not closed. The RTSP command
      * handlers are registered if they are not yet. Call `start_loop` afterwards.
      *
-     * @param fd A bound, listening, stream TCP socket, for example a loopback socket the test created.
+     * @param fd A bound, listening, stream TCP socket, for example a loopback socket the test created. Linux only:
+     *        elsewhere this returns `false` and does nothing (and `start_loop` does nothing).
      * @param paused Whether accepting starts paused.
      * @return `true` on success; `false` when `fd` is invalid, a listener is already open (call `reset_server` first),
      *         or assignment failed (nothing changed).
@@ -492,6 +505,27 @@ namespace rtsp_stream {
      * @return The count.
      */
     std::uint64_t accept_errors();
+
+    /**
+     * @brief Make the next accept completion that `handle_accept` handles carry `ec` instead of its real result, to
+     * provoke a real accept error.
+     *
+     * The injected error is consumed by exactly one completion (success or abort) and follows the normal rules: unless
+     * it is the silent `operation_aborted` of an accept that `pause_accept` or `close_listener` cancelled, it is an
+     * Error log plus `clear()` of all sessions and no re-arm, and `accept_errors()` grows by one. A test arms it, then
+     * connects (or cancels) to trigger the completion. Cleared by `reset_server`.
+     *
+     * @param ec Error code to inject; a default-constructed one (no error) removes a pending injection.
+     */
+    void inject_accept_error(const boost::system::error_code &ec);
+
+    /**
+     * @brief Number of accepts armed whose completion handler has not yet run: 0 or 1. The invariant "at most one
+     * outstanding accept" means this never exceeds 1; it is 0 while paused once the aborted completion was handled.
+     *
+     * @return 0 or 1.
+     */
+    int outstanding_accepts();
   }  // namespace testing
 #endif
 

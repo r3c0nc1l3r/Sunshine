@@ -15,7 +15,10 @@
  * that callers waiting in `end_all`, `list`, `close` or `close_cert` fail promptly instead of running to their timeout.
  * The link does not watch the pidfd while a request waits. The link never reads the channel itself; replies reach it only through `deliver`. The
  * link is destroyed (or `runtime().set_peer(nullptr)`) after the draining process is gone and no request is in flight;
- * callers copy the `shared_ptr` from `runtime().peer()` for the duration of a call, which keeps it alive.
+ * callers copy the `shared_ptr` from `runtime().peer()` for the duration of a call, which keeps it alive. The reader's
+ * message and close handlers must keep the link alive too: either they capture the `shared_ptr<peer_link_t>`, or the glue
+ * stops the reader (`channel_reader_t::stop()`, which joins the worker) before it drops the peer, so `deliver` and
+ * `on_channel_closed` never run on a destroyed link.
  */
 #pragma once
 
@@ -99,7 +102,8 @@ namespace handoff {
      *        (its handler runs on its own thread), so the reply can take longer than 500 ms; a caller that only needs
      *        the request delivered may use a short timeout and ignore `std::nullopt`; the draining process finishes the
      *        request anyway.
-     * @return The number of sessions the draining process ended. 0 when the peer is gone. `std::nullopt` when there was
+     * @return The number of sessions the draining process ended. 0 when the peer is gone (checked once on every path
+     *         that ends without a reply, see the class comment). `std::nullopt` when there was
      *         no reply in time and the peer is not gone.
      */
     virtual std::optional<std::uint32_t> close_cert(std::string_view cert_sha256, std::chrono::milliseconds timeout) = 0;
@@ -126,11 +130,16 @@ namespace handoff {
    * same, so tests pass an `eventfd` or a pipe's read end and make it readable to "kill" the peer. A pidfd of -1 can
    * never show "gone": `gone()` is `false` and `exists()` is `true`, so the terminate rule never terminates on a guess.
    *
-   * Peer disappearing mid-request: a draining process that exits closes its channel end, so the reader sees `eof`,
-   * the glue calls `on_channel_closed()` and every waiting request wakes at once. After a wait that returned without a
-   * reply each request checks `gone()` once: gone gives the "gone" result of that member (empty list, `not_found`, 0
-   * sessions, `END_ALL` `no_reply`, which the terminate rule then reads as `peer_gone`); not gone gives the "unknown"
-   * result (`std::nullopt`, `no_reply`). The members never loop or retry on their own.
+   * Common request flow (every request member, in this order): (1) validate the arguments (an invalid hash gives
+   * `std::nullopt` first, before any gone check, and nothing is sent); (2) if `timeout <= 0`, send nothing and go to (6);
+   * (3) `_tracker.begin()` for a fresh id; (4) if `_closed` is set (`on_channel_closed` ran), go to (6); (5) send; if the
+   * send fails (closed channel, `EAGAIN`, null channel) go to (6), else wait up to `timeout` for the reply, and a reply
+   * of the wrong type for the id counts as no reply; (6) every path that ends without a reply, including (2), (4), a
+   * failed send, a timeout and a wake by `fail_all`, checks `gone()` once: gone gives the "gone" result of that member
+   * (empty list, `not_found`, 0 sessions, `no_reply` for `END_ALL`, which the terminate rule then reads as `peer_gone`),
+   * not gone gives the "unknown" result (`std::nullopt`, `no_reply`). The id is forgotten when the request ends. No
+   * member loops or retries. `on_channel_closed` sets `_closed` before it calls `fail_all`, so a request that began
+   * before it is woken and one that begins after it fails at step (4).
    */
   class peer_link_t final: public session_peer_t {
   public:
@@ -170,7 +179,8 @@ namespace handoff {
     /**
      * @brief Send `END_ALL` and wait for the reply.
      *
-     * With `timeout <= 0` nothing is sent and the result is `no_reply`. Otherwise one `END_ALL` with a fresh request id
+     * With `timeout <= 0` nothing is sent and the result is `no_reply` (the gone check does not change an `END_ALL` result).
+     * Otherwise one `END_ALL` with a fresh request id
      * is sent; the call waits up to `timeout` for the reply with that id: `ENDED` gives `ended`, `END_REJECTED` gives
      * `rejected`, and a wrong-typed reply, a timeout, a lost channel (`on_channel_closed`), a failed send, or a send on a
      * closed channel give `no_reply`. A late reply after a timeout is dropped by the tracker. Two concurrent calls send

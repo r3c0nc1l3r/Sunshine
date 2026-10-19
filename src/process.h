@@ -128,14 +128,16 @@ namespace proc {
     app_atomics_t() = default;
 
     /**
-     * @brief Copy the current values of another instance.
+     * @brief Copy the current values of another instance, one by one: `app_id`, `placebo`, `pgid`, `applied`,
+     * `released` and `adopted`.
      *
      * @param other Source.
      */
     app_atomics_t(app_atomics_t &&other) noexcept;
 
     /**
-     * @brief Copy the current values of another instance.
+     * @brief Copy the current values of another instance, one by one: `app_id`, `placebo`, `pgid`, `applied`,
+     * `released` and `adopted`.
      *
      * @param other Source.
      * @return This object.
@@ -230,6 +232,9 @@ namespace proc {
 
     /**
      * @brief Launch the configured application process.
+     *
+     * Clears the `adopted` flag (an app started here is never adopted), together with the other per-app atomics it
+     * resets at its start.
      *
      * @param app_id App ID.
      * @param launch_session Launch session.

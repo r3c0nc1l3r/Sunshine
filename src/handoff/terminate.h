@@ -26,8 +26,10 @@
  *
  * `updateClient` order when a client is disabled: (1) `rtsp_stream::terminate_sessions_by_cert(cert)` for the own
  * sessions; (2) when `cert` is not empty, `session_peer_t::close_cert(cert_sha256_hex(cert), ...)` on the peer
- * (best effort: a `std::nullopt` is logged as a Warning and ends nothing else); (3) the terminate decision above. The
- * response never depends on the peer.
+ * (best effort, timeout exactly `peer_request_timeout`, 500 ms: a `std::nullopt` is only logged as a Warning and ends
+ * nothing else); (3) the terminate decision above. Step (3) does not depend on step (2)'s reply: `total_session_count()`
+ * is read afterwards, so a peer that answered too slowly still shows its sessions and the app is kept. The response
+ * never depends on the peer.
  *
  * ## Shutdown and adopted apps
  *
@@ -103,7 +105,10 @@ namespace handoff {
    *
    * Calls `proc::proc.terminate()` while holding one process-wide mutex that only this function and `terminate_app` use,
    * so concurrent request-path terminates run one after another (the second finds no app and does nothing). The mutex is
-   * never held while waiting for permission.
+   * never held while waiting for permission. It is held across the whole `proc::proc.terminate()`, including the
+   * `undo` commands and the exit timeout, so it must never be taken while holding `client_auth_mutex` or the RTSP slots
+   * lock. Internal terminates (`execute()`, `running()`) do not take it and can still overlap a request-path terminate;
+   * that is the accepted upstream race of the wave 2A carry-over (the module narrows it and does not remove it).
    *
    * It terminates unconditionally; the caller decides whether it may be called. On the shutdown path, an app that this
    * process launched itself (`!proc::proc.adopted()`) is terminated through this function even after a refusal; an
@@ -129,7 +134,9 @@ namespace handoff {
    * @brief Number of sessions the draining process reports.
    *
    * @param timeout Longest wait for the `SESSIONS?` reply.
-   * @return 0 with nothing sent when no peer exists or the peer is gone; the number of entries of the reply; and
+   * Same mode rule as `terminate_gate`: in mode `new_pending` or `draining` the result is 0 and nothing is sent.
+   *
+   * @return 0 with nothing sent when no peer exists, the mode is `new_pending` or `draining`, or the peer is gone; the number of entries of the reply; and
    *         `std::nullopt` (unknown) when a peer exists that is not gone and gave no answer in time, or the peer has no
    *         session knowledge (it is not a `session_peer_t`). Thread-safety: any thread; blocks up to `timeout`.
    */
@@ -140,7 +147,8 @@ namespace handoff {
    *
    * @return Empty when `/launch` may proceed: no peer, or the peer reports no sessions. A non-empty one-line text (no
    *         identities) when `draining_session_count()` is above 0 or unknown (a timed-out `SESSIONS?` counts as non-zero).
-   *         Thread-safety: any thread; blocks up to 500 ms.
+   *         Same mode rule as `terminate_gate` (mode `new_pending` or `draining`: empty, nothing sent). Thread-safety: any
+   *         thread; blocks up to 500 ms; must not be called while holding `client_auth_mutex` or the RTSP slots lock.
    */
   std::string launch_refusal();
 
