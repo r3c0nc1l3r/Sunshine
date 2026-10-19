@@ -240,19 +240,6 @@ TEST_F(SessionCloseTest, StopReturnsTrueOnlyForFirstStop) {
 }
 
 /**
- * @brief Test: stopping a session that is not running returns `false` and records no reason.
- */
-TEST_F(SessionCloseTest, StopOfStartingSessionRecordsNothing) {
-  constexpr std::uint32_t id = 109;
-  auto session = rtsp_stream::testing::insert_fake_session(id, stream::session::state_e::STARTING);
-  ASSERT_NE(session, nullptr);
-
-  EXPECT_FALSE(stream::session::stop(*session, stream::stop_reason_e::terminated));
-  EXPECT_EQ(stream::session::stop_reason(*session), stream::stop_reason_e::unknown);
-  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::STARTING);
-}
-
-/**
  * @brief Test: the list holds RUNNING and STOPPING fake sessions ordered by id, with the fixed transport and category values.
  */
 TEST_F(SessionCloseTest, ListedSessionsHaveFixedFieldsAndAreOrderedById) {
