@@ -26,6 +26,7 @@ extern "C" {
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
+#include "handoff/hooks.h"
 #include "input.h"
 #include "logging.h"
 #include "network.h"
@@ -1440,8 +1441,8 @@ namespace stream {
         }
       }
 
-      // Records `terminated` only if this call stops a running session; an already stopping session keeps its reason.
-      session::stop(*session, stop_reason_e::terminated);
+      // Records the shutdown reason only if this call stops a running session; an already stopping session keeps its reason.
+      session::stop(*session, rtsp_stream::to_stop_reason(handoff::hooks::shutdown_reason()));
 
       session->shutdown_event->raise(true);
       session->controlEnd.raise(true);

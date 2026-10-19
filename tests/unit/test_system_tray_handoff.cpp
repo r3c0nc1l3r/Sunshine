@@ -34,6 +34,7 @@ namespace {
     int init_calls = 0;  ///< Calls of `init`.
     int loop_calls = 0;  ///< Calls of `loop`.
     int exit_calls = 0;  ///< Calls of `exit`.
+    int poll_calls = 0;  ///< Calls of `poll`.
     int init_failures = 0;  ///< The next this-many `init` calls fail.
     int zero_loops = 0;  ///< The next this-many `loop` calls return 0 at once (one served event).
     bool in_loop = false;  ///< A `loop` call is blocked.
@@ -127,6 +128,16 @@ namespace {
     }
   }
 
+  void fake_poll() {
+    std::lock_guard lk {g_fake.m};
+    ++g_fake.poll_calls;
+    if (g_fake.queued_mode && g_fake.queued_exit) {
+      // Delivers the queued exit event without blocking: the old icon is torn down now.
+      g_fake.queued_exit = false;
+      g_fake.icon_up = false;
+    }
+  }
+
   void release_fake() {
     std::lock_guard lk {g_fake.m};
     g_fake.released = true;
@@ -183,13 +194,13 @@ namespace {
       st::reset_lifecycle_for_testing();
       g_fake.init_failures = 0;
       g_fake.zero_loops = 0;
-      g_fake.init_calls = g_fake.loop_calls = g_fake.exit_calls = 0;
+      g_fake.init_calls = g_fake.loop_calls = g_fake.exit_calls = g_fake.poll_calls = 0;
       g_fake.in_loop = g_fake.wake = g_fake.stuck = g_fake.released = false;
       g_fake.unstick = g_fake.queued_mode = g_fake.queued_exit = g_fake.icon_up = false;
       g_fake.in_loop_hook = nullptr;
       g_fake.init_thread = g_fake.loop_thread = {};
       shutdown_flag_ = false;
-      st::set_backend_for_testing({&fake_init, &fake_loop, &fake_exit});
+      st::set_backend_for_testing({&fake_init, &fake_loop, &fake_exit, &fake_poll});
       st::set_enabled_for_testing(true);
     }
 
@@ -600,6 +611,12 @@ TEST_F(TrayLifecycleHandoffTest, StaleQueuedExitDoesNotKillTheResumedIcon) {
   suspender.join();
   ASSERT_TRUE(suspended_future.get());
   ASSERT_TRUE(phase_becomes(st::tray_phase_e::suspended));
+  {
+    std::lock_guard lk {g_fake.m};
+    EXPECT_GE(g_fake.poll_calls, 1) << "completing a pending suspend must call the backend's poll so the queued exit reaches the old icon";
+    EXPECT_FALSE(g_fake.queued_exit) << "no exit event may stay queued once the suspend completed";
+    EXPECT_FALSE(g_fake.icon_up) << "the old icon must be gone after the suspend";
+  }
   ASSERT_TRUE(st::resume()) << "resume after suspend must be accepted";
   EXPECT_TRUE(phase_becomes(st::tray_phase_e::running)) << "the icon must come back";
   std::this_thread::sleep_for(250ms);
