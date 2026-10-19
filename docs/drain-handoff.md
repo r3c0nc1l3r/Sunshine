@@ -136,13 +136,19 @@ the death is still seen through the pidfd (it becomes readable), and the exit st
   `/serverinfo` reports) with a probe identity (build id, GPU render node and vendor/device id, driver version). The new
   process uses them only when the identity matches its own, and only for `/serverinfo` (see "GPU"). The old process's
   `HELLO` also carries its cooldown deadline, which the new process inherits, and a pidfd of the old process itself
-  (`pidfd_open(getpid())`, sent with `SCM_RIGHTS`), so the new process holds the right process without any pid lookup
-  (a pid number can be reused later; the pidfd still refers to the old process). A `HELLO` without it is a failed
-  `READY`. The app state is not sent here: the old
-  process keeps serving until the switch, so it is sent in `GO`.
+  (`pidfd_open(getpid())`, sent with `SCM_RIGHTS` and received with `MSG_CMSG_CLOEXEC`, so no app inherits it), so the
+  new process holds the right process without any pid lookup (a pid number can be reused later; the pidfd still refers
+  to the old process). A `HELLO` without it is a failed `READY`. The app state is not sent here: the old process keeps
+  serving until the switch, so it is sent in `GO`.
 - It adopts the sockets instead of binding them (this needs small patches: Simple-Web-Server `start()` must accept an
   existing listening socket, and the RTSP acceptor in `rtsp.cpp` must adopt one instead of `bind`/`listen`), starts its
   servers with accepting paused (see "Pausing accept"), and sends `READY` (or a failed `READY` with a reason).
+- In handoff mode it defers everything that announces it or acts as the host until `COMMIT` (step 5): it does not call
+  `platf::publish::start()` (mDNS) or `upnp::start()`, which a normal start runs right after `http::init()`, and does
+  not call `system_tray::init_tray()`, which a normal start runs after starting the server threads [C37]; so it has no
+  tray icon and no tray Quit or restart entries. Its instance file shows role `pending` (see "Active-port discovery").
+  On `COMMIT` it starts mDNS, UPnP and the tray and writes role `active`. A new process that exits before `COMMIT` has
+  published nothing, mapped no port and shown no icon.
 - If the channel reports end-of-file or an error before `GO`, the new process exits with status 1.
 
 ### 4. Failed start
@@ -169,44 +175,51 @@ On `READY` the old process, in this order:
    on separate threads: a handler first increments the counter, then checks the gate (and if it is set, decrements and
    answers 503); the switcher first sets the gate, then waits for zero (sequentially consistent atomics). Only these
    counters are waited on. A launch that answers during this wait raises a launch session (its `do` commands have run);
-   step 4 handles it. The wait is bounded (5 s). If it times out, the handoff fails: the old process kills the new
-   process and waits for it to be reaped (the kill-first rule, step 6), removes the new process's instance file, lifts
-   the 503 gate, resumes accepting, and answers the helper non-zero. Clients that got a 503 during the attempt retry;
+   switch substep 4 handles it. The wait is bounded (5 s). If it times out, the handoff fails: the old process kills the
+   new process and waits for it to be reaped (the kill-first rule, step 6), removes the new process's instance file,
+   lifts the 503 gate, resumes accepting, and answers the helper non-zero. Clients that got a 503 during the attempt
+   retry;
 4. repeats the step-1 checks that can have changed since then: an app that is not adoptable fails the handoff as in
-   step 3. A pairing session (the map holds it while it waits for the PIN, after `/pair` has answered [C14]) can only
-   end now, because the gate refuses new ones: the old process waits for it to finish or expire, up to `ping_timeout`,
-   and fails the handoff as in step 3 if one remains. A pending launch [C5] is dropped at once (the launch event is
-   popped and its timer cancelled): with accepting paused it could only expire, its client's RTSP connection waits in
-   the shared accept queue and reaches the new process, so the stream fails once and the client retries; the app it
-   started is adopted like any other;
+   switch substep 3. A pairing session (the map holds it while it waits for the PIN, after `/pair` has answered [C14])
+   can only end now, because the gate refuses new ones: the old process waits for it to finish or expire, up to
+   `ping_timeout`, and fails the handoff as in switch substep 3 if one remains. A pending launch [C5] is dropped at once
+   (the launch event is popped and its timer cancelled): with accepting paused it could only expire, its client's RTSP
+   connection waits in the shared accept queue and reaches the new process, so the stream fails once and the client
+   retries; the app it started is adopted like any other;
 5. writes `sunshine_state.json` once more (and `apps.json`, which only the web UI's app save writes, needs no extra
    write), under `client_auth_mutex`, so a pairing that completed
    just before the switch is on disk (`save_state` is called directly; `FRESH_STATE`, which skips it [C29], is refused
    at startup);
 6. freezes its state: it writes neither file nor the credentials file again unless it rolls back;
 7. withdraws its mDNS service (see "mDNS") and removes its tray icon;
-8. sends `GO` with a snapshot taken now: its running placebo app or none (see "App ownership and prep commands"), its
+8. takes the snapshot that `GO` carries: its running placebo app or none (see "App ownership and prep commands"), its
    current `host_audio` setting (the value `/resume` uses [C28]), and the next launch session id [C28];
 9. checks its shutdown flag (a `SIGTERM` that has arrived aborts the handoff with the kill-first rollback of step 6),
    sets the release flag (see "App ownership and prep commands"), and only then sends `GO`. The handoff worker is
    joined before the `proc` deinit guard runs `terminate()` [C10], so a shutdown never runs `undo` while the snapshot is
    taken or `GO` is in flight;
-10. waits for the new process's `GO_ACK` (5 s). On `ok` it sends `COMMIT` and answers the helper: switched (exit 0).
-    On a failed `GO_ACK` (with a reason), a timeout, a failed `COMMIT` send, a channel error or a dead new process, it
-    rolls back with the kill-first rule of step 6 (it is still the main process), which clears the release flag, and
-    answers the helper non-zero. Releasing before `GO` means that a stop of both processes in between can at worst
-    lose the `undo` commands, never run them twice.
+10. waits for the new process's `GO_ACK` (5 s, on the monotonic clock from the `GO` send; a `GO_ACK` read after that
+    deadline, for example because the old process was stopped, counts as a timeout and gets no `COMMIT`). On `ok` it
+    sends `COMMIT` and answers the helper: switched (exit 0). On a failed `GO_ACK` (with a reason), a timeout, a failed
+    `COMMIT` send, a channel error or a dead new process, it rolls back with the kill-first rule of step 6 (it is still
+    the main process), which clears the release flag, and answers the helper non-zero. Releasing before `GO` means that
+    a stop of both processes in between can at worst lose the `undo` commands, never run them twice.
 
 The new process writes no state file before `GO`. On `GO` it reloads `sunshine_state.json` (`load_state` also rebuilds
-the trusted client certificate chain [C30]), the credentials file and `apps.json`, all under `client_auth_mutex`. After
-the `apps.json` reload (a reload replaces the whole `proc_t` [C31]) it checks the snapshot against its own app list and
-prepares the adoption, but installs nothing yet. Then it sends `GO_ACK ok` (or a reason) and waits for `COMMIT`:
+the trusted client certificate chain [C30]), the credentials file and `apps.json`, all under `client_auth_mutex`. Each
+reload must return a status: today `load_state` returns nothing and, when the file cannot be read, logs an Error and
+keeps the state it had [C38]. A reload that fails is a failed `GO_ACK` with the reason. After the `apps.json` reload (a
+reload replaces the whole `proc_t` [C31]) it checks the snapshot against its own app list and prepares the adoption, but
+installs nothing yet. Then it sends `GO_ACK ok` (or a reason) and waits for `COMMIT`:
 
 - On `COMMIT` it installs the adoption (the app, `host_audio`, the session id counter), resumes accepting, publishes
-  mDNS and starts its tray icon. Only from here on can it run any `undo` command.
+  mDNS, maps its UPnP ports, starts its tray icon and writes role `active` (see step 3). Only from here on can it run
+  any `undo` command.
 - After a failed `GO_ACK`, or with no `COMMIT` within 5 s of its `GO_ACK`, or on a channel error before `COMMIT`, it
   exits with status 1 by itself and has adopted nothing: no app, no accept, no mDNS, no tray. Its exit runs no `undo`
-  (it holds no app). The old process does not rely on this: every rollback still kills it first.
+  (it holds no app). A `COMMIT` read after that bound (on the monotonic clock) is ignored; the old process then sees the
+  new process die before `MAIN` and rolls back (step 6). The old process does not rely on any of this: every rollback
+  still kills it first.
 
 It sends nothing to systemd yet: the old process stays the unit's main process until the handover (step 7).
 
@@ -241,24 +254,33 @@ re-arm its accept after `operation_aborted`, so resuming must start its accept a
   step 7 keeps failing), a dead or hung new process triggers a rollback. No rollback happens after a successful
   read-back (step 7).
 - **Kill-first rule.** Every rollback, on every path (a failed start in step 4, a failed step 3 or step 4 of the switch,
-  a failed or late `GO_ACK`, a failed `COMMIT` send, missed `PONG`s, a channel error, a dead new process, a failing
-  handover), starts the same way, whatever the new process does: the old process sends `SIGKILL` through the pidfd
-  (`pidfd_send_signal`; harmless if it is already dead), then waits until the pidfd is readable and the child is reaped
-  (`waitid(P_PIDFD)`; `ECHILD` because another `waitpid(-1)` reaped it also counts [C27]). The wait is bounded (5 s);
-  if the process is still not gone, the old process keeps the gate up and accepting paused, logs an Error, and sends
-  `SIGKILL` again every 5 s. Only once the new process is gone does it continue with the steps below, so a slow or
-  stuck new process can never accept, publish mDNS or hold the app next to the old one.
+  a failed or late `GO_ACK`, a failed `COMMIT` send, missed `PONG`s, a channel error, a dead new process, the step-7.1
+  liveness check failing, a dead or hung new process during step 7), starts the same way, whatever the new process does:
+  the old process sends `SIGKILL` through the pidfd (`pidfd_send_signal`; harmless if it is already dead), then waits
+  until the pidfd is readable and the child is reaped (`waitid(P_PIDFD)`; `ECHILD` because another `waitpid(-1)` reaped
+  it also counts [C27]). The wait is bounded (5 s); if the process is still not gone, the old process leaves the gate
+  and accepting as they are (up and paused once the switch has begun; a failed start never paused them, and the new
+  process cannot accept before `COMMIT`), logs an Error, sends `SIGKILL` again every 5 s, and makes the stuck kill
+  visible (next item). Only once the new process is gone does it continue with the steps below, so a slow or stuck new
+  process can never accept, publish mDNS or hold the app next to the old one.
+- A kill that does not complete within its 5 s wait is visible: the old process answers a waiting helper non-zero with
+  the reason `kill_pending`, shows `handoff` `kill_pending` in its instance file and in `/api/sessions` responses, and
+  logs an Error every 5 s until the reap, after which it continues the rollback and returns to `none`.
 - A death of the new process between `READY` and `GO` is handled as a full rollback too.
-- After the kill-first step, the old process, in this order: waits for the in-flight counters to reach zero (the
-  gate is still up, so they only fall; it keeps the gate up and waits as long as needed, logging a Warning every 5 s,
-  and never swaps while a counted request runs), reloads both state files and the credentials file and swaps in the app
-  list (see "App ownership and prep commands"), takes the app back or drops it, then lifts the 503 gate, resumes
-  accepting on its socket copies, publishes mDNS, restores its tray icon, and leaves drain mode. Nothing is reloaded
-  while the gated routes are served, and the routes that stay open do not read the app list. systemd sees no
-  main-process exit, so the unit and the old process's sessions are not affected. The new process's sessions are lost;
-  apps it launched and `do` commands it ran are not undone (logged as a Warning), and its instance file is removed by
-  the old process. After a rollback the old process takes back app ownership (see "App ownership and prep commands") and
-  makes its own virtual sink the default sink again if it has sessions.
+- After the kill-first step, the old process, in this order: waits for the in-flight counters to reach zero (the gate is
+  still up, so they only fall; it keeps the gate up and waits as long as needed, logging a Warning every 5 s, and never
+  swaps while a counted request runs), reloads both state files and the credentials file and swaps in the app list (see
+  "App ownership and prep commands"; a reload that fails keeps the in-memory state the old process froze at switch
+  substep 6 and logs an Error, so the rollback always completes), takes the app back or drops it, then lifts the 503
+  gate, resumes accepting on its socket copies, publishes mDNS, restores its tray icon, and leaves drain mode. Nothing
+  is reloaded while the gated routes are served, and the routes that stay open do not read the app list. Steps for a
+  switch step that never happened are skipped: a failed start (step 4) and a failure in switch substep 3 or 4 come
+  before the freeze and the mDNS withdraw, so they skip the reload, the swap, the take-back and the republish, and lift
+  the gate and resume accepting only if they were set. systemd sees no main-process exit, so the unit and the old
+  process's sessions are not affected. The new process's sessions are lost; apps it launched and `do` commands it ran
+  are not undone (logged as a Warning), and its instance file is removed by the old process. After a rollback the old
+  process takes back app ownership (see "App ownership and prep commands") and makes its own virtual sink the default
+  sink again if it has sessions.
 - `END_ALL` against rollback, in the old process: one state, `idle`, `ending`, `ended` or `rolling_back`, changed
   under a mutex that is never held across a join or a channel send (sends use `MSG_DONTWAIT`).
   - `END_ALL` in `idle` moves to `ending`, ends and joins the sessions, sends `ENDED`, and moves to `ended`.
@@ -267,9 +289,10 @@ re-arm its accept after `operation_aborted`, so resuming must start its accept a
   - `END_ALL` in `rolling_back` is answered `END_REJECTED`; the active process treats it like a timeout.
   - The state starts at `idle` for each handoff. An `ENDED` that cannot be sent (`EAGAIN`) is logged; the active
     process then times out and does not terminate, which is safe.
-  - A rollback decided in `idle` moves to `rolling_back` and takes the app back. A rollback decided in `ending` or
-    `ended` drops the app (no `undo`, never taken back): the new process may have run, or may be about to run, the
-    `undo` commands, so the claim is given up as soon as ending has started. This can lose an `undo`, never double it.
+  - Every rollback moves the state to `rolling_back` when it is decided, before the kill-first step. A rollback decided
+    in `idle` takes the app back. A rollback decided in `ending` or `ended` drops the app (no `undo`, never taken back):
+    the new process may have run, or may be about to run, the `undo` commands, so the claim is given up as soon as
+    ending has started. This can lose an `undo`, never double it.
 - A death of the new process while the old process is itself shutting down (`SIGTERM`, `systemctl stop`) starts no
   rollback.
 - If the old process crashes inside the window: it is the main process, so systemd stops the unit and the new process
@@ -319,11 +342,13 @@ get reason `drain-deadline`.
   drain deadline. `TimeoutStopSec=30` is enough.
 - `SIGTERM` to the draining process alone (by pid) ends only its sessions, with reason `stop`. This is the way to end
   draining sessions when the channel is lost.
-- `SIGTERM` to the new process alone before `MAIN`: its shutdown terminates the adopted app, so it sends `END_ALL`
-  first, which ends the old process's sessions; the old process then sees the new one die and rolls back with no app and
-  no sessions. The `undo` commands run at most once (the shutdown budget is 5 s, and the old process's joins can take up
-  to 10 s, so they can be skipped); the old sessions are lost. Use `systemctl reload` again or `systemctl restart`
-  instead.
+- `SIGTERM` to the new process alone before `COMMIT`: it holds no app, so it sends no `END_ALL` and runs no `undo`; it
+  exits, and the old process rolls back (kill-first), keeps its sessions and takes the app back.
+- `SIGTERM` to the new process alone between `COMMIT` and `MAIN`: its shutdown terminates the adopted app, so it sends
+  `END_ALL` first, which ends the old process's sessions; the old process then sees the new one die and rolls back with
+  no app and no sessions. The `undo` commands run at most once (the shutdown budget is 5 s, and the old process's joins
+  can take up to 10 s, so they can be skipped); the old sessions are lost. Use `systemctl reload` again or `systemctl
+  restart` instead.
 - In-place restart (`/api/restart`, tray restart; both `execv` the binary):
   - in the active role while a draining process exists or a handoff is in progress: refused (409 for the API, a
     Warning in the log). The 409 body names the ways out: wait for the drain, `SIGTERM` to the draining pid (ends its
@@ -352,12 +377,13 @@ get reason `drain-deadline`.
   an error closes the channel and logs an Error. Before `MAIN` the old process then kills the new process and rolls
   back (step 6); after `MAIN` the rule below applies.
 - Messages (requests carry a request id; replies echo it): `HELLO` (version, capabilities, probe results and identity,
-  cooldown deadline), `READY` (ok or reason), `MAIN` (handover done), `PING`/`PONG`, `SESSIONS?`/`SESSIONS` (list),
-  `CLOSE <id>`/`CLOSED <result>`, `CLOSE_CERT <hash>`/`CLOSED <count>`, `END_ALL`/`ENDED` or `END_REJECTED` (see "App
-  ownership and prep commands"), `GO` (with the snapshot)/`GO_ACK <ok|reason>`, `COMMIT`, and the draining process's
-  unsolicited `HANDOFF_STATE <state>`. Requests from the active process (`SESSIONS?`, `CLOSE`, `CLOSE_CERT`) time out
-  after 500 ms (late replies are dropped by request id), `END_ALL` after 15 s (it waits for session joins, which have a
-  10 s hang guard); they are sent only from request handlers, never while holding a lock.
+  cooldown deadline; the old process's `HELLO` also attaches its own pidfd), `READY` (ok or reason), `MAIN` (handover
+  done), `PING`/`PONG`, `SESSIONS?`/`SESSIONS` (list), `CLOSE <id>`/`CLOSED <result>`, `CLOSE_CERT <hash>`/`CLOSED
+  <count>`, `END_ALL`/`ENDED` or `END_REJECTED` (see "App ownership and prep commands"), `GO` (with the
+  snapshot)/`GO_ACK <ok|reason>`, `COMMIT`, and the draining process's unsolicited `HANDOFF_STATE <state>`. Requests
+  from the active process (`SESSIONS?`, `CLOSE`, `CLOSE_CERT`) time out after 500 ms (late replies are dropped by
+  request id), `END_ALL` after 15 s (it waits for session joins, which have a 10 s hang guard); they are sent only from
+  request handlers, never while holding a lock.
 - When the channel closes after `MAIN`, neither side ends any session: the draining process keeps draining, the active
   process keeps serving. The active process then no longer lists or closes the draining sessions (it logs a Warning)
   and keeps refusing handoffs while the draining instance file exists.
@@ -436,10 +462,11 @@ app: it has no process, and it is never executed again. The last session's end l
 - The snapshot in `GO` (step 5) describes the old process's running placebo app, or none: the app id and name, the
   number of applied prep commands (`_app_prep_it - _app_prep_begin`), a digest of its merged prep list (each entry's
   `do`, `undo` and `elevated`), of the app's `working-dir`, `output` and `exit-timeout`, and of the base environment the
-  commands run with (the process environment plus the `apps.json` `env` section [C35], without `SUNSHINE_HANDOFF_*`);
-  the digest is computed over an ordered, length-prefixed encoding, so `("a","bc")` and `("ab","c")` differ, and the
-  launch environment the commands ran with (the `SUNSHINE_*` variables set by `execute` [C18]). It is taken after the
-  gate is up and the in-flight requests have finished, so no launch or cancel can change it afterwards.
+  commands run with (the process environment plus the `apps.json` `env` section [C35], without `SUNSHINE_HANDOFF_*`).
+  The digest is computed over an ordered, length-prefixed encoding, so `("a","bc")` and `("ab","c")` differ. The
+  snapshot also carries, as data and not in the digest, the launch environment the commands ran with (the `SUNSHINE_*`
+  variables set by `execute` [C18]), which the new process uses for the `undo` commands. It is taken after the gate is
+  up and the in-flight requests have finished, so no launch or cancel can change it afterwards.
 - The new process adopts the app only when its freshly reloaded `apps.json` has the same id and name and its merged
   prep list has the same digest. Adoption is a new `proc_t` method (the fields are private): it sets the app id, the
   app (from its own `apps.json`, which also gives `get_last_run_app_name()`), `_app_prep_begin` and `_app_prep_it`
@@ -523,9 +550,10 @@ app: it has no process, and it is never executed again. The last session's end l
 - The web UI listener belongs to the active process.
 - `GET /api/sessions` there lists its own sessions and the draining process's sessions (`SESSIONS?` over the channel).
   Each entry has one more key, `draining` (bool), always present (`false` when the feature is off). The reply has one
-  more top-level key, `handoff`, always present: `"none"` (no handoff state), `"draining"` (a draining process exists)
-  or `"handover_failed"` (the main-PID handover keeps failing, step 7). `docs/api.md` and the key-set test change with
-  both. Ids are unique across both processes.
+  more top-level key, `handoff`, always present: `"none"` (no handoff state), `"draining"` (a draining process exists),
+  `"handover_failed"` (the main-PID handover keeps failing, step 7), or `"kill_pending"` (a rollback waits for the new
+  process to be reaped, step 6). `docs/api.md` and the key-set test change with both. Ids are unique across both
+  processes.
 - `POST /api/sessions/<id>/close` closes either kind; for a draining session the request goes over the channel. The
   audit line is unchanged and is written by the active process.
 - `/serverinfo` `currentgame` and `/cancel` refer to the active process's app only.
@@ -554,7 +582,9 @@ and writes only that file (a temporary file plus rename):
 | Event | Old process file | New process file | `/api/sessions` `handoff` |
 |-------|------------------|------------------|---------------------------|
 | normal operation | `none` | (none) | `none` |
-| switch (`GO`) | role `draining`, `draining` | role `active`, `draining` | `draining` |
+| new process started, until `COMMIT` | `none` | role `pending`, `none` | `none` |
+| switch (`COMMIT`) | role `draining`, `draining` | role `active`, `draining` | `draining` |
+| rollback kill not yet complete | role `active`, `kill_pending` | unchanged (removed by the old process after the reap) | `kill_pending` |
 | handover attempt fails (step 7) | `handover_failed` (+ `HANDOFF_STATE handover_failed`) | `handover_failed` | `handover_failed` |
 | handover succeeds after failures | `draining` (+ `HANDOFF_STATE draining`) | `draining` | `draining` |
 | old process exits | file deleted | `none` | `none` |
@@ -564,8 +594,9 @@ The draining process serves no web UI; the active process reports the state from
 or from the draining process's file when the channel is gone.
 
 - `start_time` is field 22 of `/proc/<pid>/stat`; an entry whose pid now has another start time is stale (pid reuse).
-- A process writes its file at startup and on every role change and session start or end, and deletes it on exit. No
-  process writes another process's file, except that the old process removes a dead new process's file on rollback.
+- A process writes its file at startup (a new process in handoff mode with role `pending`, which becomes `active` only
+  at `COMMIT`) and on every role change and session start or end, and deletes it on exit. No process writes another
+  process's file, except that the old process removes a dead new process's file on rollback.
 - Consumers read every file in the directory and ignore stale ones.
 - Fail-safe rule for consumers: treat Sunshine as busy when the directory is missing while a Sunshine process runs,
   when a running Sunshine process has no file, when any file is unreadable, or when any instance has sessions above 0
@@ -592,9 +623,10 @@ RuntimeDirectory=sunshine
   `READY` or `MAINPID`.
 - `ExecReload` exits 0 when the switch happened (step 5), and non-zero, with the reason on stderr (so it lands in the
   journal and in `systemctl reload`'s failure), when the handoff was refused or failed. Its wait is bounded by
-  `drain_handoff_ready_timeout` plus `ping_timeout` plus 20 s (the in-flight wait, the step-4 wait, `GO_ACK` and the
-  mDNS withdraw; 60 s with the defaults). systemd applies `TimeoutStartSec` to `ExecReload`; the default 90 s is enough
-  (verify on the target version).
+  `drain_handoff_ready_timeout` plus `ping_timeout` plus 25 s (the in-flight wait, the step-4 wait, the mDNS withdraw,
+  `GO_ACK` and one kill-first wait, 5 s each, plus margin; 65 s with the defaults). When the kill is still pending at
+  the end of that wait, the helper exits non-zero with `kill_pending`. systemd applies `TimeoutStartSec` to
+  `ExecReload`; the default 90 s is enough (verify on the target version).
 - Minimum systemd: 254 (tracking a main PID that is not the manager's child through a pidfd). The active process checks
   the version before a handoff (step 1), and the read-back in step 7 guards against a refused `MAINPID`.
 - The default `KillMode=control-group` stays.
@@ -617,8 +649,8 @@ RuntimeDirectory=sunshine
   - the switch re-checks: an app process, a pairing session or a pending launch that appears after step 1 delays or
     fails the switch;
   - the spawn fd placement when the sources already sit at fds 3-7, and a child reaped by another `waitpid(-1)`;
-  - the draining process's revocation backstop: a disabled or removed client in a rewritten state file ends its
-    sessions;
+  - the draining process's revocation backstop: a client disabled in a rewritten state file ends its sessions; a
+    removed client, or an unreadable or partial file, ends none;
   - app adoption: matching id, name and prep digest adopts in placebo mode with the same number of prep commands applied
     and the received environment; any mismatch is a failed `GO_ACK` and a rollback; a terminate after adoption runs each
     applied `undo` once, in reverse, with the received environment; a released app runs no `undo` at terminate or exit,
@@ -630,7 +662,11 @@ RuntimeDirectory=sunshine
   - kill-first: every rollback path sends `SIGKILL` through the pidfd and waits for the reap before resuming accept,
     mDNS or the app; a new process that ignores `SIGTERM` or is stopped is still gone before the old one accepts;
   - `COMMIT`: without it within 5 s, or after a failed `GO_ACK`, the new process exits and has adopted, accepted and
-    published nothing;
+    published nothing; before `COMMIT` (at `READY`, at `GO_ACK`, and at the `COMMIT` timeout) a new process has called
+    neither `platf::publish::start()` nor `upnp::start()` nor `init_tray()`, and its instance file shows role
+    `pending`;
+  - a reload that fails on `GO` is a failed `GO_ACK`; a reload that fails on rollback keeps the frozen state;
+  - a kill that does not complete in 5 s shows `kill_pending` and answers the helper non-zero;
   - `systemctl stop` (both processes get `SIGTERM`) between `GO` and `GO_ACK`: the `undo` commands run at most once;
   - the `END_ALL` state machine: `END_REJECTED` while rolling back, a rollback during `ending` or after `ended` drops
     the app, the mutex is never held across a join or a send;
@@ -640,7 +676,8 @@ RuntimeDirectory=sunshine
     the active process does not terminate; `/cancel` with no running app still sends `END_ALL`;
   - a rollback waits for in-flight `/applist` and `/appasset` before swapping the app list; after a successful
     read-back no rollback happens;
-  - `SIGTERM` to the new process alone before `MAIN`: `undo` at most once, the old process rolls back with no app;
+  - `SIGTERM` to the new process alone before `COMMIT`: no `END_ALL`, no `undo`, the old process rolls back with its
+    sessions and the app; between `COMMIT` and `MAIN`: `undo` at most once, the old process rolls back with no app;
   - a pause that races a successful accept does not re-arm; rollback swaps the app list while the control loop polls
     `running()` and never sees 0;
   - `END_ALL`: every terminate path waits for `ENDED` (or the draining process's pidfd, opened at `HELLO`, showing it
@@ -726,10 +763,15 @@ RuntimeDirectory=sunshine
   35. the new process cancels the adopted app and then dies inside the window: the old process rolls back without
       taking the app back, and no `undo` line appears twice;
   36. the RTSP loop of a draining process uses no measurable CPU while idle, and a rollback accepts RTSP again;
-  37. a new process that delays `GO_ACK` by more than 5 s (test hook): the old process kills it, waits for the reap,
-      rolls back, and is the only process accepting and publishing mDNS; the new process never accepted a connection;
+  37. a new process that delays `GO_ACK` by more than 5 s (a test hook compiled only into test builds, under
+      `SUNSHINE_TESTS`, never into a release binary): the old process kills it, waits for the reap, rolls back, and is
+      the only process accepting and publishing mDNS; the new process never accepted a connection;
   38. with any `capture` setting other than `wlr` (for example `kms`, `kwin`, or empty), the feature refuses to enable
-      with an Error naming the setting, and a reload is refused.
+      with an Error naming the setting, and a reload is refused;
+  39. the old process is stopped with `SIGSTOP` right after it sends `GO`: the new process sends `GO_ACK`, gets no
+      `COMMIT`, and exits within about 5 s; while it ran it accepted no connection, published no mDNS entry, mapped no
+      UPnP port and showed no tray icon, and its instance file never showed role `active`. After `SIGCONT` the old
+      process rolls back (kill-first) and serves alone.
 
 ## Out of scope
 - Moving a live session from one process to another (not possible without client support).
@@ -778,3 +820,5 @@ Base: fork branch `lanternbox` at `75612545`. Line numbers are for that commit.
 | C34 | KWin grants its screencast interface by a `.desktop` file that names the current executable. | `src/platform/linux/kwingrab.cpp:43-50` |
 | C35 | The base environment of app and prep commands is the process environment plus the `apps.json` `env` section, built when the apps are loaded. | `src/process.cpp:674-679`, `:787-788` |
 | C36 | Linux capture backends are enabled from the `capture` setting. When it is empty, the first of NvFBC, wlr and KMS that verifies is enabled, X11 and portal are added whenever they verify, and kwin only if nothing else was enabled. | `src/platform/linux/misc.cpp:1376-1406` |
+| C37 | A normal start publishes mDNS (`platf::publish::start()`) and maps UPnP ports (`upnp::start()`) on async tasks right after `http::init()`, before the server threads start, and starts the tray (`system_tray::init_tray()`) after them. | `src/main.cpp:476-484`, `:491-493`, `:503-517` |
+| C38 | `load_state` returns nothing; when the state file cannot be read it logs an Error and returns, keeping the state it had. | `src/nvhttp.cpp:366-381` |
