@@ -342,12 +342,12 @@ namespace portal {
     }
 
     std::vector<pipewire_streaminfo_t> pipewire_streams;  ///< Pipewire streams.
-    int pipewire_fd;  ///< Pipewire fd.
+    int pipewire_fd = -1;  ///< Pipewire fd, or -1 while no remote is open.
 
   private:
-    GDBusConnection *conn;
-    GDBusProxy *screencast_proxy;
-    GDBusProxy *remote_desktop_proxy;
+    GDBusConnection *conn = nullptr;
+    GDBusProxy *screencast_proxy = nullptr;
+    GDBusProxy *remote_desktop_proxy = nullptr;
     std::string session_handle;
 
     int create_portal_session(GMainLoop *loop, gchar **session_path_out, const gchar *session_token, bool use_screencast) {
