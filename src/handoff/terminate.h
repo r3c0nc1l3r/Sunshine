@@ -79,6 +79,16 @@ namespace handoff {
   constexpr std::chrono::milliseconds shutdown_terminate_budget {5000};  ///< Budget of the shutdown path (inside the 10 s forced-shutdown limit).
 
   /**
+   * @brief Budget the request-path callers pass to the gate (`/cancel`, close app, update client, unpair, unpair-all).
+   *
+   * Returns `request_terminate_budget` (15 s), or in test builds the value set with `set_request_budget_for_test`. The
+   * callers in `nvhttp.cpp` and `confighttp.cpp` pass `request_budget()`, never the constant directly.
+   *
+   * @return The budget.
+   */
+  std::chrono::milliseconds request_budget();
+
+  /**
    * @brief Ask for permission to terminate the app.
    *
    * Wraps `await_terminate_permission(*runtime().peer(), budget)`:
@@ -163,5 +173,12 @@ namespace handoff {
    * @param terminate The function to call; an empty function restores the real call.
    */
   void set_terminate_for_test(std::function<void()> terminate);
+
+  /**
+   * @brief Test-only: override the budget `request_budget()` returns, so a refusal test needs no 15 s wait.
+   *
+   * @param budget New budget; zero or negative restores `request_terminate_budget`.
+   */
+  void set_request_budget_for_test(std::chrono::milliseconds budget);
 #endif
 }  // namespace handoff
