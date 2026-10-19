@@ -10,7 +10,10 @@
  * and the old process's pidfd (received with `HELLO`), stores it with `runtime().set_peer(link)`, and starts a
  * `channel_reader_t(channel, answer_pings=true, ...)` whose message handler calls `link->deliver(received.message)` for
  * every message it does not handle itself (`MAIN` and the like), and whose close handler calls
- * `link->on_channel_closed()`. The link never reads the channel itself; replies reach it only through `deliver`. The
+ * `link->on_channel_closed()`. Requirement on that glue (P18): it MUST call `on_channel_closed()` when the channel reports
+ * EOF (or any final status), and also when the pidfd becomes readable (the draining process is gone or a zombie), so
+ * that callers waiting in `end_all`, `list`, `close` or `close_cert` fail promptly instead of running to their timeout.
+ * The link does not watch the pidfd while a request waits. The link never reads the channel itself; replies reach it only through `deliver`. The
  * link is destroyed (or `runtime().set_peer(nullptr)`) after the draining process is gone and no request is in flight;
  * callers copy the `shared_ptr` from `runtime().peer()` for the duration of a call, which keeps it alive.
  */

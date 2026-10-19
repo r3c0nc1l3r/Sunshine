@@ -93,7 +93,8 @@ namespace rtsp_stream {
    *
    * Result: `session_count()` plus the number of sessions the draining process reports. With no draining process (the
    * feature is off, no handoff happened, the draining process is gone, or on a platform without drain handoff) the
-   * result equals `session_count()` and nothing is sent. With a draining process the call sends one `SESSIONS?` and
+   * result equals `session_count()` and nothing is sent. On a platform other than Linux it always equals
+   * `session_count()` (the Linux-only handoff code is not compiled there). With a draining process the call sends one `SESSIONS?` and
    * waits up to 500 ms for the reply; a reply with N entries adds N. A `SESSIONS?` that gets no reply in that time
    * (timeout, lost channel, failed send) is unknown and adds 1, so the result is then at least 1 and "no sessions" is
    * never claimed on a guess. A draining process that is found gone while the call runs adds 0.

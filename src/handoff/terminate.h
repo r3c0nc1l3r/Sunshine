@@ -22,12 +22,29 @@
  * | `confighttp::updateClient` (disable) | 15 s | Only after the client's own sessions were ended and the peer was told (below), only when `rtsp_stream::total_session_count() == 0` and `proc::proc.running() > 0`. | The app keeps running; the reply is unchanged (`status` as before, 200). |
  * | `confighttp::unpair` | 15 s | Only when the client was removed and no client remains. | The client stays removed, the app keeps running, reply unchanged. |
  * | `confighttp::unpairAll` | 15 s | After all clients were erased. | Clients stay removed, the app keeps running, reply unchanged. |
- * | `proc` deinit guard (`process.cpp`, shutdown) | 5 s | Only when `proc::proc.running() > 0`; with no running app the guard calls `proc::proc.terminate()` as before, without asking. | The app is not terminated and no `undo` runs (logged as a Warning); the process continues to shut down. Spec-accepted: an app the process launched itself (not adopted) is then left running. |
+ * | `proc` deinit guard (`process.cpp`, shutdown) | 5 s | Only when `proc::proc.running() > 0`; with no running app the guard calls `proc::proc.terminate()` as before, without asking. | Depends on who started the app (see "Shutdown and adopted apps" below): an ADOPTED app is not terminated and no `undo` runs (logged as a Warning); an app this process launched itself is terminated exactly as upstream does, whatever the gate said. |
  *
  * `updateClient` order when a client is disabled: (1) `rtsp_stream::terminate_sessions_by_cert(cert)` for the own
  * sessions; (2) when `cert` is not empty, `session_peer_t::close_cert(cert_sha256_hex(cert), ...)` on the peer
  * (best effort: a `std::nullopt` is logged as a Warning and ends nothing else); (3) the terminate decision above. The
  * response never depends on the peer.
+ *
+ * ## Shutdown and adopted apps
+ *
+ * A shutdown must never leave behind an app this process started. So on the shutdown path (and only there) a refused
+ * permission skips `terminate()` only for an ADOPTED app, the one this process took over from the draining process
+ * (`proc::proc.adopted()`, see below): it has no process group here, and its `undo` commands must not run while the
+ * other process may still stream. For an app this process launched itself, the guard terminates it as upstream does
+ * (process group terminated, `undo` commands run), whatever `terminate_gate` returned; the gate is still asked first, so
+ * the draining process gets its `END_ALL`, but its answer does not hold back the terminate. Request paths (the other rows)
+ * keep the plain rule: refused means nothing is terminated.
+ *
+ * How the module knows "adopted": the wave 2A process contract has no accessor for it (`install_adoption` sets
+ * placebo mode with process group 0, which an app with an empty command launched by this process also has, so those
+ * atomics cannot tell the two apart). This contract therefore needs one new accessor, `bool proc::proc_t::adopted()
+ * const`: true from `install_adoption` with an app until `terminate()` or `drop_released_app()` clears the app; false for
+ * every app that `execute()` started; thread-safe (an atomic flag next to `released`). The exact diff is in the wave C
+ * report; the shutdown guard in `process.cpp` calls it.
  *
  * Internal terminates (`execute()` at its start and in its failure guard, `running()` when the app's process exited)
  * never ask: they never act on an adopted app.
@@ -87,6 +104,10 @@ namespace handoff {
    * Calls `proc::proc.terminate()` while holding one process-wide mutex that only this function and `terminate_app` use,
    * so concurrent request-path terminates run one after another (the second finds no app and does nothing). The mutex is
    * never held while waiting for permission.
+   *
+   * It terminates unconditionally; the caller decides whether it may be called. On the shutdown path, an app that this
+   * process launched itself (`!proc::proc.adopted()`) is terminated through this function even after a refusal; an
+   * adopted app is not (see "Shutdown and adopted apps" above).
    */
   void terminate_app_permitted();
 
@@ -94,7 +115,9 @@ namespace handoff {
    * @brief Ask for permission and, if granted, terminate the app.
    *
    * `terminate_gate(budget)`, then `terminate_app_permitted()` when `allows_terminate`. On a refusal it logs one Warning
-   * naming `action` and does not terminate.
+   * naming `action` and does not terminate, except when `budget` is `shutdown_terminate_budget` and the app is not
+   * adopted (`!proc::proc.adopted()`): then, after the same Warning, it terminates anyway, so a shutdown never leaves an
+   * app this process started. The return value is still the gate's permission.
    *
    * @param budget Budget for the gate.
    * @param action Short generic name of the caller for the Warning, for example `"close app"`.
