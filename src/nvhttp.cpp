@@ -10,6 +10,7 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,9 @@
 #include "video.h"
 
 #ifdef __linux__
+  #include "handoff/coordinator.h"
+  #include "handoff/hooks.h"
+  #include "handoff/runtime.h"
   #include "handoff/terminate.h"
 #endif
 
@@ -1743,6 +1747,16 @@ namespace nvhttp {
    */
   std::pair<bool, std::string> get_client_status(const std::string_view cert_pem);
 
+  namespace {
+    std::mutex listening_callback_mutex;  ///< Guards `listening_callback`.
+    std::function<void(unsigned short)> listening_callback;  ///< Called once per listener when it exists.
+  }  // namespace
+
+  void set_listening_callback(std::function<void(unsigned short)> callback) {
+    std::lock_guard lock {listening_callback_mutex};
+    listening_callback = std::move(callback);
+  }
+
   void start() {
     platf::set_thread_name("nvhttp");
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
@@ -1856,11 +1870,58 @@ namespace nvhttp {
     http_server.config.address = net::get_bind_address(address_family);
     http_server.config.port = port_http;
 
-    auto accept_and_run = [&](auto *http_server) {
+    std::function<void(unsigned short)> on_listening;
+    {
+      std::lock_guard lock {listening_callback_mutex};
+      on_listening = listening_callback;
+    }
+
+    // A handoff-started child adopts the inherited listeners, paused, instead of binding.
+    int adopt_https_fd = -1;
+    int adopt_http_fd = -1;
+#ifdef __linux__
+    if (handoff::hooks::started_by_handoff()) {
+      if (const auto inherited = handoff::runtime().inherited()) {
+        adopt_https_fd = inherited->https;
+        adopt_http_fd = inherited->http;
+      }
+    }
+
+    // Register the pause, resume, close and fd operations of both servers; they are inert until the listener exists.
+    const bool register_listeners = handoff::hooks::enabled();
+    if (register_listeners) {
+      const auto make_ops = [](auto &server) {
+        handoff::listener_ops_t ops;
+        ops.pause = [&server](std::chrono::milliseconds timeout) {
+          return server.pause(timeout);
+        };
+        ops.resume = [&server](std::chrono::milliseconds timeout) {
+          return server.resume(timeout);
+        };
+        ops.close_listener = [&server](std::chrono::milliseconds timeout) {
+          return server.close_listener(timeout);
+        };
+        ops.fd = [&server]() {
+          return server.listener_fd();
+        };
+        return ops;
+      };
+      handoff::listeners().set(handoff::listener_e::https, make_ops(https_server));
+      handoff::listeners().set(handoff::listener_e::http, make_ops(http_server));
+    }
+#endif
+
+    auto accept_and_run = [&](auto *http_server, [[maybe_unused]] int adopt_fd) {
       try {
         std::string name = "nvhttp::" + std::to_string(http_server->config.port);
         platf::set_thread_name(name);
-        http_server->start();
+#ifdef __linux__
+        if (adopt_fd >= 0) {
+          http_server->start_adopted(adopt_fd, true, on_listening);
+          return;
+        }
+#endif
+        http_server->start(on_listening);
       } catch (boost::system::system_error &err) {
         // It's possible the exception gets thrown after calling http_server->stop() from a different thread
         if (shutdown_event->peek()) {
@@ -1870,13 +1931,27 @@ namespace nvhttp {
         BOOST_LOG(fatal) << "Couldn't start http server on ports ["sv << port_https << ", "sv << port_https << "]: "sv << err.what();
         shutdown_event->raise(true);
         return;
+      } catch (const std::exception &err) {
+        if (shutdown_event->peek()) {
+          return;
+        }
+
+        BOOST_LOG(fatal) << "Couldn't start http server: "sv << err.what();
+        shutdown_event->raise(true);
+        return;
       }
     };
-    std::jthread ssl {accept_and_run, &https_server};
-    std::jthread tcp {accept_and_run, &http_server};
+    std::jthread ssl {accept_and_run, &https_server, adopt_https_fd};
+    std::jthread tcp {accept_and_run, &http_server, adopt_http_fd};
 
     // Wait for any event
     shutdown_event->view();
+
+#ifdef __linux__
+    // The registered operations use the servers, so they go before the servers stop.
+    handoff::listeners().clear(handoff::listener_e::https);
+    handoff::listeners().clear(handoff::listener_e::http);
+#endif
 
     https_server.stop();
     http_server.stop();

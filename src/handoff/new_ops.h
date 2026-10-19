@@ -61,6 +61,28 @@
 #include "src/upnp.h"
 
 namespace handoff {
+  class coordinator_t;  // defined in coordinator.h
+
+  /**
+   * @brief Give the production seams of `sunshine_new_ops_t` the coordinator of this process.
+   *
+   * The default `set_cooldown_deadline_ns` seam calls `coordinator_t::set_cooldown_until` on it and the default
+   * `start_control_server` seam calls `coordinator_t::start_control`. `main` calls this with the coordinator right
+   * after it constructed it (`entry.h`, step 8b) and with null at step 18, after `coordinator->request_shutdown()`.
+   * The new-side thread starts before the coordinator exists, so the `HELLO` cooldown can arrive while it is null:
+   * - while it is null the default cooldown seam stores the latest deadline under the same mutex;
+   * - `set_new_ops_coordinator(non-null)` applies a stored deadline with `set_cooldown_until` before it returns, then
+   *   clears it;
+   * - `set_new_ops_coordinator(nullptr)` discards it;
+   * - with a null coordinator the default `start_control_server` seam logs an Error ("control server not started: no
+   *   coordinator") and does nothing (it is reached only after `MAIN`, long after step 8b).
+   * The call waits for a seam call that is running, so after `set_new_ops_coordinator(nullptr)` returns no seam
+   * touches the coordinator any more. Thread-safe.
+   *
+   * @param coordinator The coordinator, or null.
+   */
+  void set_new_ops_coordinator(coordinator_t *coordinator);
+
   /**
    * @brief How far the new process has come; read by the shutdown path and by the overlap rules in `entry.h`.
    *

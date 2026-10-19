@@ -25,7 +25,7 @@
  * | 6 | right after step 5, when `handoff::runtime().enabled()` | `handoff::entry::open_instance_file()` (role `pending` in H, `active` in N), then `handoff::session_notifier().start()`. |
  * | 7 | `task_pool.start(1)` and the signal handlers | In the SIGTERM lambda the first statement is `handoff::hooks::on_sigterm()` (before `force_shutdown` is armed and before `shutdown_event->raise`). The SIGINT lambda is unchanged. `main` does not scrub or unset `NOTIFY_SOCKET` anywhere (the refusal gatherer reads it at call time). |
  * | 8 | after the signal handlers | `handoff_process` (section 6) is constructed here, before `proc_deinit_guard` (destruction order, section 7). Starts the shutdown watcher. |
- * | 8b | when `runtime().enabled()`, right after step 8 (so `handoff_process` is declared first and destroyed last, section 7) and before any `READY=1` can be sent (step 15 on) | N only (an H process starts it in `on_main()`): construct `std::optional<handoff::coordinator_t> coordinator` and `control_server_t control` as section 7 orders them (both `std::optional`, emplaced only when the feature is enabled; every later `coordinator` call in this table is guarded by `has_value()`), then `coordinator->start_control(control_socket_path(runtime_dir, getpid()).string())`. The path is `$RUNTIME_DIRECTORY/control/<pid>.sock` when `RUNTIME_DIRECTORY` is set (system unit, `RuntimeDirectory=sunshine`), else `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock` (user unit). In H the same `coordinator_t` is constructed here, but `start_control` is called by `sunshine_new_ops_t`'s `start_control_server` in `on_main()`. |
+ * | 8b | when `runtime().enabled()`, right after step 8 (so `handoff_process` is declared first and destroyed last, section 7) and before any `READY=1` can be sent (step 15 on) | N only (an H process starts it in `on_main()`): construct `std::optional<handoff::coordinator_t> coordinator` and `control_server_t control` as section 7 orders them (both `std::optional`, emplaced only when the feature is enabled; every later `coordinator` call in this table is guarded by `has_value()`), then `handoff::set_new_ops_coordinator(&*coordinator)` (`new_ops.h`) and `coordinator->start_control(control_socket_path(runtime_dir, getpid()).string())`. The path is `$RUNTIME_DIRECTORY/control/<pid>.sock` when `RUNTIME_DIRECTORY` is set (system unit, `RuntimeDirectory=sunshine`), else `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock` (user unit). In H the same `coordinator_t` is constructed here, but `start_control` is called by `sunshine_new_ops_t`'s `start_control_server` in `on_main()`. |
  * | 9 | `proc::refresh`, `platf::init`, `proc::init`, `reed_solomon_init`, `input::init` | unchanged; after `input::init` call `handoff::register_device_release(...)` (section 7). |
  * | 10 H | after the gamepad probe | `handoff_process.start_new_side(...)` (section 4): the new-side thread starts and exchanges `HELLO`. |
  * | 11 | the startup encoder probe | In H first `handoff_process.new_ops()->wait_probe_decision(<hello timeout> + 2 s)` (it returns early on a shutdown request; a timeout lets the probe run). Then, in both modes, the probe is wrapped: `if (!handoff::hooks::startup_probe_skipped()) { if (video::probe_encoders()) { ...the existing Error... } }`. So the accepted override is installed before `main` reaches this gate, or the probe runs. In N the `if` is the only change. |
@@ -36,7 +36,7 @@
  * | 15b | when `runtime().enabled()`, after the RTSP server has started (the `rtsp_stream::start`/adopt step) and after its listener exists | `handoff::listeners().set(handoff::listener_e::rtsp, handoff::rtsp_listener_ops())`; the nvhttp and confighttp `start()` register their own entries (their headers). Before the RTSP server stops (the `rtspThread.join()` of step 18) call `handoff::listeners().clear(handoff::listener_e::rtsp)`, as nvhttp and confighttp do for theirs before they stop. |
  * | 16 | `init_tray()` block | skipped in H (`!hooks::started_by_handoff()` added to the condition). Unchanged in N. |
  * | 17 | `mainThreadLoop` | On Linux it calls `system_tray::run_main_loop([&]{ return shutdown_event->peek(); })` whenever the tray is compiled in and enabled (`tray_is_enabled && config::sunshine.system_tray`), including in H, where no icon exists yet and the loop idles with its 500 ms poll until `request_start()` or shutdown. Without the tray it waits on `shutdown_event->view()` as before. |
- * | 18 | after `mainThreadLoop` returns | `handoff_process.finish_new_side();` then, when the feature is enabled, in this order and BEFORE the `proc` deinit guard (which runs at step 19): `coordinator->request_shutdown()`, `coordinator->stop_control()`, `coordinator->join_attempt()` (bounded, default 8 s; on expiry it logs an Error and `main` goes on; the 10 s forced-shutdown limit of the existing signal handlers still bounds the process, because both `SIGTERM` and Quit reach this point through a signal handler that arms it: Quit goes through `lifetime::exit_sunshine`, which raises `SIGINT`. Time spent before this step counts against that limit, and after an expiry here `coordinator_t::stop()` may wait for the run thread without its own bound, still under that limit); `handoff::listeners().clear(rtsp)`; then the three `join()`s, each preceded by `handoff::note_shutdown_stage(...)` (names in `drain.h`), then `task_pool.stop()` and `task_pool.join()` preceded by `note_shutdown_stage("task pool")`. |
+ * | 18 | after `mainThreadLoop` returns | `handoff_process.finish_new_side();` then, when the feature is enabled, in this order and BEFORE the `proc` deinit guard (which runs at step 19): `coordinator->request_shutdown()`, `handoff::set_new_ops_coordinator(nullptr)`, `coordinator->stop_control()`, `coordinator->join_attempt()` (bounded, default 8 s; on expiry it logs an Error and `main` goes on; the 10 s forced-shutdown limit of the existing signal handlers still bounds the process, because both `SIGTERM` and Quit reach this point through a signal handler that arms it: Quit goes through `lifetime::exit_sunshine`, which raises `SIGINT`. Time spent before this step counts against that limit, and after an expiry here `coordinator_t::stop()` may wait for the run thread without its own bound, still under that limit); `handoff::listeners().clear(rtsp)`; then the three `join()`s, each preceded by `handoff::note_shutdown_stage(...)` (names in `drain.h`), then `task_pool.stop()` and `task_pool.join()` preceded by `note_shutdown_stage("task pool")`; then, after the joins and the task pool, just before the return, `upnp_unmap.reset()` and `mDNS.reset()` (after `sync_upnp` and `sync_mDNS` completed), which keeps upstream's teardown place before the `proc` guard. |
  * | 19 | `return lifetime::desired_exit_code` | Local destructors run in the order of section 7. |
  *
  * ## 2. The `--drain-handoff <MAINPID>` helper
@@ -150,7 +150,7 @@
  *
  * Locals are destroyed in reverse declaration order, so declare, in this order, from first to last: the
  * `upnp_unmap` and `mDNS` variables (existing), `handoff_process`, then (step 8b) `std::optional<control_server_t> control` and `std::optional<coordinator_t> coordinator` (emplaced only when the feature is enabled),
- * `proc_deinit_guard` (existing), `input_deinit_guard` (existing). Then the guards run as: input devices, then the `proc`
+ * `proc_deinit_guard` (existing), `input_deinit_guard` (existing). `upnp_unmap` and `mDNS` are declared first only so the new side can use the UPnP slot; step 18 resets both explicitly (`upnp_unmap` first, at the end of step 18, before the `proc` guard), so their teardown keeps upstream's place before the app terminate and the device and platform guards. Then the guards run as: input devices, then the `proc`
  * deinit guard, then the coordinator's destructor (`stop()`, then `control`), then `handoff_process`. `request_shutdown()`, `stop_control()` and
  * `join_attempt()` are NOT left to the destructor: they run at step 18, before the `proc` guard; only the responder, the
  * poller, the reader and the channel live past the guard (`coordinator.h` requires `stop()` after it in an active process).
@@ -375,6 +375,14 @@ namespace handoff::entry {
 #endif
 
   private:
+    /**
+     * @brief Build the link, the reader and the pidfd watcher; shared by both constructors.
+     *
+     * @param old_pidfd The old process's pidfd (owned by the link from here on), or -1.
+     */
+    void start(int old_pidfd);
+
+    std::function<void(std::shared_ptr<peer_link_t>)> _set_peer;  ///< Stores or drops the peer (`runtime().set_peer` in production).
     sunshine_new_ops_t &_ops;  ///< Ops (for `on_main()`).
     std::shared_ptr<channel_t> _channel;  ///< The channel.
     std::shared_ptr<peer_link_t> _link;  ///< The link (also stored in the runtime).
@@ -472,6 +480,23 @@ namespace handoff::entry {
     void finish_new_side();
 
   private:
+    /**
+     * @brief Start the shutdown watcher thread; shared by both constructors.
+     */
+    void start_watcher();
+
+    /**
+     * @brief Build the ops and start the new-side thread; shared by `start_new_side` and its test variant.
+     *
+     * @param config Configuration facts for the ops.
+     * @param channel The channel.
+     * @param upnp_slot Guard slot.
+     * @param timeouts Timeouts.
+     * @param seams Seams for the ops, or null for the production ones (tests only).
+     * @return `true` when the thread started.
+     */
+    bool launch_new_side(const new_ops_config_t &config, std::shared_ptr<channel_t> channel, std::unique_ptr<platf::deinit_t> &upnp_slot, const new_side_timeouts_t &timeouts, const new_ops_seams_t *seams);
+
     std::function<void()> _wait_shutdown;  ///< Waits for the shutdown event.
     std::function<void()> _raise_shutdown;  ///< Raises the shutdown event.
     process_seams_t _seams;  ///< Seams with defaults.
