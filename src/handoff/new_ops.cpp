@@ -319,6 +319,25 @@ namespace handoff {
     }
   }
 
+  void sunshine_new_ops_t::close_inherited_listeners() {
+    {
+      std::lock_guard lock {_mutex};
+      if (_listeners_closed) {
+        return;
+      }
+      _listeners_closed = true;
+    }
+
+    // The servers hold their own duplicates; the channel fd is not touched here.
+    if (const auto inherited = runtime().inherited()) {
+      for (const int fd : {inherited->https, inherited->http, inherited->webui, inherited->rtsp}) {
+        if (fd >= 0) {
+          ::close(fd);
+        }
+      }
+    }
+  }
+
   protocol::hello_t sunshine_new_ops_t::hello() {
     _stage = new_stage_e::starting;
     return protocol::hello_t {};
@@ -412,6 +431,7 @@ namespace handoff {
     }
     lock.unlock();
 
+    close_inherited_listeners();
     advance(_stage, new_stage_e::ready);
     return {};
   }
@@ -584,6 +604,8 @@ namespace handoff {
       }
     }
     _cv.notify_all();
+    // Not adopted (or already closed): close the inherited listeners here.
+    close_inherited_listeners();
   }
 
   void sunshine_new_ops_t::abort() {

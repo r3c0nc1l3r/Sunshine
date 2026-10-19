@@ -477,4 +477,30 @@ namespace handoff::entry {
       thread.join();
     }
   }
+
+  struct device_release_t::state_t {
+    std::once_flag once;  ///< Makes the release run at most once and blocks a concurrent caller.
+    std::unique_ptr<platf::deinit_t> guard;  ///< The guard from `input::init()`.
+  };
+
+  device_release_t::device_release_t(std::unique_ptr<platf::deinit_t> guard):
+      _state {std::make_shared<state_t>()} {
+    _state->guard = std::move(guard);
+    register_device_release([state = _state]() {
+      std::call_once(state->once, [&state]() {
+        state->guard.reset();
+      });
+    });
+  }
+
+  device_release_t::~device_release_t() {
+    release();
+    register_device_release({});
+  }
+
+  void device_release_t::release() {
+    std::call_once(_state->once, [this]() {
+      _state->guard.reset();
+    });
+  }
 }  // namespace handoff::entry
