@@ -169,22 +169,39 @@ namespace handoff {
        * @brief Read the channel and route each message.
        */
       void reader_loop() {
-        while (!_stop_reader) {
-          received_t received;
-          auto status = _channel.receive(received, reader_slice);
-          if (status == recv_status_e::timeout) {
-            continue;
+        try {
+          while (!_stop_reader) {
+            received_t received;
+            auto status = _channel.receive(received, reader_slice);
+            if (status == recv_status_e::timeout) {
+              continue;
+            }
+            if (status != recv_status_e::ok) {
+              push_closed(status);
+              return;
+            }
+            route(std::move(received));
           }
-          if (status != recv_status_e::ok) {
-            event_t event;
-            event.closed = true;
-            event.status = status;
-            event.at = steady_t::now();
-            push_event(std::move(event));
-            return;
-          }
-          route(std::move(received));
+        } catch (const std::exception &e) {
+          BOOST_LOG(error) << "Drain handoff: channel reader failed: " << e.what();
+          push_closed(recv_status_e::error);
+        } catch (...) {
+          BOOST_LOG(error) << "Drain handoff: channel reader failed";
+          push_closed(recv_status_e::error);
         }
+      }
+
+      /**
+       * @brief Report the final channel status to `run()`.
+       *
+       * @param status Final status.
+       */
+      void push_closed(recv_status_e status) {
+        event_t event;
+        event.closed = true;
+        event.status = status;
+        event.at = steady_t::now();
+        push_event(std::move(event));
       }
 
       /**
@@ -207,8 +224,10 @@ namespace handoff {
         // Only drain requests go to the handler; anything else is a protocol violation of the new process.
         bool drain_request = std::holds_alternative<protocol::end_all_t>(message) || std::holds_alternative<protocol::sessions_request_t>(message) || std::holds_alternative<protocol::close_request_t>(message) || std::holds_alternative<protocol::close_cert_request_t>(message);
         if (!drain_request || !_on_drain_request) {
-          if (!std::holds_alternative<protocol::unknown_t>(message)) {
+          if (!drain_request) {
             BOOST_LOG(warning) << "Drain handoff: dropping unexpected " << protocol::type_name(message) << " from the new process";
+          } else {
+            BOOST_LOG(warning) << "Drain handoff: dropping " << protocol::type_name(message) << ": no drain request handler";
           }
           if (received.fd >= 0) {
             ::close(received.fd);
@@ -265,8 +284,18 @@ namespace handoff {
             _work_cv.wait(lock, [this]() {
               return _stop_worker || !_work.empty();
             });
-            if (_work.empty()) {
-              return;  // stopping and nothing left
+            if (_stop_worker) {
+              // Stopping: finish only the call that is running; discard the rest.
+              if (!_work.empty()) {
+                BOOST_LOG(warning) << "Drain handoff: discarding " << _work.size() << " queued drain request(s) at the end of the handoff";
+                for (auto &queued : _work) {
+                  if (queued.fd >= 0) {
+                    ::close(queued.fd);
+                  }
+                }
+                _work.clear();
+              }
+              return;
             }
             item = std::move(_work.front());
             _work.pop_front();
@@ -364,6 +393,10 @@ namespace handoff {
         }
         _released = true;
         _ops.set_released(true);
+        if (_shutdown.load()) {
+          // A shutdown in this gap is still before GO: kill-first rollback.
+          return rollback("shutdown requested", true);
+        }
 
         auto go_sent_at = steady_t::now();
         auto go_deadline = go_sent_at + _t.go_ack;
@@ -515,10 +548,16 @@ namespace handoff {
           }
           if (now >= next_handover) {
             // Step 7.1: the liveness check, then the main-PID handover.
+            if (_shutdown.load()) {
+              return finish_shutdown();
+            }
             if (_child.exited()) {
               return fail("the new process exited before the handover");
             }
             if (_ops.handover(_child.pid())) {
+              if (_shutdown.load()) {
+                return finish_shutdown();
+              }
               if (handover_failed) {
                 _ops.set_state(state_e::draining);
               }
@@ -530,6 +569,9 @@ namespace handoff {
               return old_outcome_e::handed_over;
             }
             BOOST_LOG(error) << "Drain handoff: the main-PID handover failed; retrying in " << _t.handover_retry.count() << " ms";
+            if (_shutdown.load()) {
+              return finish_shutdown();
+            }
             if (!handover_failed) {
               handover_failed = true;
               _ops.set_state(state_e::handover_failed);
@@ -600,15 +642,15 @@ namespace handoff {
             gone = true;
           }
           if (!gone) {
-            if (reaped == reap_result_e::error) {
-              // An error can occur while the child is alive: handle it like a timeout, at the reap interval.
-              std::this_thread::sleep_for(_t.reap);
-            }
-            BOOST_LOG(error) << "Drain handoff: the new process is not gone yet (kill pending); sending SIGKILL again";
+            BOOST_LOG(error) << "Drain handoff: the new process is not gone yet (kill pending)" << (kill_pending ? "; sending SIGKILL again" : "");
             if (!kill_pending) {
               kill_pending = true;
               _ops.set_state(state_e::kill_pending);
               answer(control_reply_t {reply_kind_e::kill_pending, "kill_pending", 0, 0});
+            }
+            if (reaped == reap_result_e::error) {
+              // An error can occur while the child is alive: handle it like a timeout, at the reap interval.
+              std::this_thread::sleep_for(_t.reap);
             }
             continue;
           }
