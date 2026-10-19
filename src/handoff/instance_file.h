@@ -132,7 +132,8 @@ namespace handoff {
    * @param runtime_directory Value of `RUNTIME_DIRECTORY` (empty when unset; only its first `:`-separated entry is
    *        used).
    * @param xdg_runtime_dir Value of `XDG_RUNTIME_DIR` (empty when unset).
-   * @return `RUNTIME_DIRECTORY` when set, else `XDG_RUNTIME_DIR/sunshine`, else `std::nullopt`.
+   * @return `RUNTIME_DIRECTORY` when set, else `XDG_RUNTIME_DIR/sunshine`, else `std::nullopt`. A value that is not an
+   *         absolute path counts as unset.
    */
   std::optional<std::filesystem::path> runtime_dir(std::string_view runtime_directory, std::string_view xdg_runtime_dir);
 
@@ -144,13 +145,19 @@ namespace handoff {
     /**
      * @brief Create a writer for `<dir>/<pid>.json`. Nothing is written yet.
      *
-     * @param dir Instances directory (`<runtime dir>/instances`); created with mode 0700 on first write if missing.
+     * @param dir Instances directory (`<runtime dir>/instances`); created with mode 0700 on first write if missing
+     *        (each missing parent too). An existing directory must be a real directory (checked with `lstat`, not a
+     *        symlink) owned by the effective uid and not writable by group or others, else the write fails with an
+     *        Error.
      * @param initial Initial content; `pid` names the file.
      */
     instance_writer_t(std::filesystem::path dir, instance_t initial);
 
     /**
-     * @brief Write the current content (temporary file in the same directory plus rename).
+     * @brief Write the current content: a temporary file `<pid>.json.tmp` in the same directory (any old one is
+     * unlinked first, then it is created with `O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` and mode 0600), written, fsynced
+     * and renamed over `<pid>.json`. After `remove()` it writes nothing and returns `false`, so a late update cannot
+     * leave a stale file.
      *
      * @return `true` on success.
      */
@@ -188,13 +195,14 @@ namespace handoff {
     instance_t current() const;
 
     /**
-     * @brief Delete the file. Safe to call when it does not exist.
+     * @brief Delete the file and stop all later writes. Safe to call when it does not exist.
      */
     void remove();
 
   private:
     std::filesystem::path _dir;  ///< Instances directory.
     instance_t _instance;  ///< Current content.
+    bool _removed {false};  ///< `remove()` was called; no more writes.
     mutable std::mutex _mutex;  ///< Guards the members.
   };
 
@@ -217,7 +225,9 @@ namespace handoff {
   };
 
   /**
-   * @brief Read every `*.json` file in the instances directory; other names are ignored.
+   * @brief Read every `*.json` file in the instances directory; other names are ignored. A file whose name pid differs
+   * from the `pid` inside it counts as unreadable, as does one that cannot be opened or read for any reason but `ENOENT`;
+   * a file that vanishes during the scan (`ENOENT`, its process removed it) is skipped.
    *
    * @param dir Instances directory.
    * @param start_time_of Returns a pid's current start time, or `std::nullopt` when it does not exist (tests inject
