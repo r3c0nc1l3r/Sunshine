@@ -187,7 +187,8 @@ namespace handoff {
      * Called on the server thread (from the handler) it does not join; the thread then exits after the handler returns
      * and a later `stop()` or the destructor on another thread joins it. Called on another thread while a handler runs,
      * it returns only when the handler has returned, so the caller must make the handler return first (the handoff
-     * glue calls `old_side_t::request_shutdown()` before `stop()` on the shutdown path).
+     * glue calls `old_side_t::request_shutdown()` before `stop()` on the shutdown path). Concurrent `stop()` calls from
+     * two threads are not supported (only one of them joins), and the destructor must not overlap any other call.
      */
     void stop();
 
@@ -203,6 +204,8 @@ namespace handoff {
     std::thread _thread;  ///< Server thread.
     handler_t _handler;  ///< Verb handler.
     bool _stopped {false};  ///< `stop()` was called.
+    dev_t _bound_dev {0};  ///< Device of the socket file this server bound (for `close_listener()`).
+    ino_t _bound_ino {0};  ///< Inode of the socket file this server bound; 0 when none.
     mutable std::mutex _mutex;  ///< Guards the members above.
   };
 }  // namespace handoff
