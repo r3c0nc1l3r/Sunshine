@@ -251,7 +251,48 @@ namespace upnp {
      * @brief Destroy the UPnP deinitializer.
      */
     ~deinit_t() {
+      // Stop the mapping thread at once; it does not wait for the process shutdown event.
+      {
+        std::lock_guard lock {stop_mutex};
+        stop_requested = true;
+      }
+      stop_cv.notify_all();
       upnp_thread.join();
+    }
+
+    /**
+     * @brief Whether the mapping thread must end: the guard is being destroyed or the process is shutting down.
+     * @param shutdown_event The process shutdown event.
+     * @return `true` when the thread must end.
+     */
+    bool should_stop(const auto &shutdown_event) {
+      {
+        std::lock_guard lock {stop_mutex};
+        if (stop_requested) {
+          return true;
+        }
+      }
+      return shutdown_event->peek();
+    }
+
+    /**
+     * @brief Wait for the refresh interval, or until a stop is requested or the process shuts down.
+     * @param shutdown_event The process shutdown event.
+     * @return `true` when the thread must end, `false` when the interval passed.
+     */
+    bool wait_refresh(const auto &shutdown_event) {
+      const auto deadline = std::chrono::steady_clock::now() + REFRESH_INTERVAL;
+      while (!should_stop(shutdown_event)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+          return false;
+        }
+        std::unique_lock lock {stop_mutex};
+        stop_cv.wait_for(lock, std::min<std::chrono::steady_clock::duration>(100ms, deadline - now), [this] {
+          return stop_requested;
+        });
+      }
+      return true;
     }
 
     /**
@@ -293,7 +334,7 @@ namespace upnp {
             auto mapping_period = std::to_string(PORT_MAPPING_LIFETIME.count());
             auto shutdown_event = mail::man->event<bool>(mail::shutdown);
 
-            for (auto it = std::begin(mappings); it != std::end(mappings) && !shutdown_event->peek(); ++it) {
+            for (auto it = std::begin(mappings); it != std::end(mappings) && !should_stop(shutdown_event); ++it) {
               auto mapping = *it;
               char uniqueId[8];
 
@@ -476,7 +517,7 @@ namespace upnp {
 #ifdef SUNSHINE_TESTS
         if (fake_igd_installed()) {
           // Test seam: the fake gateway is found at once and holds the mappings in memory.
-          for (auto it = std::begin(plan); it != std::end(plan) && !shutdown_event->peek(); ++it) {
+          for (auto it = std::begin(plan); it != std::end(plan) && !should_stop(shutdown_event); ++it) {
             fake_igd_map(it->port, it->udp);
           }
           mapped = true;
@@ -509,7 +550,7 @@ namespace upnp {
 
         BOOST_LOG(debug) << "Found valid IGD device: "sv << urls->rootdescURL;
 
-        for (auto it = std::begin(mappings); it != std::end(mappings) && !shutdown_event->peek(); ++it) {
+        for (auto it = std::begin(mappings); it != std::end(mappings) && !should_stop(shutdown_event); ++it) {
           map_upnp_port(data, urls, lan_addr_str, *it);
         }
 
@@ -527,7 +568,7 @@ namespace upnp {
 
         mapped = true;
         mapped_urls = std::move(urls);
-      } while (!shutdown_event->view(REFRESH_INTERVAL));
+      } while (!wait_refresh(shutdown_event));
 
       if (mapped) {
         // Give a queued background removal up to 3 s to finish, so it does not race this unmap. Wait only here.
@@ -559,6 +600,9 @@ namespace upnp {
 
     std::vector<planned_mapping_t> plan;  ///< Planned mappings, kept in plan form for the unmap scope.
     std::vector<mapping_t> mappings;  ///< Port mappings Sunshine should keep registered with the gateway.
+    std::mutex stop_mutex;  ///< Guards `stop_requested`.
+    std::condition_variable stop_cv;  ///< Wakes the refresh wait when a stop is requested.
+    bool stop_requested = false;  ///< The guard is being destroyed.
     std::jthread upnp_thread;  ///< Worker thread that refreshes mappings until shutdown.
   };
 

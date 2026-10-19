@@ -1641,11 +1641,18 @@ namespace handoff {
 
     // 9. The child.
     const auto child_start = A::start_time(*this, spawned->pid);
-    auto child = A::make_child(*this, *spawned);
     if (!child_start) {
-      early_kill(*child);
+      // No `pidfd_child_t` is built: kill and reap through the spawned pidfd, then close it.
+      const auto result = kill_and_reap(spawned->pidfd, early_kill_wait, nullptr);
+      if (result != reap_result_e::reaped && result != reap_result_e::reaped_elsewhere) {
+        BOOST_LOG(error) << "Drain handoff: the new process (pid "sv << spawned->pid << ") did not confirm the reap in time"sv;
+      }
+      if (spawned->pidfd >= 0) {
+        ::close(spawned->pidfd);
+      }
       return fail(std::string(coordinator_reason::start_time_unreadable));
     }
+    auto child = A::make_child(*this, *spawned);
     {
       std::lock_guard lock {_mutex};
       stopping = _stopping;
