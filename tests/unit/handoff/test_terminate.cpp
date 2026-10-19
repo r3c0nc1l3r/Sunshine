@@ -8,8 +8,10 @@
  * 15 s: the module's rules depend on the mode, the peer and (for the shutdown rule) on `budget ==
  * shutdown_terminate_budget`, not on the length of any other budget.
  *
- * The shutdown-path refusal needs the full 5 s budget; those tests are `DISABLED_` so that they do not break the 2 s
- * rule of the unit suite. Run them with `--gtest_also_run_disabled_tests --gtest_filter='*DISABLED_*'`.
+ * The shutdown rule is selected by the `at_shutdown` flag of `terminate_app`, never by the budget value, so its tests use
+ * short budgets. The one test that proves a refusal with `at_shutdown == false` never terminates even with
+ * `budget == shutdown_terminate_budget` takes the whole 5 s (a refusal only comes at the end of the budget) and is
+ * `DISABLED_`; run it with `--gtest_also_run_disabled_tests --gtest_filter='*DISABLED_*'`.
  */
 #ifdef __linux__
 
@@ -478,7 +480,7 @@ TEST_F(HandoffTerminateTest, TerminateAppPermittedAnswerTerminatesRegardlessOfTh
   auto peer = std::make_shared<fake_drain_peer_t>();
   peer->reply = drain_peer_t::reply_e::ended;
   handoff::runtime().set_peer(peer);
-  EXPECT_EQ(handoff::terminate_app(handoff::shutdown_terminate_budget, "shutdown"), terminate_permission_e::ended);
+  EXPECT_EQ(handoff::terminate_app(handoff::shutdown_terminate_budget, "shutdown", true), terminate_permission_e::ended);
   EXPECT_EQ(terminate_calls.load(), 1) << "A granted permission terminates on the shutdown path.";
 }
 
@@ -486,12 +488,12 @@ TEST_F(HandoffTerminateTest, TerminateAppShutdownPeerGoneTerminates) {
   auto peer = std::make_shared<fake_drain_peer_t>();
   peer->gone_value = true;
   handoff::runtime().set_peer(peer);
-  EXPECT_EQ(handoff::terminate_app(handoff::shutdown_terminate_budget, "shutdown"), terminate_permission_e::peer_gone);
+  EXPECT_EQ(handoff::terminate_app(handoff::shutdown_terminate_budget, "shutdown", true), terminate_permission_e::peer_gone);
   EXPECT_EQ(terminate_calls.load(), 1);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// The shutdown rule after a refusal. It needs the whole 5 s budget, so these tests are DISABLED_ (see the file comment).
+// The shutdown rule after a refusal, selected by the at_shutdown flag (see the file comment).
 // ---------------------------------------------------------------------------------------------------------------------
 
 namespace {
@@ -538,20 +540,37 @@ namespace {
   };
 }  // namespace
 
-TEST_F(HandoffTerminateShutdownTest, DISABLED_RefusedShutdownSkipsTerminateForAnAdoptedApp) {
+TEST_F(HandoffTerminateShutdownTest, RefusedShutdownSkipsTerminateForAnAdoptedApp) {
   run_adopted_app();
   auto peer = std::make_shared<fake_drain_peer_t>();
   handoff::runtime().set_peer(peer);
-  EXPECT_EQ(handoff::terminate_app(handoff::shutdown_terminate_budget, "shutdown"), terminate_permission_e::refused);
+  EXPECT_EQ(handoff::terminate_app(80ms, "shutdown", true), terminate_permission_e::refused);
   EXPECT_EQ(terminate_calls.load(), 0) << "A refused shutdown terminate must skip terminate() for an ADOPTED app (no undo while the other process may stream).";
 }
 
-TEST_F(HandoffTerminateShutdownTest, DISABLED_RefusedShutdownStillTerminatesAnAppThisProcessLaunched) {
+TEST_F(HandoffTerminateShutdownTest, RefusedShutdownStillTerminatesAnAppThisProcessLaunched) {
   run_own_app();
   auto peer = std::make_shared<fake_drain_peer_t>();
   handoff::runtime().set_peer(peer);
-  EXPECT_EQ(handoff::terminate_app(handoff::shutdown_terminate_budget, "shutdown"), terminate_permission_e::refused) << "The return value is still the gate's permission.";
+  EXPECT_EQ(handoff::terminate_app(80ms, "shutdown", true), terminate_permission_e::refused) << "The return value is still the gate's permission.";
   EXPECT_EQ(terminate_calls.load(), 1) << "A shutdown must never leave behind an app this process started: terminate even after a refusal.";
+}
+
+TEST_F(HandoffTerminateShutdownTest, DISABLED_RefusalWithoutAtShutdownNeverTerminatesEvenWithTheShutdownBudget) {
+  // Takes the whole 5 s budget (a refusal only comes at the end of it): run with --gtest_also_run_disabled_tests.
+  run_own_app();
+  auto peer = std::make_shared<fake_drain_peer_t>();
+  handoff::runtime().set_peer(peer);
+  EXPECT_EQ(handoff::terminate_app(handoff::shutdown_terminate_budget, "close app", false), terminate_permission_e::refused);
+  EXPECT_EQ(terminate_calls.load(), 0) << "Only at_shutdown selects the terminate-anyway rule; the budget value never does.";
+}
+
+TEST_F(HandoffTerminateShutdownTest, DefaultAtShutdownIsFalse) {
+  run_own_app();
+  auto peer = std::make_shared<fake_drain_peer_t>();
+  handoff::runtime().set_peer(peer);
+  EXPECT_EQ(handoff::terminate_app(80ms, "close app"), terminate_permission_e::refused);
+  EXPECT_EQ(terminate_calls.load(), 0) << "at_shutdown defaults to false: a refusal terminates nothing.";
 }
 
 TEST_F(HandoffTerminateShutdownTest, GrantedShutdownTerminatesAnAdoptedApp) {
@@ -559,7 +578,7 @@ TEST_F(HandoffTerminateShutdownTest, GrantedShutdownTerminatesAnAdoptedApp) {
   auto peer = std::make_shared<fake_drain_peer_t>();
   peer->reply = drain_peer_t::reply_e::ended;
   handoff::runtime().set_peer(peer);
-  EXPECT_EQ(handoff::terminate_app(handoff::shutdown_terminate_budget, "shutdown"), terminate_permission_e::ended);
+  EXPECT_EQ(handoff::terminate_app(handoff::shutdown_terminate_budget, "shutdown", true), terminate_permission_e::ended);
   EXPECT_EQ(terminate_calls.load(), 1) << "With ENDED the adopted app is terminated; the skip applies only after a refusal.";
 }
 
@@ -616,6 +635,7 @@ TEST_F(HandoffTerminateTest, CountIsZeroWhenPeerIsGone) {
   const auto count = handoff::draining_session_count();
   ASSERT_TRUE(count.has_value()) << "A gone peer has no sessions: 0, not unknown.";
   EXPECT_EQ(*count, 0u);
+  EXPECT_EQ(peer->list_calls.load(), 0) << "A gone peer is answered with 0 and nothing is sent.";
 }
 
 TEST_F(HandoffTerminateTest, CountIsUnknownForAPeerWithoutSessionKnowledge) {
