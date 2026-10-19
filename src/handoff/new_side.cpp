@@ -78,6 +78,9 @@ namespace handoff {
             BOOST_LOG(warning) << "Drain handoff (new process): could not send PONG " << ping->seq;
           }
         }
+        if (!std::holds_alternative<protocol::unknown_t>(received.message)) {
+          BOOST_LOG(warning) << "Drain handoff (new process): dropping " << protocol::type_name(received.message) << " received out of order while waiting for " << what;
+        }
         drop_fd(received);  // Unknown or unexpected messages are ignored.
       }
     }

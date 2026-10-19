@@ -34,6 +34,8 @@ namespace handoff {
     constexpr std::chrono::milliseconds wait_slice {20};
     /// Receive timeout of the reader thread; bounds the latency of `stop()`.
     constexpr std::chrono::milliseconds reader_slice {50};
+    /// Most events (and, separately, drain requests) queued; later ones are dropped.
+    constexpr std::size_t max_queued = 1024;
 
     /**
      * @brief One item for the `run()` thread: a control message or the final channel status.
@@ -202,17 +204,33 @@ namespace handoff {
           push_event(std::move(event));
           return;
         }
-        if (std::holds_alternative<protocol::unknown_t>(message) || !_on_drain_request) {
+        // Only drain requests go to the handler; anything else is a protocol violation of the new process.
+        bool drain_request = std::holds_alternative<protocol::end_all_t>(message) || std::holds_alternative<protocol::sessions_request_t>(message) || std::holds_alternative<protocol::close_request_t>(message) || std::holds_alternative<protocol::close_cert_request_t>(message);
+        if (!drain_request || !_on_drain_request) {
+          if (!std::holds_alternative<protocol::unknown_t>(message)) {
+            BOOST_LOG(warning) << "Drain handoff: dropping unexpected " << protocol::type_name(message) << " from the new process";
+          }
           if (received.fd >= 0) {
             ::close(received.fd);
           }
           return;
         }
+        bool queued = false;
         {
           std::lock_guard lock {_work_mutex};
-          _work.push_back(std::move(received));
+          if (_work.size() < max_queued) {
+            _work.push_back(std::move(received));
+            queued = true;
+          }
         }
-        _work_cv.notify_one();
+        if (queued) {
+          _work_cv.notify_one();
+        } else {
+          BOOST_LOG(warning) << "Drain handoff: drain request queue full; dropping a request";
+          if (received.fd >= 0) {
+            ::close(received.fd);
+          }
+        }
       }
 
       /**
@@ -227,8 +245,10 @@ namespace handoff {
             // Kept apart so that it is reported after every queued event, and again by later waits.
             _closed_seen = true;
             _closed_status = event.status;
-          } else {
+          } else if (_events.size() < max_queued) {
             _events.push_back(std::move(event));
+          } else {
+            BOOST_LOG(warning) << "Drain handoff: event queue full; dropping a message";
           }
         }
         _event_cv.notify_all();
@@ -377,7 +397,10 @@ namespace handoff {
             }
             break;
           }
-          // HELLO, READY or PONG here carry nothing for us.
+          // HELLO, READY or PONG here carry nothing for us; do not let a stream of them starve the deadline.
+          if (steady_t::now() > go_deadline) {
+            return fail("timeout waiting for GO_ACK");
+          }
         }
         if (steady_t::now() > go_deadline) {
           return fail("GO_ACK deadline passed before COMMIT");
@@ -476,10 +499,9 @@ namespace handoff {
             if (auto *pong = std::get_if<protocol::pong_t>(&event.message)) {
               monitor.on_pong(pong->seq);
             }
-            continue;
           }
 
-          // Timeout: a timed action is due.
+          // Run the timed actions that are due, also after an event, so a stream of events cannot starve them.
           auto now = steady_t::now();
           if (now >= next_ping) {
             auto seq = monitor.next_ping();
@@ -567,11 +589,21 @@ namespace handoff {
         BOOST_LOG(error) << "Drain handoff: rolling back: " << reason;
         auto app = _end_all.decide_rollback();
 
-        // Kill-first: nothing below runs before the child is gone.
+        // Kill-first: nothing below runs before the child is gone. This loop deliberately ignores a shutdown request:
+        // the forced-shutdown limit of 10 s covers a stuck kill.
         bool kill_pending = false;
         for (;;) {
           auto reaped = _child.kill_and_reap(_t.reap);
-          if (reaped == reap_result_e::timeout) {
+          bool gone = reaped == reap_result_e::reaped || reaped == reap_result_e::reaped_elsewhere;
+          if (reaped == reap_result_e::error && _child.exited()) {
+            BOOST_LOG(error) << "Drain handoff: the new process's pidfd is invalid but the child has exited; treating it as gone";
+            gone = true;
+          }
+          if (!gone) {
+            if (reaped == reap_result_e::error) {
+              // An error can occur while the child is alive: handle it like a timeout, at the reap interval.
+              std::this_thread::sleep_for(_t.reap);
+            }
             BOOST_LOG(error) << "Drain handoff: the new process is not gone yet (kill pending); sending SIGKILL again";
             if (!kill_pending) {
               kill_pending = true;
@@ -579,9 +611,6 @@ namespace handoff {
               answer(control_reply_t {reply_kind_e::kill_pending, "kill_pending", 0, 0});
             }
             continue;
-          }
-          if (reaped == reap_result_e::error) {
-            BOOST_LOG(error) << "Drain handoff: the new process's pidfd is invalid; treating it as gone";
           }
           break;
         }
