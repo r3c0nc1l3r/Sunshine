@@ -20,7 +20,7 @@
  *    Otherwise call the terminate callback (production: `rtsp_stream::terminate_sessions_by_cert(canonical_pem)`) once
  *    for each certificate that is new: not in the handled set.
  * 4. The handled set, keyed by the raw PEM from the file, becomes the current disabled set minus the certificates whose
- *    callback threw (logged as an Error; they stay new for the next pass) and minus those that were not processed
+ *    callback threw (they stay new for the next pass; see the Error rate below) and minus those that were not processed
  *    because `stop()` was requested. A skipped (invalid) certificate is in the handled set, so it is not retried or
  *    logged again until it leaves the file's disabled set and returns. The first successful pass has an empty handled
  *    set, so every disabled certificate is new. A certificate that was enabled again and disabled again is new again.
@@ -38,6 +38,11 @@
  * Warning rate: the first failed pass of a failure episode logs a Warning, and further failed passes of the same
  * episode log at most one Warning per 60 s (by the injected clock); the first successful pass after a failure logs an
  * Info line.
+ *
+ * Error rate: a throwing callback logs an Error the first time it throws for a certificate, and at most one further
+ * Error per 60 s (by the injected clock) for that certificate while it keeps throwing. The limit is per certificate: a
+ * throw for another certificate logs its own Error. It resets when the callback succeeds for the certificate or the
+ * certificate leaves the disabled set.
  *
  * Directory: the watched directory is the state file's parent path; a relative path with no parent directory (a bare
  * file name) watches `"."`. If the directory does not exist (or the watch cannot be added), the poller logs one Warning

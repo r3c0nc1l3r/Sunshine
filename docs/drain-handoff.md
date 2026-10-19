@@ -589,8 +589,10 @@ app: it has no process, and it is never executed again. The last session's end l
   `sunshine_state.json` (read-only) whenever it changes (inotify on its directory, checked at least every 2 s) and
   ends the sessions of any client that is disabled there (`enabled=false`, today's semantics [C24]). A client missing
   from the file ends nothing, because a newer state schema could move the list. An unreadable or partial file, or one
-  without a parseable client list, ends no session (logged as a Warning, retried). So a revoked
-  client cannot keep streaming on the draining process until the drain deadline.
+  without a parseable client list, ends no session (logged as a Warning, retried). If ending a disabled client's
+  sessions fails, that client is retried at the next pass; the failure logs an Error the first time and then at most
+  once every 60 s for that client while it keeps failing, so a persistent failure cannot flood the log every 2 s. So a
+  revoked client cannot keep streaming on the draining process until the drain deadline.
 - Each process writes its own `Session ended: reason=<r>, active sessions=<N>` line; N counts that process's sessions.
 - New stop reasons: `drain-deadline` (ended at the drain deadline) and `stop` (a draining session ended because the
   service or the draining process was stopped).
