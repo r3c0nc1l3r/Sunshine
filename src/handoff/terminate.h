@@ -29,7 +29,8 @@
  * (best effort, timeout exactly `peer_request_timeout`, 500 ms: a `std::nullopt` is only logged as a Warning and ends
  * nothing else); (3) the terminate decision above. Step (3) does not depend on step (2)'s reply: `total_session_count()`
  * is read afterwards, so a peer that answered too slowly still shows its sessions and the app is kept. The response
- * never depends on the peer.
+ * never depends on the peer. Step (2) runs in every runtime mode whenever a `session_peer_t` exists (intended: it
+ * only ends the sessions of the cert the operator just disabled, never others, and costs at most 500 ms).
  *
  * ## Shutdown and adopted apps
  *
