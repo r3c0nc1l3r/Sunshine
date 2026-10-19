@@ -5,6 +5,8 @@
 // standard includes
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <stddef.h>  // workaround for type_t error in miniupnpc 2.3.3, see https://github.com/miniupnp/miniupnp/commit/e263ab6f56c382e10fed31347ec68095d691a0e8
@@ -41,6 +43,7 @@ namespace upnp {
       std::vector<planned_mapping_t> own_plan;  ///< Mappings this process requested in `start()`; the second guard.
       std::deque<std::vector<planned_mapping_t>> jobs;  ///< Removal jobs waiting for the worker, in call order.
       bool worker_running = false;  ///< A removal worker thread is draining `jobs`.
+      std::condition_variable idle;  ///< Notified when `worker_running` becomes false.
     };
 
     /**
@@ -57,6 +60,8 @@ namespace upnp {
   }  // namespace
 
   std::vector<planned_mapping_t> plan_mappings(int port, int udp_base, bool web_ui_on_wan) {
+    // This function is pure and does not check the port range. The "Port out of range" warning is logged by
+    // net::map_port and net::map_udp_port where the ports are bound, not here.
     // Same arithmetic as net::map_port (TCP, relative to `port`) and net::map_udp_port (UDP, relative to `udp_base`).
     auto tcp = [port](int offset) {
       return static_cast<std::uint16_t>(port + offset);
@@ -157,15 +162,17 @@ namespace upnp {
 #endif
   }
 
-  /**
-   * @brief Convert a planned mapping into the form the gateway calls take.
-   * @param entry The planned mapping.
-   * @return The mapping with WAN and LAN ports set to the planned port.
-   */
-  mapping_t to_mapping(const planned_mapping_t &entry) {
-    auto port = std::to_string(entry.port);
-    return mapping_t {{port, port, entry.udp ? "UDP"s : "TCP"s}, entry.description};
-  }
+  namespace {
+    /**
+     * @brief Convert a planned mapping into the form the gateway calls take.
+     * @param entry The planned mapping.
+     * @return The mapping with WAN and LAN ports set to the planned port.
+     */
+    mapping_t to_mapping(const planned_mapping_t &entry) {
+      auto port = std::to_string(entry.port);
+      return mapping_t {{port, port, entry.udp ? "UDP"s : "TCP"s}, entry.description};
+    }
+  }  // namespace
 
   /**
    * @brief RAII helper that runs shutdown cleanup when destroyed.
@@ -459,6 +466,17 @@ namespace upnp {
       } while (!shutdown_event->view(REFRESH_INTERVAL));
 
       if (mapped) {
+        // Give a queued background removal up to 3 s to finish, so it does not race this unmap. Wait only here.
+        {
+          auto &shared = state();
+          std::unique_lock lock {shared.mutex};
+          if (!shared.idle.wait_for(lock, 3s, [&shared] {
+                return !shared.worker_running;
+              })) {
+            BOOST_LOG(warning) << "Background UPnP port removal still running after 3 s; unmapping anyway"sv;
+          }
+        }
+
         // Unmap ports upon termination
         BOOST_LOG(info) << "Unmapping UPNP ports..."sv;
         unmap_all_upnp_ports(mapped_urls, data);
@@ -496,11 +514,64 @@ namespace upnp {
 
       for (const auto &entry : entries) {
         auto wan = std::to_string(entry.port);
+
+        // Guard 3: look the mapping up first and delete it only when this host owns it. A UDP mapping that
+        // another LAN host holds is left alone.
+        char intClient[64];
+        char intPort[16];
+        char desc[80];
+        char enabled[4];
+        char leaseDuration[16];
+        auto lookup_err = UPNP_GetSpecificPortMappingEntry(
+          urls->controlURL,
+          data.first.servicetype,
+          wan.c_str(),
+          "UDP",
+          nullptr,
+          intClient,
+          intPort,
+          desc,
+          enabled,
+          leaseDuration
+        );
+        if (lookup_err == 714) {  // NoSuchEntryInArray: nothing to remove
+          BOOST_LOG(debug) << "No UDP mapping to remove for "sv << wan;
+          continue;
+        }
+        if (lookup_err != UPNPCOMMAND_SUCCESS) {
+          BOOST_LOG(warning) << "Skipping removal of UDP "sv << wan << ": lookup failed: "sv << lookup_err;
+          continue;
+        }
+        if (std::strcmp(intClient, lan_addr.data()) != 0) {
+          BOOST_LOG(warning) << "Not removing UDP "sv << wan << ": it is mapped to another LAN host"sv;
+          continue;
+        }
+
         auto del_err = UPNP_DeletePortMapping(urls->controlURL, data.first.servicetype, wan.c_str(), "UDP", nullptr);
         if (del_err && del_err != 714) {  // NoSuchEntryInArray
           BOOST_LOG(warning) << "Failed to remove UDP "sv << wan << ": "sv << del_err;
         } else {
           BOOST_LOG(debug) << "Removed UDP "sv << wan;
+        }
+      }
+    }
+
+    /**
+     * @brief Run one removal job, and contain any exception so it never reaches std::terminate.
+     * @param job The UDP mappings to delete.
+     */
+    void run_job(const std::vector<planned_mapping_t> &job) {
+      try {
+        remove_entries(job);
+      } catch (const std::exception &e) {
+        try {
+          BOOST_LOG(warning) << "UPnP port removal failed: "sv << e.what();
+        } catch (...) {
+        }
+      } catch (...) {
+        try {
+          BOOST_LOG(warning) << "UPnP port removal failed"sv;
+        } catch (...) {
         }
       }
     }
@@ -517,12 +588,13 @@ namespace upnp {
           std::lock_guard lock {shared.mutex};
           if (shared.jobs.empty()) {
             shared.worker_running = false;
+            shared.idle.notify_all();
             return;
           }
           job = std::move(shared.jobs.front());
           shared.jobs.pop_front();
         }
-        remove_entries(job);
+        run_job(job);
       }
     }
   }  // namespace
@@ -574,7 +646,14 @@ namespace upnp {
     shared.jobs.push_back(std::move(entries));
     if (!shared.worker_running) {
       shared.worker_running = true;
-      std::thread {removal_worker}.detach();
+      try {
+        std::thread {removal_worker}.detach();
+      } catch (const std::exception &e) {
+        // The worker never started, so this job is the only one queued: drop it and clear the flag.
+        shared.worker_running = false;
+        shared.jobs.pop_back();
+        BOOST_LOG(warning) << "Could not start the UPnP port removal worker, dropping the job: "sv << e.what();
+      }
     }
   }
 }  // namespace upnp
