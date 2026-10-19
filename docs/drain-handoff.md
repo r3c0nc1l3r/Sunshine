@@ -77,18 +77,17 @@ answers the helper with the reason, keeps running unchanged) when:
 - a handoff is in progress, a draining instance exists (known from the open channel and the instance files), or the
   cooldown has not passed;
 - an application with a running process is active, because the new process cannot adopt processes: the app is not in
-  placebo mode, or it is in placebo mode but its process group still has running processes (an `auto-detach` app
-  whose launcher exited while the processes it started keep running [C11]). This needs a new read accessor
-  ("adoptable": the `placebo` flag is set, and the process group is not valid or `kill(-pgid, 0)` finds no process in
-  it). The accessor reads the fields directly and never calls `running()`, which can itself terminate the app and run
-  `undo` commands [C21]. `kill(-pgid, 0)` also sees processes that are no longer Sunshine's children, unlike
-  `process_group_running` [C11]; `EPERM` counts as a process present. With no app running there is nothing to adopt
-  (the snapshot says none). A process that joins the adopted app's process group after the handoff is not killed by the
-  new process's terminate, which has no group (today `terminate_process_group` would kill it [C11]); adoption needs an
-  empty group, so this needs a process that the app started before and that started another one later. A non-placebo
-  app whose process has exited but has not been polled yet is refused; the
-  next `running()` poll clears it and the helper can retry. A desktop-style app (placebo mode, no
-  process group left) is adopted, see "App ownership and prep commands";
+  placebo mode, or it is in placebo mode but its process group still has running processes (an `auto-detach` app whose
+  launcher exited while the processes it started keep running [C11]). This needs a new read accessor ("adoptable": the
+  `placebo` flag is set, and the process group is not valid or `kill(-pgid, 0)` finds no process in it). The accessor
+  reads the fields directly and never calls `running()`, which can itself terminate the app and run `undo` commands
+  [C21]. `kill(-pgid, 0)` also sees processes that are no longer Sunshine's children, unlike `process_group_running`
+  [C11]; `EPERM` counts as a process present. With no app running there is nothing to adopt (the snapshot says none). A
+  process that moves into the adopted app's empty process group after the handoff (with `setpgid`) is not killed by the
+  new process's terminate, which has no group; today `terminate_process_group` would kill it [C11]. This is an accepted
+  difference. A non-placebo app whose process has exited but has not been polled yet is refused; the next `running()`
+  poll clears it and the helper can retry. A desktop-style app (placebo mode, no process group left) is adopted, see
+  "App ownership and prep commands";
 - a pairing is in progress: after `expire_pair_sessions` [C14], the pairing session map is not empty (a
   `getservercert` request can wait for its PIN, so the handoff does not wait for it);
 - a launch is pending: the RTSP server holds a raised launch session (`launch_event`) whose client has not started
@@ -156,16 +155,16 @@ On `READY` the old process, in this order:
    its own connection [C15], so pausing accept is enough. `/serverinfo` is still answered on keep-alive connections and
    reports the old process's `currentgame` (harmless; documented); it reads the running app, which the swap does not
    touch [C33];
-3. waits for the state-changing requests already in progress to finish. These are tracked by route, not by method (all
-   client routes are GETs [C13]): `/pair`, `/launch`, `/resume`, `/cancel`, `/applist`, `/appasset` and the web UI write
-   APIs each increment an in-flight counter on entry and decrement it on exit (an RAII guard, so every return path
-   decrements). Order matters, because the HTTP, HTTPS and web UI servers run on separate threads: a handler first
-   increments the counter, then checks the gate (and if it is set, decrements and answers 503); the switcher first sets
-   the gate, then waits for zero (sequentially consistent atomics). Only these counters are waited on. A launch that
-   answers during this wait raises a launch session (its `do` commands have run); step 4 handles it. The wait is bounded
-   (5 s). If it times out, the handoff fails: the old process lifts the 503 gate, resumes accepting, kills and reaps the
-   new process, removes the new process's instance file, and answers the helper non-zero. Clients that got a 503 during
-   the attempt retry;
+3. waits for the state-changing requests, and the `/applist` and `/appasset` reads, already in progress to finish. These
+   are tracked by route, not by method (all client routes are GETs [C13]): `/pair`, `/launch`, `/resume`, `/cancel`,
+   `/applist`, `/appasset` and the web UI write APIs each increment an in-flight counter on entry and decrement it on
+   exit (an RAII guard, so every return path decrements). Order matters, because the HTTP, HTTPS and web UI servers run
+   on separate threads: a handler first increments the counter, then checks the gate (and if it is set, decrements and
+   answers 503); the switcher first sets the gate, then waits for zero (sequentially consistent atomics). Only these
+   counters are waited on. A launch that answers during this wait raises a launch session (its `do` commands have run);
+   step 4 handles it. The wait is bounded (5 s). If it times out, the handoff fails: the old process lifts the 503 gate,
+   resumes accepting, kills and reaps the new process, removes the new process's instance file, and answers the helper
+   non-zero. Clients that got a 503 during the attempt retry;
 4. repeats the step-1 checks that can have changed since then: an app that is not adoptable fails the handoff as in
    step 3. A pairing session (the map holds it while it waits for the PIN, after `/pair` has answered [C14]) or a
    pending launch [C5] can only end now, because the gate refuses new ones: the old process waits for them to finish
@@ -223,20 +222,21 @@ re-arm its accept after `operation_aborted`, so resuming must start its accept a
 - **Rule:** whenever the old process is still the main process (inside the window, or later while the handover in
   step 7 keeps failing), a dead or hung new process triggers a rollback.
 - A death of the new process between `READY` and `GO` is handled as a full rollback too.
-- On a dead or hung new process, the old process, in this order: waits for the in-flight counters to reach zero
-  (bounded, 5 s; the gate is still up, so they only fall), reloads both state files and the credentials file and
-  swaps in the app list (see "App ownership and prep commands"), takes the app back or drops it, then lifts the 503
-  gate, resumes accepting on its socket copies, publishes mDNS, restores its tray icon, and leaves drain mode. Nothing
-  is reloaded while the gated routes are served, and the routes that stay open do not read the app list.
-  systemd sees no main-process exit, so the unit and the old process's sessions are not affected. The new process's
-  sessions are lost; apps it launched and `do` commands it ran are not undone (logged as a Warning), and its instance
-  file is removed by the old process. After a rollback the old process takes back app ownership (see "App ownership
-  and prep commands") and makes its own virtual sink the default sink again if it has sessions.
+- On a dead or hung new process, the old process, in this order: waits for the in-flight counters to reach zero (the
+  gate is still up, so they only fall; it keeps the gate up and waits as long as needed, logging a Warning every 5 s,
+  and never swaps while a counted request runs), reloads both state files and the credentials file and swaps in the app
+  list (see "App ownership and prep commands"), takes the app back or drops it, then lifts the 503 gate, resumes
+  accepting on its socket copies, publishes mDNS, restores its tray icon, and leaves drain mode. Nothing is reloaded
+  while the gated routes are served, and the routes that stay open do not read the app list. systemd sees no
+  main-process exit, so the unit and the old process's sessions are not affected. The new process's sessions are lost;
+  apps it launched and `do` commands it ran are not undone (logged as a Warning), and its instance file is removed by
+  the old process. After a rollback the old process takes back app ownership (see "App ownership and prep commands") and
+  makes its own virtual sink the default sink again if it has sessions.
 - `END_ALL` against rollback, in the old process: one state, `idle`, `ending`, `ended` or `rolling_back`, changed
   under a mutex that is never held across a join or a channel send (sends use `MSG_DONTWAIT`).
   - `END_ALL` in `idle` moves to `ending`, ends and joins the sessions, sends `ENDED`, and moves to `ended`.
-  - `END_ALL` in `ending` (a second terminate while the first still waits) waits for the first and is then answered
-    `ENDED`; `END_ALL` in `ended` is answered `ENDED` at once.
+  - `END_ALL` in `ending` (a second terminate while the first still waits) waits for the first and gets the same answer
+    (`ENDED`, or `END_REJECTED` if a rollback was decided meanwhile); `END_ALL` in `ended` is answered `ENDED` at once.
   - `END_ALL` in `rolling_back` is answered `END_REJECTED`; the active process treats it like a timeout.
   - The state starts at `idle` for each handoff. An `ENDED` that cannot be sent (`EAGAIN`) is logged; the active
     process then times out and does not terminate, which is safe.
@@ -270,7 +270,9 @@ units) and a 5 s timeout.
 If the read-back times out although systemd has already applied `MAINPID=`, the old process still acts as the main
 process. A later death of the new process is then a main-process exit for systemd: the unit stops and `Restart=`
 applies, as in "the new process dies after the handover" below. No state is lost beyond that. The same holds for a
-death of the new process between the read-back and `MAIN`: systemd already tracks it as the main process.
+death of the new process between the read-back and `MAIN`: systemd already tracks it as the main process. So once the
+read-back has succeeded the old process never rolls back (it has closed its socket copies): a channel error or a dead
+new process from then on is only logged, and systemd handles the main-process exit.
 
 From the handover on, the new process is the main process and sends any later notifications (`STATUS=`, `STOPPING=1`).
 A dead new process after the handover is a normal main-process exit: with `KillMode=control-group` systemd stops the
@@ -289,9 +291,10 @@ get reason `drain-deadline`.
 - `SIGTERM` to the draining process alone (by pid) ends only its sessions, with reason `stop`. This is the way to end
   draining sessions when the channel is lost.
 - `SIGTERM` to the new process alone before `MAIN`: its shutdown terminates the adopted app, so it sends `END_ALL`
-  first, which ends the old process's sessions; the old process then sees the new one die and rolls back with no app
-  and no sessions. The `undo` commands run once; the old sessions are lost. Use `systemctl reload` again or
-  `systemctl restart` instead.
+  first, which ends the old process's sessions; the old process then sees the new one die and rolls back with no app and
+  no sessions. The `undo` commands run at most once (the shutdown budget is 5 s, and the old process's joins can take up
+  to 10 s, so they can be skipped); the old sessions are lost. Use `systemctl reload` again or `systemctl restart`
+  instead.
 - In-place restart (`/api/restart`, tray restart; both `execv` the binary):
   - in the active role while a draining process exists or a handoff is in progress: refused (409 for the API, a
     Warning in the log). The 409 body names the ways out: wait for the drain, `SIGTERM` to the draining pid (ends its
@@ -588,6 +591,11 @@ RuntimeDirectory=sunshine
     the app, the mutex is never held across a join or a send;
   - a channel error before `MAIN` makes the old process roll back at once;
   - `/applist` and `/appasset` on a keep-alive connection to a draining or rolling-back process get 503;
+  - `END_ALL` in `ending` (a second terminate) and in `ended`; an `ENDED` send that fails with `EAGAIN` is logged and
+    the active process does not terminate; `/cancel` with no running app still sends `END_ALL`;
+  - a rollback waits for in-flight `/applist` and `/appasset` before swapping the app list; after a successful
+    read-back no rollback happens;
+  - `SIGTERM` to the new process alone before `MAIN`: `undo` at most once, the old process rolls back with no app;
   - a pause that races a successful accept does not re-arm; rollback swaps the app list while the control loop polls
     `running()` and never sees 0;
   - `END_ALL`: every terminate path waits for `ENDED` (or the draining process's pidfd, opened at `HELLO`, showing it
