@@ -790,6 +790,7 @@ namespace {
       q.sleep_for = [this](std::chrono::milliseconds d) {
         ++sleep_calls;
         sleep_max_ms = std::max<long long>(sleep_max_ms.load(), d.count());
+        clk.advance(d);  // the refusal sources read the fake clock, so waiting must move it
         if (on_sleep) {
           on_sleep();
         }
@@ -1886,13 +1887,15 @@ TEST_F(HandoffCoordinatorTest, OpsRecheckStopsAtTheFirstFailingStep) {
 TEST_F(HandoffCoordinatorTest, OpsRecheckWaitsForPairingThenGivesThePairingReason) {
   pairing_value = 2;
   auto ops = direct_ops();
-  const auto start = std::chrono::steady_clock::now();
+  const auto wall_start = std::chrono::steady_clock::now();
+  const auto fake_start = clk.now();
   EXPECT_EQ(std::string {hf::refusal_reason::pairing}, ops->recheck(60ms));
-  const auto elapsed = std::chrono::steady_clock::now() - start;
-  EXPECT_GE(elapsed, 55ms) << "the pairing wait lasts up to pairing_wait";
-  EXPECT_LT(elapsed, 1500ms) << "the pairing wait is bounded";
+  const auto fake_elapsed = clk.now() - fake_start;
+  EXPECT_GE(fake_elapsed, 60ms) << "the pairing wait lasts at least pairing_wait on the sources' clock";
+  EXPECT_LT(fake_elapsed, 60ms + hf::recheck_poll_period) << "and not more than one poll period longer";
   EXPECT_GT(sleep_calls.load(), 0) << "the wait polls through the sleep seam";
   EXPECT_LE(sleep_max_ms.load(), hf::recheck_poll_period.count()) << "the poll period is at most recheck_poll_period";
+  EXPECT_LT(std::chrono::steady_clock::now() - wall_start, 1500ms) << "guard: the wait must not hang";
 }
 
 TEST_F(HandoffCoordinatorTest, OpsRecheckSucceedsWhenPairingEndsDuringTheWait) {
