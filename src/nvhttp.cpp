@@ -280,6 +280,9 @@ namespace nvhttp {
 
     // Only the keys this save owns are replaced; every other key under `root` is kept.
     root.put("root.uniqueid", http::unique_id);
+    // The legacy `devices` list was imported into named_devices by the loader. Keeping it would re-import unpaired
+    // clients (with fresh uuids) on every load, so it is dropped here, as the old full-rewrite save did.
+    root.get_child("root").erase("devices"s);
     client_t &client = client_root;
     pt::ptree node;
 
@@ -1927,6 +1930,10 @@ namespace nvhttp {
   }
 
   void set_next_launch_session_id(std::uint32_t next_id) {
+    // Ids start at 1, so a next id of 0 is treated as 1 (otherwise the next allocation would be 0).
+    if (next_id == 0) {
+      next_id = 1;
+    }
     session_id_counter.store(next_id - 1u);
   }
 
