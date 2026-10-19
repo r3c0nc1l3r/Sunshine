@@ -18,6 +18,9 @@ if(${SUNSHINE_BUILD_APPIMAGE} OR ${SUNSHINE_BUILD_FLATPAK})
             DESTINATION "${SUNSHINE_ASSETS_DIR}/modules-load.d")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/app-${PROJECT_FQDN}.service"
             DESTINATION "${SUNSHINE_ASSETS_DIR}/systemd/user")
+    # opt-in drop-in example; not installed into an active *.service.d/ directory
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/drain-handoff.conf"
+            DESTINATION "${SUNSHINE_ASSETS_DIR}/systemd")
 elseif(${SUNSHINE_BUILD_HOMEBREW})
     install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-sunshine.rules"
             DESTINATION "${CMAKE_INSTALL_LIBDIR}/udev/rules.d")
@@ -25,6 +28,9 @@ elseif(${SUNSHINE_BUILD_HOMEBREW})
             DESTINATION "${CMAKE_INSTALL_LIBDIR}/modules-load.d")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/app-${PROJECT_FQDN}.service"
             DESTINATION ".")
+    # opt-in drop-in example; not installed into an active *.service.d/ directory
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/drain-handoff.conf"
+            DESTINATION "${SUNSHINE_ASSETS_DIR}/systemd")
 else()
     find_package(Systemd)
     find_package(Udev)
@@ -42,6 +48,9 @@ else()
     if(SYSTEMD_FOUND)
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/app-${PROJECT_FQDN}.service"
                 DESTINATION "${SYSTEMD_USER_UNIT_INSTALL_DIR}")
+        # opt-in drop-in example; not installed into an active *.service.d/ directory
+        install(FILES "${CMAKE_CURRENT_BINARY_DIR}/drain-handoff.conf"
+                DESTINATION "${SUNSHINE_ASSETS_DIR}/systemd")
         install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-sunshine.conf"
                 DESTINATION "${SYSTEMD_MODULES_LOAD_DIR}")
     endif()
