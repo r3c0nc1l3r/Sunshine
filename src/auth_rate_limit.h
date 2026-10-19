@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -19,9 +20,12 @@ namespace confighttp {
    *
    * A source's failures are counted from its first failure in the current window. The failure that reaches
    * `max_failures` starts a lockout that lasts until `first_failure + window`. Once the window has passed, the
-   * source's counter starts again. The table holds at most `max_sources` sources; when it is full, the source
-   * with the oldest first failure is evicted. All members are thread-safe. The class is pure logic: it never
-   * reads the clock, so callers pass the time point.
+   * source's counter starts again. The table holds at most `max_sources` sources. When a new source must be added
+   * to a full table, every source whose window has ended is dropped first. If none was dropped, the source with
+   * the oldest first failure among those that are not locked out is evicted. Only when every source is locked out
+   * is the locked source with the oldest first failure evicted. So a flood of new addresses cannot clear a live
+   * lockout while unlocked sources exist. All members are thread-safe. The class is pure logic: it never reads
+   * the clock, so callers pass the time point.
    */
   class auth_rate_limiter_t {
   public:
@@ -42,6 +46,16 @@ namespace confighttp {
      * @return True while `source` is locked out at `now`.
      */
     bool blocked(std::string_view source, std::chrono::steady_clock::time_point now);
+
+    /**
+     * @brief Get the time left in a source's lockout.
+     *
+     * @param source Normalized source address.
+     * @param now Current time point.
+     * @return While `source` is locked out at `now`, the time left until the lockout ends, rounded up to whole
+     *         seconds and at least one second. Otherwise an empty optional.
+     */
+    std::optional<std::chrono::seconds> retry_after(std::string_view source, std::chrono::steady_clock::time_point now);
 
     /**
      * @brief Record one failed authentication for a source.
@@ -81,6 +95,16 @@ namespace confighttp {
      * @return True when `now` is at or after `first_failure + window`.
      */
     bool expired(const entry_t &entry, std::chrono::steady_clock::time_point now) const;
+
+    /**
+     * @brief Make room in a full table for a new source. The caller must hold `mutex`.
+     *
+     * Drops every expired entry. When none was dropped, evicts the unlocked entry with the oldest first failure,
+     * or, when every entry is locked out, the locked entry with the oldest first failure.
+     *
+     * @param now Current time point.
+     */
+    void make_room(std::chrono::steady_clock::time_point now);
 
     const std::size_t max_failures;  ///< Failures inside one window that start a lockout.
     const std::chrono::seconds window;  ///< Length of the failure window and of the lockout.

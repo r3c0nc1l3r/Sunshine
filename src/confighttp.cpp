@@ -644,8 +644,9 @@ namespace confighttp {
    * @brief Send a 429 Too Many Requests response for a source that is locked out.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
+   * @param retry_after Time left in the lockout, sent as the `Retry-After` header in seconds.
    */
-  void send_too_many_requests(const resp_https_t &response, [[maybe_unused]] const req_https_t &request) {
+  void send_too_many_requests(const resp_https_t &response, [[maybe_unused]] const req_https_t &request, std::chrono::seconds retry_after) {
     constexpr auto code = SimpleWeb::StatusCode::client_error_too_many_requests;
 
     nlohmann::json tree;
@@ -655,6 +656,7 @@ namespace confighttp {
 
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");
+    headers.emplace("Retry-After", std::to_string(retry_after.count()));
     headers.emplace("X-Frame-Options", "DENY");
     headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
 
@@ -684,9 +686,12 @@ namespace confighttp {
 
     const auto now = std::chrono::steady_clock::now();
     const bool rate_limited = is_auth_rate_limit_enabled();
-    if (rate_limited && get_auth_rate_limiter().blocked(address, now)) {
-      send_too_many_requests(response, request);
-      return false;
+    // retry_after() is set exactly while the source is locked out, so one lookup decides the 429 and its header
+    if (rate_limited) {
+      if (const auto retry_after = get_auth_rate_limiter().retry_after(address, now)) {
+        send_too_many_requests(response, request, *retry_after);
+        return false;
+      }
     }
 
     auto fg = util::fail_guard([&]() {

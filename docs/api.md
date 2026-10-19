@@ -9,10 +9,13 @@ basic authentication with the admin username and password.
 
 The web UI API counts failed authentication attempts per client address (the TCP peer address; forwarded headers are
 never used). After 10 failed attempts from one address within 5 minutes, further requests from that address get
-`429 Too Many Requests` with a JSON error body, without an authentication check. The block lasts until 5 minutes after
-the first failure in the window. Requests from other addresses are not affected. The table of tracked addresses is
-bounded; when it is full, the address with the oldest first failure is dropped. A request without an `Authorization`
-header gets `401` and is not counted.
+`429 Too Many Requests` with a JSON error body, without an authentication check. The 429 response carries a
+`Retry-After` header with the number of seconds until the block ends (a whole number, at least 1). The block lasts until
+5 minutes after the first failure in the window. Requests from other addresses are not affected. The table of tracked
+addresses is bounded (at most 1024). When a new address must be added to a full table, addresses whose window has ended
+are dropped first. If there are none, the unlocked address with the oldest first failure is dropped. Only when every
+tracked address is locked out is the locked address with the oldest first failure dropped. A request without an
+`Authorization` header gets `401` and is not counted.
 
 ## CSRF Protection
 
