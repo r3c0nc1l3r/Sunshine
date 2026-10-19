@@ -392,11 +392,13 @@ TEST(HandoffSpawnTest, ValidateListenerAcceptsIpv6AndRejectsItForIpv4) {
   if (s.fd < 0) {
     GTEST_SKIP() << "IPv6 not available";
   }
+  int dual = 0;
+  ::setsockopt(s.fd, IPPROTO_IPV6, IPV6_V6ONLY, &dual, sizeof(dual));
   sockaddr_in6 addr {};
   addr.sin6_family = AF_INET6;
-  addr.sin6_addr = in6addr_loopback;
+  addr.sin6_addr = in6addr_any;
   if (::bind(s.fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 || ::listen(s.fd, 4) != 0) {
-    GTEST_SKIP() << "cannot listen on the IPv6 loopback";
+    GTEST_SKIP() << "cannot listen on the IPv6 wildcard address";
   }
   int port = port_of(s.fd);
   EXPECT_EQ("", handoff::validate_listener(s.fd, port, true)) << "a listening IPv6 socket is valid for ipv6=true";
@@ -412,9 +414,9 @@ TEST(HandoffSpawnTest, ValidateListenerIpv6RejectsV6OnlyAndAcceptsDualStack) {
     ASSERT_EQ(0, ::setsockopt(s.fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)));
     sockaddr_in6 addr {};
     addr.sin6_family = AF_INET6;
-    addr.sin6_addr = in6addr_loopback;
+    addr.sin6_addr = in6addr_any;
     if (::bind(s.fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 || ::listen(s.fd, 4) != 0) {
-      GTEST_SKIP() << "cannot listen on the IPv6 loopback";
+      GTEST_SKIP() << "cannot listen on the IPv6 wildcard address";
     }
     auto reason = handoff::validate_listener(s.fd, port_of(s.fd), true);
     if (v6only) {
