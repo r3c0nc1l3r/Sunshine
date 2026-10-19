@@ -76,6 +76,10 @@ namespace {
    * @brief RAII guard that points DBUS_SESSION_BUS_ADDRESS at an unreachable bus for its lifetime.
    *
    * The previous value is restored on destruction, or the variable is unset if it was not set before.
+   *
+   * Note: GLib caches the session-bus connection per process. The address override only isolates
+   * the test when nothing earlier in the process has connected to the session bus. No other test
+   * does today; run the suite with --gtest_filter=PortalgrabFdTest* when in doubt.
    */
   class unreachable_bus_guard_t {
   public:
@@ -101,10 +105,10 @@ namespace {
       }
     }
 
-    unreachable_bus_guard_t(const unreachable_bus_guard_t &) = delete;
-    unreachable_bus_guard_t &operator=(const unreachable_bus_guard_t &) = delete;
-    unreachable_bus_guard_t(unreachable_bus_guard_t &&) = delete;
-    unreachable_bus_guard_t &operator=(unreachable_bus_guard_t &&) = delete;
+    unreachable_bus_guard_t(const unreachable_bus_guard_t &) = delete;  ///< Not copyable.
+    unreachable_bus_guard_t &operator=(const unreachable_bus_guard_t &) = delete;  ///< Not copy-assignable.
+    unreachable_bus_guard_t(unreachable_bus_guard_t &&) = delete;  ///< Not movable.
+    unreachable_bus_guard_t &operator=(unreachable_bus_guard_t &&) = delete;  ///< Not move-assignable.
 
   private:
     std::optional<std::string> previous_value_;  ///< Bus address before the guard ran, if any.
@@ -118,6 +122,59 @@ namespace {
   int open_dev_null() {
     return ::open("/dev/null", O_RDONLY);
   }
+
+  /**
+   * @brief RAII owner of a test-created descriptor that closes it on every exit path.
+   *
+   * The descriptor is closed only if it still refers to the object recorded at construction.
+   */
+  class owned_fd_guard_t {
+  public:
+    /**
+     * @brief Take ownership of a descriptor and record its identity.
+     *
+     * @param fd Descriptor the test opened; may be negative when the open failed.
+     */
+    explicit owned_fd_guard_t(int fd):
+        fd_(fd),
+        identity_(fd >= 0 ? identify_fd(fd) : std::nullopt) {}
+
+    /**
+     * @brief Close the descriptor if it is still the same object that was recorded.
+     */
+    ~owned_fd_guard_t() {
+      if (identity_.has_value() && same_open_object(fd_, *identity_)) {
+        ::close(fd_);
+      }
+    }
+
+    owned_fd_guard_t(const owned_fd_guard_t &) = delete;  ///< Not copyable.
+    owned_fd_guard_t &operator=(const owned_fd_guard_t &) = delete;  ///< Not copy-assignable.
+    owned_fd_guard_t(owned_fd_guard_t &&) = delete;  ///< Not movable.
+    owned_fd_guard_t &operator=(owned_fd_guard_t &&) = delete;  ///< Not move-assignable.
+
+    /**
+     * @brief Descriptor number held by the guard.
+     *
+     * @return The file descriptor.
+     */
+    [[nodiscard]] int fd() const {
+      return fd_;
+    }
+
+    /**
+     * @brief Identity recorded when the guard was constructed.
+     *
+     * @return The recorded device and inode, or std::nullopt if fstat failed.
+     */
+    [[nodiscard]] const std::optional<fd_identity_t> &identity() const {
+      return identity_;
+    }
+
+  private:
+    int fd_;  ///< Descriptor owned by this guard.
+    std::optional<fd_identity_t> identity_;  ///< Identity recorded at construction.
+  };
 }  // namespace
 
 /**
@@ -155,10 +212,10 @@ TEST(PortalgrabFdTest, RepeatedFailedEnumerationsKeepFdsOpen) {
   const auto fd0_before = identify_fd(0);
   ASSERT_TRUE(fd0_before.has_value()) << "Setup: fstat on fd 0 should succeed before the calls";
 
-  const int owned_fd = open_dev_null();
-  ASSERT_GE(owned_fd, 0) << "Setup: opening /dev/null for the test-owned descriptor should succeed";
-  const auto owned_before = identify_fd(owned_fd);
-  ASSERT_TRUE(owned_before.has_value()) << "Setup: fstat on the test-owned descriptor should succeed";
+  // The guard closes the test-owned descriptor on every exit path, including failed ASSERTs.
+  owned_fd_guard_t owned(open_dev_null());
+  ASSERT_GE(owned.fd(), 0) << "Setup: opening /dev/null for the test-owned descriptor should succeed";
+  ASSERT_TRUE(owned.identity().has_value()) << "Setup: fstat on the test-owned descriptor should succeed";
 
   for (int i = 0; i < 3; ++i) {
     const auto names = platf::portal_display_names();
@@ -167,11 +224,6 @@ TEST(PortalgrabFdTest, RepeatedFailedEnumerationsKeepFdsOpen) {
 
   EXPECT_NE(::fcntl(0, F_GETFD), -1) << "After repeated calls: fd 0 must still be open";
   EXPECT_TRUE(same_open_object(0, *fd0_before)) << "After repeated calls: fd 0 must still refer to the same object";
-  EXPECT_TRUE(same_open_object(owned_fd, *owned_before)) << "After repeated calls: the test-owned fd must still be open and unchanged";
-
-  // Close the test-owned descriptor only if it is still the same object we opened.
-  if (same_open_object(owned_fd, *owned_before)) {
-    ::close(owned_fd);
-  }
+  EXPECT_TRUE(same_open_object(owned.fd(), *owned.identity())) << "After repeated calls: the test-owned fd must still be open and unchanged";
 }
 #endif
