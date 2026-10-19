@@ -5,6 +5,31 @@ https://github.com/LizardByte/Sunshine/releases.
 
 ## Unreleased
 
+### Added
+- Drain handoff (Linux, opt-in, `drain_handoff = enabled`): `systemctl reload` runs `sunshine --drain-handoff
+  $MAINPID`, which starts a new Sunshine process that takes over the listeners and the unit's main PID. The old process
+  keeps its running sessions until they end or `drain_handoff_deadline` passes, then exits; new clients reach the new
+  process. A switch that fails rolls back to the old process. New options `drain_handoff`, `drain_handoff_udp_offset`,
+  `drain_handoff_deadline`, `drain_handoff_ready_timeout`, `drain_handoff_rollback_window`, `drain_handoff_cooldown`
+  and `drain_handoff_binary`. Needs systemd 254 or newer. See `docs/drain-handoff.md` (#28-#37).
+- Example systemd drop-in `drain-handoff.conf` (`Type=notify`, `NotifyAccess=main`, the `ExecReload` line,
+  `TimeoutStopSec=30`), installed in the `systemd` directory of the Sunshine assets. It is not active until copied into
+  the unit's drop-in directory; the shipped unit is unchanged.
+- Session API: each entry of `GET /api/sessions` has `draining`, and the reply has a top-level `handoff` (`none`,
+  `draining`, `handover_failed` or `kill_pending`). The draining process's sessions are listed after this process's
+  own, and `POST /api/sessions/<id>/close` closes them too; the audit line is written by the active process.
+- Stop reasons `drain-deadline` and `stop` in the `Session ended` line.
+
+### Changed
+- Whenever `NOTIFY_SOCKET` is set, Sunshine sends `READY=1` once its servers run, also when the drain handoff is
+  disabled. It has no effect on `Type=simple` units such as the shipped one.
+- Audio: when the default sink is already a Sunshine virtual sink (`sink-sunshine-*`) at stream start, it is no longer
+  recorded as the host sink. The recorded host sink is then empty, and the stream's end restores `audio_sink` from the
+  configuration instead.
+- With the drain handoff enabled, the in-place restart (`POST /api/restart`, the tray entry) is refused while a handoff
+  is in progress or a draining process exists, and in a draining or not yet active process (409 with the reason for
+  the API). Quit is refused only in a draining or not yet active process.
+
 ### Fixed
 - Portal capture: a portal helper that never opened a PipeWire remote no longer closes fd 0 when it is destroyed (for
   example at startup when the portal is unavailable). Its fd and D-Bus pointers now start unset (#39).
