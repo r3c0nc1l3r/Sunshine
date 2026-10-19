@@ -186,6 +186,10 @@ namespace handoff {
       if (n == 0) {
         return fail(recv_status_e::eof);
       }
+      if (msg.msg_flags & MSG_CTRUNC) {
+        // Control data was cut off: an fd may have been lost, so the message cannot be trusted.
+        return fail(recv_status_e::malformed);
+      }
       if ((msg.msg_flags & MSG_TRUNC) || static_cast<std::size_t>(n) > protocol::max_message_size) {
         return fail(recv_status_e::oversized);
       }
@@ -262,7 +266,6 @@ namespace handoff {
 
   void request_tracker_t::fail_all() {
     std::lock_guard lock {_mutex};
-    ++_fail_generation;
     for (auto it = _pending.begin(); it != _pending.end();) {
       it = it->second.has_value() ? std::next(it) : _pending.erase(it);
     }
