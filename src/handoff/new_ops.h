@@ -334,6 +334,11 @@ namespace handoff {
      * (`start_adopted(fd, true, ...)`, `rtsp_stream::adopt_listener(fd, true)`), so this op does not pause anything.
      * Sets the stage `ready` on success.
      *
+     * After every server has adopted its listener (all listening callbacks fired), closes the four inherited listener
+     * fds exactly once; the servers keep their own close-on-exec duplicates. On every path where they were not adopted
+     * (`exit_failure`, a failed or timed-out validation, `mark_finished` without adoption), the inherited listener fds
+     * are closed there. The channel fd is never closed here.
+     *
      * @return `""` on success; otherwise a one-line reason: the one given to `servers_failed`, or "servers did not
      *         start listening within <n> s (<k> of 4)", or "shutdown requested".
      */
@@ -495,6 +500,11 @@ namespace handoff {
     new_stage_e stage() const;
 
   private:
+    /**
+     * @brief Close the four inherited listener fds once (never the channel fd). Later calls do nothing.
+     */
+    void close_inherited_listeners();
+
     new_ops_config_t _config;  ///< Configuration facts.
     new_ops_seams_t _seams;  ///< Seams with defaults filled in.
     std::shared_ptr<channel_t> _channel;  ///< The channel (for `abort()` and `runtime().set_channel()`).
@@ -511,5 +521,6 @@ namespace handoff {
     int _listening {0};  ///< Number of `server_listening()` calls.
     std::optional<std::string> _servers_failed;  ///< First reason given to `servers_failed()`.
     bool _finished {false};  ///< `mark_finished()` ran.
+    bool _listeners_closed {false};  ///< The inherited listener fds were closed (guarded by `_mutex`).
   };
 }  // namespace handoff
