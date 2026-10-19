@@ -94,9 +94,11 @@ namespace rtsp_stream {
   };
 
   /**
-   * @brief List the streaming sessions that the RTSP server tracks.
+   * @brief List the live streaming sessions (running or stopping) that the RTSP server tracks.
    *
-   * @return One entry per session, ordered by id.
+   * Sessions that have not started yet are not listed.
+   *
+   * @return One entry per live session, ordered by id.
    */
   std::vector<session_info_t> list_sessions();
 

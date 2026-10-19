@@ -90,8 +90,9 @@ namespace confighttp {
   /**
    * @brief Close one streaming session by id (`POST /api/sessions/<id>/close`).
    *
-   * Requires admin authentication and a CSRF token. Every close is logged at Info with the session id,
-   * the authenticated user and the source address.
+   * Requires admin authentication and a CSRF token. Every authenticated request is logged at Info with the
+   * session id, the authenticated user, the source address and the result (`closed`, `not-found`,
+   * `csrf-rejected` or `bad-id`).
    *
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client; `path_match[1]` is the session id.
