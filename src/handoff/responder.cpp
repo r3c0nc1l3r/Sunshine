@@ -302,7 +302,8 @@ namespace handoff {
           }
 
           // Take the waiters and clear the running flag in one critical section. The thread marks itself done here
-          // too, so that it is not counted against the CLOSE_CERT cap while it sends the replies.
+          // too, so that it is not counted against the CLOSE_CERT cap while it sends the replies (the cap count depends on
+          // this). A reap may therefore join a runner that is still sending; that is brief, because sends do not block.
           std::vector<std::uint64_t> waiters;
           bool stopping = false;
           {
@@ -324,9 +325,15 @@ namespace handoff {
             BOOST_LOG(warning) << "Drain handoff: late END_ALL reply";
           }
           for (const auto id : waiters) {
-            const bool sent = answer == end_all_answer_e::ended ? _channel.send(protocol::ended_t {id}) : _channel.send(protocol::end_rejected_t {id});
-            if (!sent) {
-              BOOST_LOG(warning) << "Drain handoff: cannot send the END_ALL reply";
+            try {
+              const bool sent = answer == end_all_answer_e::ended ? _channel.send(protocol::ended_t {id}) : _channel.send(protocol::end_rejected_t {id});
+              if (!sent) {
+                BOOST_LOG(warning) << "Drain handoff: cannot send the END_ALL reply";
+              }
+            } catch (const std::exception &e) {
+              BOOST_LOG(error) << "Drain handoff: sending the END_ALL reply failed: " << e.what();
+            } catch (...) {
+              BOOST_LOG(error) << "Drain handoff: sending the END_ALL reply failed";
             }
           }
         });
