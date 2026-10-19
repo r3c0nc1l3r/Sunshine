@@ -5,6 +5,7 @@
 #include "terminate.h"
 
 // standard includes
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -22,6 +23,7 @@ namespace handoff {
 #ifdef SUNSHINE_TESTS
     std::mutex test_hook_mutex;  ///< Guards `test_terminate`.
     std::function<void()> test_terminate;  ///< Replacement for `proc::proc.terminate()`, or empty.
+    std::atomic<long long> test_request_budget_ms {0};  ///< Override of `request_budget()` in ms; 0 means none.
 #endif
 
     /**
@@ -37,6 +39,16 @@ namespace handoff {
       return runtime().peer();
     }
   }  // namespace
+
+  std::chrono::milliseconds request_budget() {
+#ifdef SUNSHINE_TESTS
+    const auto override_ms = test_request_budget_ms.load();
+    if (override_ms > 0) {
+      return std::chrono::milliseconds {override_ms};
+    }
+#endif
+    return request_terminate_budget;
+  }
 
   terminate_permission_e terminate_gate(std::chrono::milliseconds budget) {
     const auto peer = active_peer();
@@ -109,6 +121,10 @@ namespace handoff {
   void set_terminate_for_test(std::function<void()> terminate) {
     std::lock_guard hook_lock {test_hook_mutex};
     test_terminate = std::move(terminate);
+  }
+
+  void set_request_budget_for_test(std::chrono::milliseconds budget) {
+    test_request_budget_ms.store(budget.count() > 0 ? budget.count() : 0);
   }
 #endif
 }  // namespace handoff
