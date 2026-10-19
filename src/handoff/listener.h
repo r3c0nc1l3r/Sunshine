@@ -232,4 +232,6 @@ namespace handoff {
     std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> work_guard_;
   };
 }  // namespace handoff
+
+  #include "listener_impl.h"
 #endif

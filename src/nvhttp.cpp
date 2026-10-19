@@ -152,11 +152,11 @@ namespace nvhttp {
   /**
    * @brief HTTPS server type used for GameStream endpoints requiring TLS.
    */
-  using https_server_t = SunshineHTTPSServer;
+  using https_server_t = adoptable_https_server_t;
   /**
    * @brief Plain HTTP server type used for GameStream endpoints without TLS.
    */
-  using http_server_t = SimpleWeb::Server<SimpleWeb::HTTP>;
+  using http_server_t = adoptable_http_server_t;
 
   /**
    * @brief Internal HTTPS credential paths for the configuration server.
