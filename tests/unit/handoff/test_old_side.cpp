@@ -617,6 +617,27 @@ namespace {
   }
 
   /**
+   * @brief Whether this build is instrumented by a sanitizer (AddressSanitizer or ThreadSanitizer).
+   *
+   * GCC defines `__SANITIZE_ADDRESS__` and `__SANITIZE_THREAD__`; Clang exposes `__has_feature`.
+   *
+   * @return `true` in a sanitizer build, where the per-message cost exceeds the fixture's millisecond-scale ping budget.
+   */
+  constexpr bool sanitizer_build() {
+  #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+    return true;
+  #elif defined(__has_feature)
+    #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+    return true;
+    #else
+    return false;
+    #endif
+  #else
+    return false;
+  #endif
+  }
+
+  /**
    * @brief Stops and joins a flood thread on every exit path, including exceptions, so it is never left joinable.
    */
   struct flood_joiner_t {
@@ -1956,6 +1977,9 @@ TEST_F(HandoffOldSideTest, OnlyDrainRequestsReachTheHandlerAndOtherFdsAreClosed)
 }
 
 TEST_F(HandoffOldSideTest, FloodOfDrainRequestsWithBlockedHandlerDoesNotDelayHandover) {
+  if (sanitizer_build()) {
+    GTEST_SKIP() << "timing test: the sanitizer's per-message cost exceeds the fixture's ping budget";
+  }
   timeouts.rollback_window = 200ms;
   handler_blocks = true;
   start();
@@ -1990,6 +2014,9 @@ TEST_F(HandoffOldSideTest, FloodOfDrainRequestsWithBlockedHandlerDoesNotDelayHan
 }
 
 TEST_F(HandoffOldSideTest, FloodOfPongsDoesNotDelayPingsOrHandover) {
+  if (sanitizer_build()) {
+    GTEST_SKIP() << "timing test: the sanitizer's per-message cost exceeds the fixture's ping budget";
+  }
   timeouts.rollback_window = 200ms;
   start();
   ASSERT_TRUE(to_committed());
