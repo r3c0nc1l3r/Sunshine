@@ -54,8 +54,9 @@ namespace net {
    * An in-place restart (`/api/restart`, the tray restart) sets it again just before `execv`, through
    * `handoff::hooks::restart_environment()`, only when the base differs from the configured `port`, and unsets it
    * when it does not. A handoff child gets its base from `SUNSHINE_HANDOFF_UDP_BASE` instead, which is invalid
-   * (refused, exit 1) when it does not parse or is out of range. Nothing validates an override against the TCP
-   * ports or the other base here; that check is for `handoff::validate` on the configured offset only.
+   * (refused, exit 1) when it does not parse or is out of range. `early_init` range-checks the value only: there is no
+   * collision check against the TCP ports or the other base. Sunshine sets the variable itself, and the old process
+   * validated the configured offset before it spawned the child, so the variable is trusted once it parses.
    *
    * Thread-safety: reads only the handoff runtime's override, which is fixed after `early_init()` (except the test
    * seam). Callable from any thread.

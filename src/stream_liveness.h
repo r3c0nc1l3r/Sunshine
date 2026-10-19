@@ -29,13 +29,19 @@ namespace stream {
     api_close,  ///< Closed through the web UI session API.
     stream_ended,  ///< The video or audio pipeline ended (capture or encode stopped or failed).
     terminated,  ///< Ended by the host (app quit, client unpaired, shutdown).
+    stop,  ///< A draining process was stopped (`systemctl stop` or SIGTERM to the draining pid); name `stop`.
+    drain_deadline,  ///< The draining process reached its drain deadline and ends what remains; name `drain-deadline`.
   };
 
   /**
    * @brief Name of a stop reason as written in the session-end log line.
    *
    * @param reason Stop reason.
-   * @return Lowercase name with dashes, for example `media-ping-timeout`; `unknown` for out-of-range values.
+   * Names are the existing ones (for example `media-ping-timeout`, `terminated`), plus `stop` for `stop_reason_e::stop`
+   * and `drain-deadline` for `stop_reason_e::drain_deadline`. The implementation's switch needs one case for each of the
+   * two new values; the strings above are the contract.
+   *
+   * @return Lowercase name with dashes; `unknown` for out-of-range values.
    */
   std::string_view to_string(stop_reason_e reason);
 

@@ -21,6 +21,7 @@
 #include <vector>
 
 // local includes
+#include "settings.h"
 #include "src/config.h"
 #include "types.h"
 
@@ -143,6 +144,33 @@ namespace handoff::hooks {
    *         `shutdown_reason_e::terminated`.
    */
   shutdown_reason_e shutdown_reason();
+
+  /**
+   * @brief Why the drain-handoff options must not enable the feature, judged from the parsed options.
+   *
+   * Called by `apply_config` after `port` is set. Only when `settings.enabled` is `true` does it apply the rules of
+   * `handoff::validate(settings, port)`; with the feature disabled there is nothing to refuse, so nothing is checked
+   * and nothing is logged. Pure; reads no runtime state.
+   *
+   * @param settings Options as parsed (`config::drain_handoff`).
+   * @param port Configured `port`.
+   * @return Empty when the options may enable the feature (or it is disabled); otherwise the one-line reason
+   *         `validate` returned, which the caller logs as an Error before it sets `enabled` to `false`. Non-Linux: see
+   *         the non-Linux declaration.
+   */
+  std::string config_refusal(const settings_t &settings, int port);
+
+  /**
+   * @brief Why the host forbids enabling the feature, judged from the host facts.
+   *
+   * Called once at startup, after `display_device::init` and before the runtime is configured. It is
+   * `handoff::check_enable(context)` on Linux. Pure apart from the host facts the caller collected.
+   *
+   * @param context Host facts (capture backend, `FRESH_STATE`, display settings manager, runtime directory).
+   * @return Empty when the feature may enable; otherwise the Error text the caller logs before it sets `enabled` to
+   *         `false`. Non-Linux: see the non-Linux declaration.
+   */
+  std::string enable_refusal(const enable_context_t &context);
 #else
   /**
    * @brief Whether the feature is on in this process.
@@ -238,6 +266,35 @@ namespace handoff::hooks {
    */
   inline shutdown_reason_e shutdown_reason() {
     return shutdown_reason_e::terminated;
+  }
+
+  /**
+   * @brief Why the drain-handoff options must not enable the feature (non-Linux).
+   *
+   * Drain handoff exists only on Linux. With `settings.enabled` set, this returns the fixed refusal text, so the caller
+   * logs one Error and sets `enabled` to `false` on every platform that does not support the feature. With the feature
+   * disabled it returns empty, so non-Linux builds log nothing for an unused option.
+   *
+   * @param settings Options as parsed; only `enabled` is read.
+   * @param port Configured `port`; unused here.
+   * @return `"drain handoff is available on Linux only"` when `settings.enabled`; otherwise empty.
+   */
+  inline std::string config_refusal(const settings_t &settings, int port) {
+    (void) port;
+    return settings.enabled ? std::string {"drain handoff is available on Linux only"} : std::string {};
+  }
+
+  /**
+   * @brief Why the host forbids enabling the feature (non-Linux).
+   *
+   * The caller calls it only when the options enabled the feature, so the answer is always the fixed refusal text.
+   *
+   * @param context Host facts; unused here.
+   * @return `"drain handoff is available on Linux only"`.
+   */
+  inline std::string enable_refusal(const enable_context_t &context) {
+    (void) context;
+    return "drain handoff is available on Linux only";
   }
 #endif
 }  // namespace handoff::hooks
