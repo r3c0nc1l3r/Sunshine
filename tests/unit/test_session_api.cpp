@@ -37,6 +37,8 @@
 #include <src/crypto.h>
 #include <src/httpcommon.h>
 #include <src/rtsp.h>
+#include <src/stream.h>
+#include <src/stream_liveness.h>
 #include <src/utility.h>
 
 namespace {
@@ -285,10 +287,10 @@ TEST(SessionApiRtspTest, ListSessionsWithoutSessionsIsEmpty) {
 }
 
 /**
- * @brief Test: asking to close an unknown session id returns false.
+ * @brief Test: asking to close an unknown session id returns `not_found`.
  */
-TEST(SessionApiRtspTest, RequestSessionCloseUnknownIdReturnsFalse) {
-  EXPECT_FALSE(rtsp_stream::request_session_close(12345));
+TEST(SessionApiRtspTest, RequestSessionCloseUnknownIdReturnsNotFound) {
+  EXPECT_EQ(rtsp_stream::request_session_close(12345), rtsp_stream::close_result_e::not_found);
 }
 
 /**
@@ -385,6 +387,10 @@ protected:
    * @brief Stop the server and restore the configuration changed by SetUp.
    */
   void TearDown() override {
+    // Fake sessions and the rate limiter are process-wide: clear them before the server goes away.
+    rtsp_stream::testing::remove_all();
+    confighttp::testing::set_auth_rate_limit_enabled(false);
+
     if (server) {
       server->stop();
     }
@@ -721,4 +727,318 @@ TEST_F(SessionApiHttpTest, CloseSessionCrossOriginWithoutCsrfTokenIsAuditLogged)
     {"Session close requested via API: id=4242", "result=csrf-rejected", "user=testuser"}
   ));
   EXPECT_EQ(logged.find("testpass"), std::string::npos);
+}
+
+namespace {
+  /**
+   * @brief Percent-encode every byte outside the RFC 3986 unreserved set, so a token can go in a query string.
+   *
+   * @param text Raw text.
+   * @return Encoded text.
+   */
+  std::string percent_encode(const std::string &text) {
+    std::string encoded;
+    for (const unsigned char ch : text) {
+      if (std::isalnum(ch) || ch == '-' || ch == '.' || ch == '_' || ch == '~') {
+        encoded.push_back(static_cast<char>(ch));
+      } else {
+        encoded += std::format("%{:02X}", static_cast<unsigned int>(ch));
+      }
+    }
+    return encoded;
+  }
+}  // namespace
+
+/**
+ * @brief Test: an authenticated close of a RUNNING session returns 200, stops it with reason `api-close`, and audit-logs `result=closed`.
+ */
+TEST_F(SessionApiHttpTest, CloseRunningSessionReturnsOkStopsSessionAndIsAuditLogged) {
+  auto session = rtsp_stream::testing::insert_fake_session(7001, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  const std::string token = fetch_csrf_token();
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("X-CSRF-Token", token);
+
+  const std::uintmax_t offset = test_log_size();
+  const auto response = client->request("POST", "/api/sessions/7001/close", "", headers);
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  const nlohmann::json json = nlohmann::json::parse(response->content.string());
+  const nlohmann::json expected {{"status", true}};
+  EXPECT_EQ(json, expected);
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::STOPPING);
+  EXPECT_EQ(stream::session::stop_reason(*session), stream::stop_reason_e::api_close);
+
+  const std::string logged = test_log_since(offset);
+  ASSERT_FALSE(logged.empty()) << "No log text captured from " << TEST_LOG_FILE;
+  EXPECT_TRUE(has_line_with_all(logged, {"Session close requested via API: id=7001", "result=closed", "user=testuser", "source="}));
+  EXPECT_EQ(logged.find("testpass"), std::string::npos);
+}
+
+/**
+ * @brief Test: a cross-origin POST with a valid `X-CSRF-Token` header is accepted and closes the session.
+ */
+TEST_F(SessionApiHttpTest, CloseCrossOriginWithCsrfHeaderIsAccepted) {
+  auto session = rtsp_stream::testing::insert_fake_session(7002, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  const std::string token = fetch_csrf_token();
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("Origin", "https://example.invalid");
+  headers.emplace("X-CSRF-Token", token);
+
+  const auto response = client->request("POST", "/api/sessions/7002/close", "", headers);
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::STOPPING);
+}
+
+/**
+ * @brief Test: the same valid token sent only in the query string is ignored, so the cross-origin close is rejected as `csrf-rejected`.
+ */
+TEST_F(SessionApiHttpTest, CloseCsrfTokenOnlyInQueryStringIsRejected) {
+  auto session = rtsp_stream::testing::insert_fake_session(7003, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  const std::string token = fetch_csrf_token();
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("Origin", "https://example.invalid");
+
+  const std::uintmax_t offset = test_log_size();
+  const auto response = client->request("POST", "/api/sessions/7003/close?csrf_token=" + percent_encode(token), "", headers);
+
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::RUNNING);
+  const std::string logged = test_log_since(offset);
+  EXPECT_TRUE(has_line_with_all(logged, {"Session close requested via API: id=7003", "result=csrf-rejected"}));
+  EXPECT_EQ(count_occurrences(logged, "result=closed"), 0U);
+}
+
+/**
+ * @brief Test: a same-origin POST (Origin is the server's own address) without a CSRF token is accepted.
+ */
+TEST_F(SessionApiHttpTest, CloseSameOriginWithoutTokenIsAccepted) {
+  auto session = rtsp_stream::testing::insert_fake_session(7004, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
+
+  const auto response = client->request("POST", "/api/sessions/7004/close", "", headers);
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::STOPPING);
+}
+
+/**
+ * @brief Test: a POST with no Origin header and no CSRF token is accepted as a same-origin request.
+ */
+TEST_F(SessionApiHttpTest, CloseWithoutOriginHeaderAndWithoutTokenIsAccepted) {
+  auto session = rtsp_stream::testing::insert_fake_session(7005, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+
+  const auto response = client->request("POST", "/api/sessions/7005/close", "", auth_headers());
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::STOPPING);
+}
+
+/**
+ * @brief Test: closing a session that is already STOPPING returns 200, audit-logs `result=already-stopping`, and keeps the reason.
+ */
+TEST_F(SessionApiHttpTest, CloseAlreadyStoppingSessionReturnsOkWithAuditAndKeepsReason) {
+  constexpr std::uint32_t id = 7006;
+  auto session = rtsp_stream::testing::insert_fake_session(id, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  ASSERT_TRUE(stream::session::stop(*session, stream::stop_reason_e::ping_timeout));
+  const std::string token = fetch_csrf_token();
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("X-CSRF-Token", token);
+
+  const std::uintmax_t offset = test_log_size();
+  const auto response = client->request("POST", "/api/sessions/7006/close", "", headers);
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  const nlohmann::json json = nlohmann::json::parse(response->content.string());
+  const nlohmann::json expected {{"status", true}};
+  EXPECT_EQ(json, expected);
+  EXPECT_EQ(stream::session::stop_reason(*session), stream::stop_reason_e::ping_timeout);
+  EXPECT_TRUE(has_line_with_all(test_log_since(offset), {"Session close requested via API: id=7006", "result=already-stopping"}));
+}
+
+/**
+ * @brief Test: a session id with leading zeros (`/007/`) parses to the same id and closes that session.
+ */
+TEST_F(SessionApiHttpTest, CloseLeadingZeroIdClosesSameSession) {
+  auto session = rtsp_stream::testing::insert_fake_session(7, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  const std::string token = fetch_csrf_token();
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("X-CSRF-Token", token);
+
+  const auto response = client->request("POST", "/api/sessions/007/close", "", headers);
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::STOPPING);
+  EXPECT_EQ(stream::session::stop_reason(*session), stream::stop_reason_e::api_close);
+}
+
+/**
+ * @brief Test: a trailing slash (`/7/close/`) does not match the close route, so nothing is closed and nothing is audit-logged.
+ */
+TEST_F(SessionApiHttpTest, CloseWithTrailingSlashIsNotRoutedAndHasNoSideEffect) {
+  auto session = rtsp_stream::testing::insert_fake_session(7, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  const std::string token = fetch_csrf_token();
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("X-CSRF-Token", token);
+
+  const std::uintmax_t offset = test_log_size();
+  // The fixture registers no default resources, so the server may just drop the connection; either way it must not be served.
+  try {
+    const auto response = client->request("POST", "/api/sessions/7/close/", "", headers);
+    EXPECT_NE(response->status_code, "200 OK");
+  } catch (const std::exception &) {
+    SUCCEED() << "connection dropped: not served";
+  }
+
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::RUNNING);
+  EXPECT_EQ(count_occurrences(test_log_since(offset), "Session close requested via API"), 0U);
+}
+
+/**
+ * @brief Test: HEAD and OPTIONS on both session paths are not served and have no side effect on a RUNNING session.
+ */
+TEST_F(SessionApiHttpTest, HeadAndOptionsOnSessionPathsHaveNoSideEffects) {
+  auto session = rtsp_stream::testing::insert_fake_session(7, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  const std::uintmax_t offset = test_log_size();
+
+  const std::vector<std::string> methods {"HEAD", "OPTIONS"};
+  const std::vector<std::string> paths {"/api/sessions", "/api/sessions/7/close"};
+  for (const auto &method : methods) {
+    for (const auto &path : paths) {
+      // The fixture registers no default resources, so the server may just drop the connection; either way it must not be served.
+      try {
+        const auto response = client->request(method, path, "", auth_headers());
+        EXPECT_NE(response->status_code, "200 OK") << method << " " << path;
+      } catch (const std::exception &) {
+        SUCCEED() << method << " " << path << ": connection dropped, not served";
+      }
+    }
+  }
+
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::RUNNING);
+  EXPECT_EQ(count_occurrences(test_log_since(offset), "Session close requested via API"), 0U);
+}
+
+/**
+ * @brief Test: a POST whose id does not fit in 32 bits is rejected with 400, leaves the RUNNING session alone, and never logs `result=closed`.
+ */
+TEST_F(SessionApiHttpTest, OverflowingIdPostIsBadRequestWithoutSideEffect) {
+  auto session = rtsp_stream::testing::insert_fake_session(7, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  const std::string token = fetch_csrf_token();
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("X-CSRF-Token", token);
+
+  const std::uintmax_t offset = test_log_size();
+  const auto response = client->request("POST", "/api/sessions/99999999999/close", "", headers);
+
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::RUNNING);
+  EXPECT_EQ(count_occurrences(test_log_since(offset), "result=closed"), 0U);
+}
+
+/**
+ * @brief Test helper: a GET to the session list with the given Authorization value must be 401 (never an exception or 500).
+ *
+ * @param value Raw `Authorization` header value.
+ */
+static void expect_unauthorized_for_authorization(SimpleWeb::Client<SimpleWeb::HTTPS> &client, const std::string &value) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", value);
+
+  const auto response = client.request("GET", "/api/sessions", "", headers);
+
+  EXPECT_EQ(response->status_code, "401 Unauthorized") << "Authorization value of length " << value.size();
+}
+
+/**
+ * @brief Test: an `Authorization` header that is only `Basic` (shorter than `Basic `) is rejected with 401.
+ */
+TEST_F(SessionApiHttpTest, AuthenticateRejectsBasicWithoutCredentials) {
+  expect_unauthorized_for_authorization(*client, "Basic");
+}
+
+/**
+ * @brief Test: an empty `Authorization` header is rejected with 401.
+ */
+TEST_F(SessionApiHttpTest, AuthenticateRejectsEmptyAuthorizationHeader) {
+  expect_unauthorized_for_authorization(*client, "");
+}
+
+/**
+ * @brief Test: an `Authorization` header with another scheme (`Bearer x`) is rejected with 401.
+ */
+TEST_F(SessionApiHttpTest, AuthenticateRejectsBearerScheme) {
+  expect_unauthorized_for_authorization(*client, "Bearer x");
+}
+
+/**
+ * @brief Test: a `Basic` header whose payload is not valid base64 is rejected with 401.
+ */
+TEST_F(SessionApiHttpTest, AuthenticateRejectsInvalidBase64) {
+  expect_unauthorized_for_authorization(*client, "Basic @@@not-base64@@@");
+}
+
+/**
+ * @brief Test: after 10 failed logins from loopback, a correct login and a correct close get 429 with a JSON body and change nothing.
+ */
+TEST_F(SessionApiHttpTest, RateLimitLocksOutCorrectLoginAfterTenFailures) {
+  auto session = rtsp_stream::testing::insert_fake_session(7301, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  const std::string token = fetch_csrf_token();  // Fetched while the limiter is still disabled.
+  confighttp::testing::set_auth_rate_limit_enabled(true);
+
+  SimpleWeb::CaseInsensitiveMultimap wrong_headers;
+  wrong_headers.emplace("Authorization", create_auth_header("testuser", "wrongpass"));
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    const auto response = client->request("GET", "/api/sessions", "", wrong_headers);
+    EXPECT_EQ(response->status_code, "401 Unauthorized") << "failed attempt " << attempt;
+  }
+
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("X-CSRF-Token", token);
+  const auto close_response = client->request("POST", "/api/sessions/7301/close", "", headers);
+  EXPECT_EQ(close_response->status_code, "429 Too Many Requests");
+  const nlohmann::json body = nlohmann::json::parse(close_response->content.string());
+  EXPECT_TRUE(body.is_object());
+
+  const auto list_response = client->request("GET", "/api/sessions", "", auth_headers());
+  EXPECT_EQ(list_response->status_code, "429 Too Many Requests");
+
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::RUNNING) << "a locked-out request must not close the session";
+}
+
+/**
+ * @brief Test: disabling the limiter (which also clears it) restores access for the same loopback client.
+ */
+TEST_F(SessionApiHttpTest, DisablingRateLimiterRestoresAccess) {
+  auto session = rtsp_stream::testing::insert_fake_session(7302, stream::session::state_e::RUNNING);
+  ASSERT_NE(session, nullptr);
+  const std::string token = fetch_csrf_token();
+  confighttp::testing::set_auth_rate_limit_enabled(true);
+
+  SimpleWeb::CaseInsensitiveMultimap wrong_headers;
+  wrong_headers.emplace("Authorization", create_auth_header("testuser", "wrongpass"));
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    (void) client->request("GET", "/api/sessions", "", wrong_headers);
+  }
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers();
+  headers.emplace("X-CSRF-Token", token);
+  ASSERT_EQ(client->request("POST", "/api/sessions/7302/close", "", headers)->status_code, "429 Too Many Requests");
+
+  confighttp::testing::set_auth_rate_limit_enabled(false);
+
+  const auto response = client->request("POST", "/api/sessions/7302/close", "", headers);
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_EQ(stream::session::state(*session), stream::session::state_e::STOPPING);
 }
