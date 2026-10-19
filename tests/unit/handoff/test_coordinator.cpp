@@ -2840,13 +2840,18 @@ TEST_F(HandoffCoordinatorTest, ScopeStaysUdpOnlyAfterAShutdownFollowingCommit) {
 TEST_F(HandoffCoordinatorTest, ScopeIsAssertedAfterHandoverAndNothingRestoresIt) {
   timeouts.rollback_window = 150ms;
   ASSERT_TRUE(run_to_commit());
+  // freeze() runs before COMMIT, so the udp_only calls made so far are all freeze()'s. The handover re-assert is one more.
+  const int udp_only_before = events.count("env_scope:udp_only");
   peer->start_pump();
   ASSERT_TRUE(get_reply().has_value());
   ASSERT_TRUE(wait_until([this]() {
     return C().handed_over();
   }));
+  EXPECT_TRUE(wait_until([&]() {
+    return events.count("env_scope:udp_only") > udp_only_before;
+  }))
+    << "the scope of freeze() must be asserted again after the handover (a new env_scope:udp_only call)";
   EXPECT_EQ(upnp::unmap_scope_e::udp_only, upnp::unmap_scope());
-  EXPECT_GE(events.count("env_scope:udp_only"), 1) << "the scope of freeze() is asserted again after the handover";
   EXPECT_EQ(0, events.count("env_scope:all")) << "nothing restores all after handed_over";
   EXPECT_EQ(0, events.count("env_scope:none"));
   EXPECT_EQ(0, events.count("unfreeze")) << "no unfreeze after a handover";
@@ -3022,7 +3027,11 @@ TEST_F(HandoffCoordinatorTest, AfterTheHandoverTheProcessIsDrainingAndRefusesNew
   }))
     << "the new process must receive MAIN";
   EXPECT_FALSE(C().attempt_running()) << "after a handover no attempt is running";
-  EXPECT_FALSE(hf::runtime().handoff_in_progress()) << "handoff_in_progress is cleared after the handover";
+  // handoff_in_progress is cleared by step (2), which runs after run() returned, so wait for it (bounded).
+  EXPECT_TRUE(wait_until([this]() {
+    return !hf::runtime().handoff_in_progress();
+  }))
+    << "handoff_in_progress must be cleared after the handover";
   EXPECT_EQ(hf::mode_e::draining, hf::runtime().mode());
   for (const auto &l : lf) {
     EXPECT_EQ(1, l.closes.load()) << "the socket copies are closed";
@@ -3064,12 +3073,18 @@ TEST_F(HandoffCoordinatorTest, AfterTheHandoverTheRevocationPollerRuns) {
   ASSERT_TRUE(wait_until([this]() {
     return C().handed_over();
   }));
-  ASSERT_EQ(1, poller_calls.load()) << "one poller is made for the handover";
+  // The poller is made in step (5), which runs after run() returned: wait (bounded) for the seam call first.
+  ASSERT_TRUE(wait_until([this]() {
+    return poller_calls.load() >= 1;
+  }))
+    << "one poller must be made for the handover (step 5 runs after run() returned)";
+  EXPECT_EQ(1, poller_calls.load()) << "exactly one poller is made for the handover";
   ASSERT_NE(nullptr, poller_raw);
   EXPECT_TRUE(wait_until([this]() {
     return poller_raw->running();
   }))
     << "the revocation poller must be started after the handover";
+  EXPECT_EQ(1, poller_calls.load()) << "the poller is not made again once it runs";
 }
 
 TEST_F(HandoffCoordinatorTest, ALostChannelAfterTheHandoverEndsNothingAndTheDrainGoesOn) {
@@ -3080,6 +3095,10 @@ TEST_F(HandoffCoordinatorTest, ALostChannelAfterTheHandoverEndsNothingAndTheDrai
   ASSERT_TRUE(wait_until([this]() {
     return C().handed_over();
   }));
+  // The reader is started in step (4), after run() returned. Prove it is serving (a SESSIONS? is answered through it)
+  // before the channel is closed, so the closed-channel path really runs.
+  ASSERT_TRUE(peer->send(protocol::sessions_request_t {6}));
+  ASSERT_TRUE(peer->take<protocol::sessions_reply_t>().has_value()) << "the channel reader must serve the drain before the channel is closed";
   peer->stop_pump();
   peer->channel.close();
   std::this_thread::sleep_for(100ms);
