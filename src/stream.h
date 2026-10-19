@@ -5,6 +5,8 @@
 #pragma once
 
 // standard includes
+#include <future>
+#include <memory>
 #include <utility>
 
 // lib includes
@@ -86,8 +88,9 @@ namespace stream {
      *
      * @param session Active streaming or pairing session for the request.
      * @param reason Why the session is being stopped.
+     * @return `true` when this call moved the session from running to stopping (its reason is recorded).
      */
-    void stop(session_t &session, stop_reason_e reason);
+    bool stop(session_t &session, stop_reason_e reason);
     /**
      * @brief Get the reason recorded for the end of a session.
      *
@@ -133,5 +136,25 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief Test-only helpers.
+     */
+    namespace testing {
+      /**
+       * @brief Create a session with no worker threads.
+       *
+       * `join()` of the returned session skips thread joins, the control wait, the input reset, the hang guard and the
+       * last-session platform callbacks. It describes itself with the creation time, `udp/ipv4` and `local`.
+       *
+       * @param id Launch session id.
+       * @param state Initial session state.
+       * @param join_gate When valid, `join()` waits until this future is ready.
+       * @return The new session.
+       */
+      std::shared_ptr<session_t> make_fake(std::uint32_t id, state_e state, std::shared_future<void> join_gate);
+    }  // namespace testing
+#endif
   }  // namespace session
 }  // namespace stream

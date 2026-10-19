@@ -5,13 +5,26 @@ Sunshine has a RESTful API which can be used to interact with the service.
 Unless otherwise specified, authentication is required for all API calls. You can authenticate using
 basic authentication with the admin username and password.
 
+## Failed Login Limit
+
+The web UI API counts failed authentication attempts per client address (the TCP peer address; forwarded headers are
+never used). After 10 failed attempts from one address within 5 minutes, further requests from that address get
+`429 Too Many Requests` with a JSON error body, without an authentication check. The 429 response carries a
+`Retry-After` header with the number of seconds until the block ends (a whole number, at least 1). The block lasts until
+5 minutes after the first failure in the window. Requests from other addresses are not affected. The table of tracked
+addresses is bounded (at most 1024). When a new address must be added to a full table, addresses whose window has ended
+are dropped first. If there are none, the unlocked address with the oldest first failure is dropped. Only when every
+tracked address is locked out is the locked address with the oldest first failure dropped. A request without an
+`Authorization` header gets `401` and is not counted.
+
 ## CSRF Protection
 
 State-changing API endpoints (POST, DELETE) are protected against Cross-Site Request Forgery (CSRF) attacks.
 
 **For Web Browsers:**
 - Requests from same-origin (configured via `csrf_allowed_origins`) are automatically allowed
-- Cross-origin requests require a CSRF token
+- Cross-origin requests require a CSRF token, sent only in the `X-CSRF-Token` header. A token in the query string
+  (`csrf_token`) is ignored and counts as no token
 
 **For Non-Browser Applications:**
 - Non-browser clients (e.g. `curl`, scripts, custom apps) are **exempt** from CSRF protection
@@ -108,6 +121,7 @@ Responses:
 - `200`: `{"status": true, "sessions": [...]}`. The list is empty when no session is running.
 - `401`: no credentials, or wrong username or password.
 - `403`: the client address is not allowed.
+- `429`: the client address is locked out after too many failed logins (see [Failed Login Limit](#failed-login-limit)).
 
 If no admin user is configured yet, both session endpoints redirect to the welcome page and do nothing.
 
@@ -122,11 +136,12 @@ This endpoint exists only on the admin web UI listener and requires admin authen
 a valid CSRF token (see [CSRF Protection](#csrf-protection)).
 
 Responses:
-- `200`: `{"status": true}`. The session exists and was asked to stop.
+- `200`: `{"status": true}`. The session was running and this request stopped it, or it was already stopping.
 - `400`: `{id}` is not a 32-bit unsigned decimal number, or the CSRF token is missing, invalid or expired.
 - `401`: no credentials, or wrong username or password.
 - `403`: the client address is not allowed.
 - `404`: no session with this id is running or stopping (unknown, not yet started, or already ended).
+- `429`: the client address is locked out after too many failed logins (see [Failed Login Limit](#failed-login-limit)).
 
 If no admin user is configured yet, the request redirects to the welcome page and nothing is done.
 
@@ -141,8 +156,9 @@ Session close requested via API: id=<id>, user=<admin user>, source=<client addr
 - `id`: the requested id. For `bad-id` and `csrf-rejected`, it is the sanitised path id (digits only, at most 32 characters).
 - `user`: the authenticated admin user.
 - `source`: the TCP peer address of the client. A forwarded-for header is never used.
-- `result`: `closed` (the session was asked to stop), `not-found` (no running or stopping session has this id),
-  `csrf-rejected` (the CSRF check failed), or `bad-id` (the id is not a valid 32-bit unsigned number).
+- `result`: `closed` (this request stopped the running session), `already-stopping` (the session was already stopping,
+  or another stop won the race; the recorded stop reason is unchanged), `not-found` (no running or stopping session has
+  this id), `csrf-rejected` (the CSRF check failed), or `bad-id` (the id is not a valid 32-bit unsigned number).
 
 The password, the `Authorization` header and the CSRF token never appear in the log. Unauthenticated requests are
 rejected before this line is written.

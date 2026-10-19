@@ -571,6 +571,11 @@ namespace stream {
     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
 
     std::atomic<session::state_e> state;  ///< Current lifecycle state observed by stream workers.
+
+#ifdef SUNSHINE_TESTS
+    bool fake {false};  ///< Test-only: the session has no workers, and `session::join()` skips all teardown.
+    std::shared_future<void> join_gate;  ///< Test-only: when valid, `session::join()` of a fake session waits for it.
+#endif
   };
 
   /**
@@ -2253,17 +2258,18 @@ namespace stream {
     /**
      * @brief Stop a streaming session and record why it ended.
      */
-    void stop(session_t &session, stop_reason_e reason) {
+    bool stop(session_t &session, stop_reason_e reason) {
       while_starting_do_nothing(session.state);
       auto expected = state_e::RUNNING;
       if (!session.state.compare_exchange_strong(expected, state_e::STOPPING)) {
-        return;
+        return false;
       }
 
       // Only the call that moved the session to STOPPING records the reason. It is stored before the shutdown
       // event is raised, so the workers (and the join that follows) always observe it.
       session.stop_reason.store(reason);
       session.shutdown_event->raise(true);
+      return true;
     }
 
     /**
@@ -2318,6 +2324,16 @@ namespace stream {
      * @brief Wait for worker threads owned by the session to exit.
      */
     void join(session_t &session) {
+#ifdef SUNSHINE_TESTS
+      if (session.fake) {
+        // A fake session has no workers: only honour the gate a test uses to hold the join open.
+        if (session.join_gate.valid()) {
+          session.join_gate.wait();
+        }
+        return;
+      }
+#endif
+
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
       // GPU scheduling enabled. If this happens, we will terminate ourselves and the service can restart.
       // The alternative is that Sunshine can never start another session until it's manually restarted.
@@ -2508,5 +2524,28 @@ namespace stream {
 
       return session;
     }
+
+#ifdef SUNSHINE_TESTS
+    namespace testing {
+      /**
+       * @brief Create a session with no workers for tests.
+       */
+      std::shared_ptr<session_t> make_fake(std::uint32_t id, state_e state, std::shared_future<void> join_gate) {
+        auto session = std::make_shared<session_t>();
+        auto mail = std::make_shared<safe::mail_raw_t>();
+
+        session->fake = true;
+        session->join_gate = std::move(join_gate);
+        session->started = std::chrono::system_clock::now();
+        session->transport = "udp/ipv4";
+        session->client_category = "local";
+        session->launch_session_id = id;
+        session->shutdown_event = mail->event<bool>(mail::shutdown);
+        session->mail = std::move(mail);
+        session->state.store(state, std::memory_order_relaxed);
+        return session;
+      }
+    }  // namespace testing
+#endif
   }  // namespace session
 }  // namespace stream

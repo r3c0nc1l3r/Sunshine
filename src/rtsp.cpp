@@ -14,6 +14,8 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <future>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -646,44 +648,47 @@ namespace rtsp_stream {
 
     /**
      * @brief Clear launch sessions.
+     *
+     * The sessions to end are selected and stopped under the slots lock, which is then released while they are
+     * joined, so that listing, closing, counting and inserting sessions never wait for a join. Each ended session is
+     * erased, and logged, under the slots lock again. Concurrent clears are serialised, so no session is joined twice.
+     * With `all` set, this returns only after every session present when it started has been joined and erased.
+     *
      * @param all If true, clear all sessions. Otherwise, only clear timed out and stopped sessions.
      * @examples
      * clear(false);
      * @examples_end
      */
     void clear(bool all = true) {
-      auto lg = _session_slots.lock();
+      std::lock_guard cg {_clear_lock};
+      clear_locked(all);
+    }
 
-      for (auto i = _session_slots->begin(); i != _session_slots->end();) {
-        auto &slot = *(*i);
-        if (all || stream::session::state(slot) == stream::session::state_e::STOPPING) {
-          stream::session::stop(slot, stream::stop_reason_e::terminated);
-          stream::session::join(slot);
-
-          i = erase_ended(i);
-        } else {
-          i++;
-        }
+    /**
+     * @brief Clear stopped sessions unless another clear is already running.
+     *
+     * The clear that is already running ends the stopped sessions itself, so this returns at once instead of waiting
+     * for its joins.
+     */
+    void clear_stopped_if_idle() {
+      std::unique_lock cg {_clear_lock, std::try_to_lock};
+      if (cg.owns_lock()) {
+        clear_locked(false);
       }
     }
 
     /**
      * @brief Clear by cert state.
      *
+     * Locking is the same as for `clear()`: sessions are stopped under the slots lock and joined outside of it.
+     *
      * @param cert Certificate data or object used by the operation.
      */
     void clear_by_cert(std::string_view cert) {
-      auto lg = _session_slots.lock();
-      for (auto i = _session_slots->begin(); i != _session_slots->end();) {
-        auto &slot = *(*i);
-        if (stream::session::client_cert(slot) == cert) {
-          stream::session::stop(slot, stream::stop_reason_e::terminated);
-          stream::session::join(slot);
-          i = erase_ended(i);
-        } else {
-          i++;
-        }
-      }
+      std::lock_guard cg {_clear_lock};
+      end_sessions([cert](stream::session_t &slot) {
+        return stream::session::client_cert(slot) == cert;
+      });
     }
 
     /**
@@ -715,14 +720,14 @@ namespace rtsp_stream {
      * @brief Ask the session with the given launch session id to stop.
      *
      * The session is neither joined nor erased here: `clear(false)`, run by the RTSP loop, joins and removes it
-     * once it is `STOPPING`. `stream::session::stop()` only waits while a session is `STARTING`, a state no
-     * code path currently enters, so holding the slots lock for the call cannot block the RTSP loop for long.
+     * once it is `STOPPING`. Only the slots lock is held, and only for the state change: nothing is joined under
+     * it. `stream::session::stop()` only waits while a session is `STARTING`, a state this method never reaches.
      *
      * @param id Launch session id.
-     * @return `true` when the session is running and was asked to stop by this call, or is already stopping.
-     *         `false` for an unknown id or a session that has not started yet.
+     * @return `closed` when this call stopped the running session, `already_stopping` when the session was already
+     *         stopping or another stop won the race, `not_found` for an unknown id or a session that has not started.
      */
-    bool close(std::uint32_t id) {
+    close_result_e close(std::uint32_t id) {
       auto lg = _session_slots.lock();
       for (const auto &slot : *_session_slots) {
         if (stream::session::id(*slot) != id) {
@@ -732,13 +737,12 @@ namespace rtsp_stream {
         // Sessions that are not started (or already finished) are not closable. This also avoids the stop() wait.
         const auto state = stream::session::state(*slot);
         if (state != stream::session::state_e::RUNNING && state != stream::session::state_e::STOPPING) {
-          return false;
+          return close_result_e::not_found;
         }
 
-        stream::session::stop(*slot, stream::stop_reason_e::api_close);
-        return stream::session::state(*slot) == stream::session::state_e::STOPPING;
+        return stream::session::stop(*slot, stream::stop_reason_e::api_close) ? close_result_e::closed : close_result_e::already_stopping;
       }
-      return false;
+      return close_result_e::not_found;
     }
 
     /**
@@ -749,6 +753,16 @@ namespace rtsp_stream {
       auto lg = _session_slots.lock();
       _session_slots->erase(session);
     }
+
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief Remove every session from the set without joining it (test cleanup).
+     */
+    void remove_all() {
+      auto lg = _session_slots.lock();
+      _session_slots->clear();
+    }
+#endif
 
     /**
      * @brief Inserts the provided session into the set of sessions.
@@ -786,19 +800,51 @@ namespace rtsp_stream {
     using slots_t = std::set<std::shared_ptr<stream::session_t>>;  ///< Container type of the tracked sessions.
 
     /**
-     * @brief Erase a joined session from the slots and log why it ended.
+     * @brief Stop the selected sessions, join them without the slots lock, then erase and log them.
      *
-     * The caller must hold the slots lock.
+     * The caller must hold the clear lock. Sessions are erased by value, and logged only when actually erased, so a
+     * concurrent `remove()` of the same session cannot cause a crash or a second log line.
      *
-     * @param i Iterator to the session to erase.
-     * @return Iterator following the erased session.
+     * @param select Predicate choosing the sessions to end; called with the slots lock held.
      */
-    slots_t::iterator erase_ended(slots_t::iterator i) {
-      auto reason = stream::session::stop_reason(**i);
-      i = _session_slots->erase(i);
-      BOOST_LOG(info) << "Session ended: reason="sv << stream::to_string(reason) << ", active sessions="sv << _session_slots->size();
-      return i;
+    template<class Select>
+    void end_sessions(Select &&select) {
+      std::vector<std::shared_ptr<stream::session_t>> ending;
+      {
+        auto lg = _session_slots.lock();
+        for (const auto &slot : *_session_slots) {
+          if (select(*slot)) {
+            stream::session::stop(*slot, stream::stop_reason_e::terminated);
+            ending.push_back(slot);
+          }
+        }
+      }
+
+      // Joining may call into process and display callbacks, so it must not hold the slots lock.
+      for (const auto &slot : ending) {
+        stream::session::join(*slot);
+      }
+
+      auto lg = _session_slots.lock();
+      for (const auto &slot : ending) {
+        if (_session_slots->erase(slot) > 0) {
+          BOOST_LOG(info) << "Session ended: reason="sv << stream::to_string(stream::session::stop_reason(*slot)) << ", active sessions="sv << _session_slots->size();
+        }
+      }
     }
+
+    /**
+     * @brief Implementation of `clear()`; the caller must hold the clear lock.
+     *
+     * @param all If true, end all sessions. Otherwise, only end stopping ones.
+     */
+    void clear_locked(bool all) {
+      end_sessions([all](stream::session_t &slot) {
+        return all || stream::session::state(slot) == stream::session::state_e::STOPPING;
+      });
+    }
+
+    std::mutex _clear_lock;  ///< Serialises `clear()` and `clear_by_cert()`; taken before the slots lock, never while holding it.
 
     std::unordered_map<std::string_view, cmd_func_t> _map_cmd_cb;
 
@@ -825,8 +871,8 @@ namespace rtsp_stream {
   }
 
   int session_count() {
-    // Ensure session_count is up-to-date
-    server.clear(false);
+    // Ensure session_count is up-to-date. If a clear is already joining sessions, it ends the stopped ones itself.
+    server.clear_stopped_if_idle();
 
     return server.session_count();
   }
@@ -835,9 +881,27 @@ namespace rtsp_stream {
     return server.list();
   }
 
-  bool request_session_close(std::uint32_t id) {
+  close_result_e request_session_close(std::uint32_t id) {
     return server.close(id);
   }
+
+#ifdef SUNSHINE_TESTS
+  namespace testing {
+    std::shared_ptr<stream::session_t> insert_fake_session(std::uint32_t id, stream::session::state_e state, std::shared_future<void> join_gate) {
+      auto session = stream::session::testing::make_fake(id, state, std::move(join_gate));
+      server.insert(session);
+      return session;
+    }
+
+    void clear(bool all) {
+      server.clear(all);
+    }
+
+    void remove_all() {
+      server.remove_all();
+    }
+  }  // namespace testing
+#endif
 
   void terminate_sessions() {
     server.clear(true);

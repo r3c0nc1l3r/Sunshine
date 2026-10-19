@@ -3,6 +3,26 @@
 Fork changes on top of the upstream base. Upstream's own changelog is at
 https://github.com/LizardByte/Sunshine/releases.
 
+## Unreleased (lb.2)
+
+### Changed
+- Session close API: a close that finds the session already stopping (or loses the stop race) is answered 200 and
+  audited as `result=already-stopping` instead of `closed` (#17).
+- Web UI API: the CSRF token is accepted only from the `X-CSRF-Token` header (#19).
+- Sessions are joined outside the RTSP slots lock, so the session list and close API never wait behind a session
+  teardown (#13). While a teardown is being joined, the session count used by `/launch` and `/resume` still includes
+  the session being ended, instead of waiting for the join.
+
+### Fixed
+- `authenticate()` no longer throws on a short or malformed `Authorization` header, and compares the password hash in
+  constant time (#14).
+
+### Added
+- Failed-login limit on the web UI: 10 failures from one address within 5 minutes lock that address out (429) until
+  the window ends, with a `Retry-After` header. The address table is bounded; when it is full, expired and then
+  unlocked entries are evicted before any locked-out address (#19).
+- Tests for the session close API and the login limit, with a test-only seam for fake sessions (#18).
+
 ## v2026.914.233613-lb.1
 Upstream base: `63d35f702ee9` (nightly `2026.914.233613`). Arch package `sunshine 2026.914.233613.1-1` (CUDA off).
 

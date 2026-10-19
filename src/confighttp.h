@@ -41,6 +41,17 @@ namespace confighttp {
   void send_response(const resp_https_t &response, const nlohmann::json &output_tree);
   void send_unauthorized(const resp_https_t &response, const req_https_t &request);
   void send_redirect(const resp_https_t &response, const req_https_t &request, const char *path);
+  /**
+   * @brief Authenticate the admin user with HTTP Basic credentials.
+   *
+   * A malformed or non-Basic `Authorization` header, or a wrong credential, is a failed attempt. Failed attempts
+   * are counted per source address; a source over the limit gets 429 without an authentication check. A request
+   * without an `Authorization` header is answered with 401 but not counted.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   * @return True if the user is authenticated, false otherwise.
+   */
   bool authenticate(const resp_https_t &response, const req_https_t &request);
   void not_found(const resp_https_t &response, const req_https_t &request, const std::string &error_message = "Not Found");
   void bad_request(const resp_https_t &response, const req_https_t &request, const std::string &error_message = "Bad Request");
@@ -91,8 +102,9 @@ namespace confighttp {
    * @brief Close one streaming session by id (`POST /api/sessions/<id>/close`).
    *
    * Requires admin authentication and a CSRF token. Every authenticated request is logged at Info with the
-   * session id, the authenticated user, the source address and the result (`closed`, `not-found`,
-   * `csrf-rejected` or `bad-id`).
+   * session id, the authenticated user, the source address and the result (`closed`, `already-stopping`,
+   * `not-found`, `csrf-rejected` or `bad-id`). A session that is already stopping, or whose stop another request
+   * just won, gets 200 like `closed`.
    *
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client; `path_match[1]` is the session id.
@@ -238,6 +250,18 @@ namespace confighttp {
    * @param value Mutable sensitive string to overwrite and clear.
    */
   void clear_sensitive_string_for_testing(std::string &value);
+
+  namespace testing {
+    /**
+     * @brief Enable or disable the failed-login rate limit used by `authenticate()`.
+     *
+     * The limit starts disabled in test builds so that tests with wrong credentials do not lock each other out.
+     * Enabling or disabling it also clears every tracked source.
+     *
+     * @param enabled True to enforce the failed-login rate limit, false to skip it.
+     */
+    void set_auth_rate_limit_enabled(bool enabled);
+  }  // namespace testing
 #endif
 
   // Browse helper functions (also exposed for unit testing)
