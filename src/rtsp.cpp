@@ -655,13 +655,14 @@ namespace rtsp_stream {
      * With `all` set, this returns only after every session present when it started has been joined and erased.
      *
      * @param all If true, clear all sessions. Otherwise, only clear timed out and stopped sessions.
+     * @param reason Stop reason to record for the sessions this call ends.
      * @examples
      * clear(false);
      * @examples_end
      */
-    void clear(bool all = true) {
+    void clear(bool all = true, stream::stop_reason_e reason = stream::stop_reason_e::terminated) {
       std::lock_guard cg {_clear_lock};
-      clear_locked(all);
+      clear_locked(all, reason);
     }
 
     /**
@@ -806,15 +807,16 @@ namespace rtsp_stream {
      * concurrent `remove()` of the same session cannot cause a crash or a second log line.
      *
      * @param select Predicate choosing the sessions to end; called with the slots lock held.
+     * @param reason Stop reason to record for the selected sessions; a session that is already stopping keeps its first reason.
      */
     template<class Select>
-    void end_sessions(Select &&select) {
+    void end_sessions(Select &&select, stream::stop_reason_e reason = stream::stop_reason_e::terminated) {
       std::vector<std::shared_ptr<stream::session_t>> ending;
       {
         auto lg = _session_slots.lock();
         for (const auto &slot : *_session_slots) {
           if (select(*slot)) {
-            stream::session::stop(*slot, stream::stop_reason_e::terminated);
+            stream::session::stop(*slot, reason);
             ending.push_back(slot);
           }
         }
@@ -837,11 +839,15 @@ namespace rtsp_stream {
      * @brief Implementation of `clear()`; the caller must hold the clear lock.
      *
      * @param all If true, end all sessions. Otherwise, only end stopping ones.
+     * @param reason Stop reason to record for the sessions this call ends.
      */
-    void clear_locked(bool all) {
-      end_sessions([all](stream::session_t &slot) {
-        return all || stream::session::state(slot) == stream::session::state_e::STOPPING;
-      });
+    void clear_locked(bool all, stream::stop_reason_e reason = stream::stop_reason_e::terminated) {
+      end_sessions(
+        [all](stream::session_t &slot) {
+          return all || stream::session::state(slot) == stream::session::state_e::STOPPING;
+        },
+        reason
+      );
     }
 
     std::mutex _clear_lock;  ///< Serialises `clear()` and `clear_by_cert()`; taken before the slots lock, never while holding it.
@@ -893,8 +899,8 @@ namespace rtsp_stream {
       return session;
     }
 
-    void clear(bool all) {
-      server.clear(all);
+    void clear(bool all, stream::stop_reason_e reason) {
+      server.clear(all, reason);
     }
 
     void remove_all() {
@@ -903,8 +909,24 @@ namespace rtsp_stream {
   }  // namespace testing
 #endif
 
-  void terminate_sessions() {
-    server.clear(true);
+  /**
+   * @brief Map a handoff shutdown reason to the session stop reason it records.
+   *
+   * @param reason Shutdown reason from `handoff::hooks::shutdown_reason()`.
+   * @return `stop` for `shutdown_reason_e::stop`, otherwise `terminated`.
+   */
+  stream::stop_reason_e to_stop_reason(handoff::shutdown_reason_e reason) {
+    switch (reason) {
+      case handoff::shutdown_reason_e::stop:
+        return stream::stop_reason_e::stop;
+      case handoff::shutdown_reason_e::terminated:
+        break;
+    }
+    return stream::stop_reason_e::terminated;
+  }
+
+  void terminate_sessions(stream::stop_reason_e reason) {
+    server.clear(true, reason);
     input::terminate_gamepads();
   }
 
