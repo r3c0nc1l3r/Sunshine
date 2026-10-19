@@ -3,6 +3,12 @@
 Fork changes on top of the upstream base. Upstream's own changelog is at
 https://github.com/LizardByte/Sunshine/releases.
 
+## Unreleased
+
+### Fixed
+- Portal capture: a portal helper that never opened a PipeWire remote no longer closes fd 0 when it is destroyed (for
+  example at startup when the portal is unavailable). Its fd and D-Bus pointers now start unset (#39).
+
 ## v2026.914.233613-lb.2
 Upstream base: `63d35f702ee9` (nightly `2026.914.233613`). Arch package `sunshine 2026.914.233613.2-1` (CUDA off).
 
