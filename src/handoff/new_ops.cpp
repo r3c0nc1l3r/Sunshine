@@ -421,6 +421,9 @@ namespace handoff {
       if (_aborted || runtime().shutdown_requested()) {
         return "shutdown requested";
       }
+      if (_finished) {
+        return "the handoff ended before the servers started listening";
+      }
       const auto now = std::chrono::steady_clock::now();
       if (now >= deadline) {
         return "servers did not start listening within " +
