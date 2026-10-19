@@ -24,6 +24,9 @@
 
 // local includes
 #include "crypto.h"
+#ifdef __linux__
+  #include "handoff/listener.h"
+#endif
 
 /**
  * @brief Contains all the functions and variables related to the nvhttp (GameStream) server.
@@ -71,6 +74,43 @@ namespace nvhttp {
    * @brief Lifetime of an incomplete pairing session.
    */
   constexpr auto PAIRING_SESSION_TIMEOUT = std::chrono::minutes {5};
+
+  /**
+   * @brief Sunshine's HTTPS server with client-certificate verification; defined in `nvhttp.cpp`.
+   */
+  class SunshineHTTPSServer;
+
+#ifdef __linux__
+  /**
+   * @brief Plain HTTP server type of the GameStream endpoints, as the handoff needs it (Linux).
+   *
+   * `handoff::adoptable_server_t<SimpleWeb::Server<SimpleWeb::HTTP>>`: it adopts a listening socket, pauses and
+   * resumes accepting, and reports its socket (see `handoff/listener.h`). Contract of the swap: `nvhttp.cpp` defines
+   * `http_server_t` as this alias (today it is `SimpleWeb::Server<SimpleWeb::HTTP>`) and drops its own definition.
+   * Request and response types go through `SimpleWeb::ServerBase<SimpleWeb::HTTP>` and do not change. An unadopted
+   * `start()` behaves exactly as before.
+   */
+  using adoptable_http_server_t = handoff::adoptable_server_t<SimpleWeb::Server<SimpleWeb::HTTP>>;
+
+  /**
+   * @brief HTTPS server type of the GameStream endpoints, as the handoff needs it (Linux).
+   *
+   * `handoff::adoptable_server_t<SunshineHTTPSServer>`. `nvhttp.cpp` defines `https_server_t` as this alias (today it
+   * is `SunshineHTTPSServer`) and drops its own definition. The class `SunshineHTTPSServer` is complete only in
+   * `nvhttp.cpp`, so only that file may instantiate the alias; headers may name it.
+   */
+  using adoptable_https_server_t = handoff::adoptable_server_t<SunshineHTTPSServer>;
+#else
+  /**
+   * @brief Plain HTTP server type of the GameStream endpoints (non-Linux builds keep the upstream type).
+   */
+  using adoptable_http_server_t = SimpleWeb::Server<SimpleWeb::HTTP>;
+
+  /**
+   * @brief HTTPS server type of the GameStream endpoints (non-Linux builds keep the upstream type).
+   */
+  using adoptable_https_server_t = SunshineHTTPSServer;
+#endif
 
   /**
    * @brief Start the nvhttp server.

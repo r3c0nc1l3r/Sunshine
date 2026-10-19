@@ -17,6 +17,9 @@
 #include <Simple-Web-Server/server_https.hpp>
 
 // local includes
+#ifdef __linux__
+  #include "handoff/listener.h"
+#endif
 #include "rtsp.h"
 #include "thread_safe.h"
 
@@ -29,8 +32,25 @@
 namespace confighttp {
   constexpr auto PORT_HTTPS = 1;  ///< GameStream port offset for port https.
 
+#ifdef __linux__
+  /**
+   * @brief HTTPS server type of the Web UI, as the handoff needs it (Linux).
+   *
+   * `handoff::adoptable_server_t<SimpleWeb::Server<SimpleWeb::HTTPS>>` (see `handoff/listener.h`). Contract of the
+   * swap: `https_server_t` below becomes this type on Linux and the duplicate alias in `confighttp.cpp` is removed.
+   * `resp_https_t` and `req_https_t` go through `SimpleWeb::ServerBase<SimpleWeb::HTTPS>` and do not change, and
+   * `register_session_routes(https_server_t &)` keeps its signature. An unadopted `start()` is unchanged.
+   */
+  using adoptable_https_server_t = handoff::adoptable_server_t<SimpleWeb::Server<SimpleWeb::HTTPS>>;
+#else
+  /**
+   * @brief HTTPS server type of the Web UI (non-Linux builds keep the upstream type).
+   */
+  using adoptable_https_server_t = SimpleWeb::Server<SimpleWeb::HTTPS>;
+#endif
+
   // Type aliases for HTTPS server components
-  using https_server_t = SimpleWeb::Server<SimpleWeb::HTTPS>;
+  using https_server_t = SimpleWeb::Server<SimpleWeb::HTTPS>;  // wave B: becomes adoptable_https_server_t
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
   using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
 

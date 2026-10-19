@@ -5,6 +5,8 @@
 #pragma once
 
 // standard includes
+#include <chrono>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -64,18 +66,33 @@ namespace system_tray {
 
   /**
    * @brief Callback for restarting Sunshine from the system tray.
+   *
+   * With the drain handoff on Linux, first asks `handoff::hooks::restart_blocked()`: when it is non-empty the restart
+   * is not done and the text is logged at Warning level (a draining process, a handoff in progress, a draining peer, a
+   * new process before `MAIN`). Otherwise as before.
+   *
    * @param item The tray menu item.
    */
   void tray_restart_cb([[maybe_unused]] struct tray_menu *item);
 
   /**
    * @brief Callback for exiting Sunshine from the system tray.
+   *
+   * With the drain handoff on Linux, first asks `handoff::hooks::quit_blocked()`: when it is non-empty Quit is not
+   * done and the text is logged at Warning level (a draining process, a new process before `MAIN`). Otherwise as
+   * before.
+   *
    * @param item The tray menu item.
    */
   void tray_quit_cb([[maybe_unused]] struct tray_menu *item);
 
   /**
    * @brief Initializes the system tray without starting a loop.
+   *
+   * Must run on the main thread on Linux and macOS (the Qt constraint). On success the lifecycle phase becomes
+   * `running` (see `tray_phase_e`); on failure it is unchanged. Also used by the lifecycle machinery below, which runs
+   * it on the main thread.
+   *
    * @return 0 if initialization was successful, non-zero otherwise.
    */
   int init_tray();
@@ -87,7 +104,14 @@ namespace system_tray {
   int process_tray_events();
 
   /**
-   * @brief Exit the system tray.
+   * @brief Exit the system tray for good (shutdown).
+   *
+   * As before: asks the worker thread to stop, calls `tray_exit()` if the tray is initialized, joins the worker. New:
+   * the lifecycle phase becomes `ended` (terminal), `run_main_loop` is woken and returns, and every later `suspend`,
+   * `resume` and `request_start` does nothing (`resume`/`request_start` return `false`, `suspend` returns `true`).
+   * Idempotent. Called from the SIGINT/SIGTERM handler threads, so it must stay safe to call from any thread, also
+   * when the tray never started or is suspended; a `suspend` waiting at that moment returns `true`.
+   *
    * @return 0 after exiting the system tray.
    */
   int end_tray();
@@ -154,6 +178,147 @@ namespace system_tray {
 #endif
 
   /**
+   * @brief Lifecycle phase of the main-thread tray (Linux; see "Tray lifecycle" in `run_main_loop`).
+   */
+  enum class tray_phase_e {
+    not_started,  ///< No icon was ever shown (the initial phase; a handoff-started process stays here until `COMMIT`).
+    running,  ///< The icon is shown (`init_tray` succeeded) and the main loop serves its events.
+    suspended,  ///< The icon was removed by `suspend` and may come back with `resume`.
+    ended,  ///< `end_tray` ran. Terminal.
+  };
+
+  /**
+   * @brief Entry points of the tray backend the lifecycle drives; tests replace them (see
+   * `set_backend_for_testing`).
+   *
+   * Function pointers, as the wave 2A handoff seams. The production values are `init_tray`, `process_tray_events` and
+   * the library's `tray_exit`.
+   */
+  struct tray_backend_t {
+    int (*init)() = nullptr;  ///< Create the icon on the calling (main) thread. 0 on success.
+    int (*loop)() = nullptr;  ///< Run one blocking event iteration. 0 to continue, non-zero when the loop ended.
+    void (*exit)() = nullptr;  ///< Ask `loop` to return non-zero and remove the icon. Callable from any thread.
+  };
+
+  /**
+   * @brief Run the main-thread tray loop until the process ends. Replaces the loop in `mainThreadLoop`.
+   *
+   * **Tray lifecycle.** Today `mainThreadLoop` (in `main.cpp`) runs `while (process_tray_events() == 0);` after
+   * `init_tray()`, and `end_tray()` is the only way a running tray stops. With the drain handoff the tray must also
+   * go away and come back without ending the process, and a process that starts without a tray must be able to show
+   * one later. The qt backend must be driven from the main thread only; the only call other threads may make is
+   * `tray_exit()` (a queued Qt signal, as `end_tray` already does).
+   *
+   * Command channel. `suspend`, `resume` and `request_start` run on other threads (the handoff coordinator thread).
+   * They do not touch the backend; they set a pending command under an internal mutex, notify a condition variable
+   * and (for `suspend`) call the backend's `exit` to wake the blocked loop. Only this function executes commands, on
+   * the thread that called it. Commands are not queued up: the pending command is a single slot where the last of
+   * `suspend`/`resume`/`start` wins, which is correct because they all converge on "icon shown" or "icon removed".
+   *
+   * The loop, in this order, until it returns:
+   * 1. If `end_tray` ran (phase `ended`), return.
+   * 2. If a start or resume command is pending and the phase is `not_started` or `suspended`: call the backend's
+   *    `init` on this thread. Success: phase `running`, the "removed/shown" waiters are notified. Failure: log a
+   *    Warning "Failed to create system tray", keep the phase, drop the command (the next `resume` may retry).
+   * 3. If the phase is `running`: call the backend's `loop` (blocking). When it returns 0, repeat from 1 (one event
+   *    was served). When it returns non-zero: if a suspend command is pending, execute it (phase `suspended`,
+   *    initialized flag cleared so `update_tray_*` skip, waiters notified) and repeat from 1; if `end_tray` ran, return;
+   *    otherwise (Quit chosen in the menu, or the backend failed) return, exactly as the old loop ended.
+   * 4. Otherwise (`not_started` or `suspended` with no command): wait on the condition variable with a 500 ms timeout,
+   *    and return when `shutdown_requested()` is true. The poll is only for the idle phases; it is how a process
+   *    with no tray (a draining process, a new process before `COMMIT`) notices a shutdown that did not come through
+   *    `end_tray`. While the icon is running the loop blocks in the backend as before.
+   *
+   * Calling it on a platform whose tray runs on its own thread (Windows) or with the tray compiled out is a
+   * programming error; `mainThreadLoop` does not call it there (it keeps its "wait for shutdown" branch).
+   *
+   * @param shutdown_requested Returns true once the process is shutting down (`shutdown_event->peek()`). May be empty
+   *        (never true). Called on this thread, without the internal mutex.
+   *
+   * Thread-safety: call once, on the main thread. It records its thread id; `suspend` called on that thread (a tray
+   * menu callback) does not wait.
+   */
+  void run_main_loop(const std::function<bool()> &shutdown_requested);
+
+  /**
+   * @brief Remove the tray icon, keeping the process and the option to bring it back (the old side's `remove_tray`).
+   *
+   * Sets the pending command to suspend and, if the phase is `running`, calls the backend's `exit` to wake the loop;
+   * the loop removes the icon and acknowledges. Waits for that acknowledgement.
+   *
+   * A start or resume command still pending (not yet executed) is replaced by the suspend command (last wins).
+   *
+   * Returns `true` at once, without a command, when there is nothing to remove: phase `not_started`, `suspended` or
+   * `ended`, or the loop is not running and the phase is not `running`. After `true` the icon is gone and
+   * `update_tray_playing/pausing/stopped/require_pin` do nothing until a resume.
+   *
+   * @param timeout Longest wait for the acknowledgement.
+   * @return `true` when the icon is gone (or was never shown). `false` on timeout (the command stays pending and will
+   *         still run), or when called on the main-loop thread (it posts the command and returns `false` without
+   *         waiting, to avoid waiting for itself), or on a platform without the main-thread tray (see below).
+   *
+   * Thread-safety: any thread. Takes only the internal mutex. Must not be called while holding a lock that a tray menu
+   * callback or `update_tray_*` takes (the tray state mutex is never held across the wait).
+   * Platforms: on other than Linux and macOS (Windows runs the tray on its own thread, and the handoff is Linux only)
+   * it does nothing and returns `false`.
+   */
+  bool suspend(std::chrono::milliseconds timeout = std::chrono::milliseconds {2000});
+
+  /**
+   * @brief Bring the icon back after `suspend` (the old side's `restore_tray`, on rollback).
+   *
+   * Sets the pending command to resume and wakes the loop's condition variable; the loop calls `init` on the main
+   * thread. Does not wait for the icon to appear.
+   *
+   * @return `true` when the command was accepted: the phase is `suspended` (re-init is done by the loop), or already
+   *         `running` (nothing to do). `false` when the phase is `not_started` (there was no icon to restore; use
+   *         `request_start`), `ended`, the main loop was never entered and the tray is not enabled, or the platform has
+   *         no main-thread tray.
+   *
+   * Thread-safety: any thread; non-blocking. Re-initialising Qt's tray after `tray_exit` is assumed to work (the
+   * backend's `init` checks `trayIcon` is null); if it fails the loop logs a Warning and the phase stays `suspended`.
+   */
+  bool resume();
+
+  /**
+   * @brief Ask the main loop to show the icon for the first time (the new side's `start_tray`, at `COMMIT`).
+   *
+   * Sets the pending command to start and wakes the condition variable; the loop calls `init` on the main thread,
+   * which is the same thread as the caller in the new process (`run_new_side` runs on the main thread before the loop
+   * is entered): the command is then executed when the loop starts. Does not wait. In the `suspended` phase it
+   * behaves as `resume`.
+   *
+   * The deferral rule: the handoff-started process must not call this, nor `init_tray`, before `COMMIT`; the glue
+   * guarantees it and the glue's tests check it with a fake backend.
+   *
+   * @return `true` when accepted or already `running`; `false` when `ended`, when the tray is not enabled
+   *         (`config::sunshine.system_tray` false or compiled out), or the platform has no main-thread tray.
+   *
+   * Thread-safety: any thread, including the main thread before `run_main_loop`; non-blocking.
+   */
+  bool request_start();
+
+  /**
+   * @brief Enable or disable the Quit and Restart menu entries (the handoff keeps them off until `MAIN`).
+   *
+   * The setting is remembered and applied when the icon is created and updated at once when it is shown (as the other
+   * `tray_update` callers, under the tray state mutex). Disabled entries cannot be chosen; the callbacks also refuse
+   * through the hooks, so this is only the visible part. The default is enabled.
+   *
+   * @param enabled Whether Quit and Restart can be chosen.
+   *
+   * Thread-safety: any thread; non-blocking.
+   */
+  void set_lifecycle_entries_enabled(bool enabled);
+
+  /**
+   * @brief The lifecycle phase.
+   *
+   * @return The phase. Thread-safety: any thread.
+   */
+  tray_phase_e current_phase();
+
+  /**
    * @brief Initializes and runs the system tray in a separate thread.
    * @return 0 if initialization was successful, non-zero otherwise.
    */
@@ -173,6 +338,31 @@ namespace system_tray {
    * @return true if the system tray is initialized; otherwise, false.
    */
   bool tray_initialized_for_testing();
+
+  /**
+   * @brief Replace the backend entry points the lifecycle drives (a null member restores its production value), for
+   * tests of `run_main_loop`, `suspend`, `resume` and `request_start`.
+   *
+   * With a fake backend the lifecycle code makes no Qt call. A fake `loop` typically blocks on a test condition
+   * variable until the fake `exit` is called, as the real one blocks in `QApplication::exec`.
+   *
+   * @param backend The entry points.
+   */
+  void set_backend_for_testing(const tray_backend_t &backend);
+
+  /**
+   * @brief Return the lifecycle to its fresh state: phase `not_started`, no pending command, Quit and Restart entries
+   * enabled, backend production defaults. Not thread-safe: call it when no other thread uses the tray.
+   */
+  void reset_lifecycle_for_testing();
+
+  /**
+   * @brief Make the lifecycle treat the tray as enabled although `config::sunshine.system_tray` is not set, so a unit
+   * test can run `request_start` and `resume` with a fake backend.
+   *
+   * @param enabled Whether the tray counts as enabled.
+   */
+  void set_enabled_for_testing(bool enabled);
 
   /**
    * @brief Restore the persistent tray data to its initial state between tests.
