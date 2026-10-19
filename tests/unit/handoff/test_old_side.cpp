@@ -26,6 +26,7 @@
   #include <memory>
   #include <mutex>
   #include <optional>
+  #include <stdexcept>
   #include <string>
   #include <thread>
   #include <type_traits>
@@ -171,6 +172,7 @@ namespace {
     std::atomic<bool> shutdown_flag {false};  ///< Result of `shutdown_requested`.
     bool reload_ok {true};  ///< Result of `reload_after_rollback`.
     protocol::go_t snapshot;  ///< Result of `take_snapshot`.
+    bool snapshot_throws {false};  ///< When true, `take_snapshot` throws `std::runtime_error` (after it is logged).
     std::deque<bool> handover_results;  ///< Scripted `handover` results.
     bool handover_default {true};  ///< `handover` result once the script is used up.
     std::function<void(const std::string &)> hook;  ///< Called after each logged call, on the calling thread.
@@ -252,6 +254,9 @@ namespace {
 
     protocol::go_t take_snapshot() override {
       note("take_snapshot");
+      if (snapshot_throws) {
+        throw std::runtime_error("snapshot failed");
+      }
       return snapshot;
     }
 
@@ -1994,6 +1999,54 @@ TEST_F(HandoffOldSideTest, ChildDeathDuringHandoverRetriesWhileShuttingDownStart
   EXPECT_EQ(old_outcome_e::shutdown, *outcome);
   EXPECT_EQ(0, count_of(log.all(), "resume_accept")) << "no rollback while shutting down";
   EXPECT_EQ(0, count_of(log.all(), "publish_mdns"));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// A take_snapshot that throws fails the switch and the full rollback runs
+// ---------------------------------------------------------------------------------------------------------------
+
+TEST_F(HandoffOldSideTest, ThrowingTakeSnapshotFailsTheSwitchWithAReasonAndRunsTheFullRollback) {
+  ops.snapshot_throws = true;
+  start();
+  ASSERT_TRUE(to_ready());
+  const auto outcome = finish();
+  ASSERT_TRUE(outcome.has_value()) << "run() must return (not hang) when take_snapshot throws";
+  EXPECT_EQ(old_outcome_e::rolled_back, *outcome) << "a snapshot that cannot be taken fails the switch: the outcome is rolled_back";
+  const auto v = log.all();
+  EXPECT_EQ(1, count_of(v, "take_snapshot")) << "setup: take_snapshot must have been reached";
+  verify_rollback(9, false, withdrawn_tail(), {"answer:failed"});
+  // The rollback effects, one by one (positive identification of each undo).
+  for (const auto *effect : {"unfreeze", "lower_gate", "resume_accept", "publish_mdns", "restore_tray", "reload_after_rollback", "remove_new_instance_file"}) {
+    EXPECT_EQ(1, count_of(v, effect)) << effect << " must run exactly once after take_snapshot threw";
+  }
+  EXPECT_EQ(1, count_of(v, "kill_and_reap")) << "the rollback is kill-first: the child must be killed and reaped";
+  EXPECT_EQ(0, count_of(v, "set_released:1")) << "the app must not be released when the snapshot failed";
+  EXPECT_EQ(0, count_of(v, "start_upnp_cleanup:" + std::to_string(test_new_base))) << "COMMIT was never sent";
+  EXPECT_EQ(1, count_of(v, "set_state:none")) << "the handoff state must be reset";
+  EXPECT_EQ(0, count_of(v, "answer:committed"));
+  {
+    std::lock_guard lock {replies_mutex};
+    ASSERT_EQ(1U, replies.size()) << "the helper must be answered exactly once";
+    EXPECT_EQ(reply_kind_e::failed, replies[0].kind);
+    // SPEC-QUESTION: the header does not fix the reason text; the lead's ruling for this case is "taking the snapshot
+    // failed". Only a non-empty reason that mentions the snapshot is asserted.
+    EXPECT_NE(std::string::npos, replies[0].reason.find("snapshot")) << "the reason must say that taking the snapshot failed; it was: " << replies[0].reason;
+  }
+  const auto got_go = peer->collect(50ms);
+  EXPECT_EQ(0, count_of(got_go, "GO")) << "no GO may be sent when take_snapshot threw";
+}
+
+TEST_F(HandoffOldSideTest, NonThrowingTakeSnapshotReachesGoAndRunsNoRollbackEffect) {
+  start();
+  const auto go = to_go();
+  ASSERT_TRUE(go.has_value()) << "control: with a normal take_snapshot the switch must reach GO";
+  const auto v = log.all();
+  EXPECT_EQ(1, count_of(v, "take_snapshot"));
+  for (const auto *effect : {"unfreeze", "lower_gate", "resume_accept", "publish_mdns", "restore_tray", "kill_and_reap", "answer:failed"}) {
+    EXPECT_EQ(0, count_of(v, effect)) << effect << " must not run when the switch succeeded";
+  }
+  peer->channel.close();
+  finish(1000ms);
 }
 
 #endif  // __linux__
