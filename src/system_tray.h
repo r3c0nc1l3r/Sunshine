@@ -291,8 +291,13 @@ namespace system_tray {
    * Sets the pending command to resume and wakes the loop's condition variable; the loop calls `init` on the main
    * thread. Does not wait for the icon to appear.
    *
-   * @return `true` when the command was accepted: the phase is `suspended` (re-init is done by the loop), or already
-   *         `running` (nothing to do). `false` when the phase is `not_started` (there was no icon to restore; use
+   * A suspend still in progress (its command pending or its teardown not yet acknowledged) is never replaced: the
+   * resume is accepted and deferred, the loop first completes the suspend (phase `suspended`, waiters notified, so that
+   * `suspend` returns `true`), and then executes the resume (`init`, phase `running`). This is the rollback order
+   * `remove_tray` then `restore_tray`, also when `remove_tray` timed out.
+   *
+   * @return `true` when the command was accepted: the phase is `suspended` (re-init is done by the loop), a suspend is in
+   *         progress (deferred, as above), or already `running` with no suspend in progress (nothing to do). `false` when the phase is `not_started` (there was no icon to restore; use
    *         `request_start`), `ended`, the main loop was never entered and the tray is not enabled, or the platform has
    *         no main-thread tray.
    *
@@ -306,8 +311,8 @@ namespace system_tray {
    *
    * Sets the pending command to start and wakes the condition variable; the loop calls `init` on the main thread,
    * which is the same thread as the caller in the new process (`run_new_side` runs on the main thread before the loop
-   * is entered): the command is then executed when the loop starts. Does not wait. In the `suspended` phase it
-   * behaves as `resume`.
+   * is entered): the command is then executed when the loop starts. Does not wait. In the `suspended` phase, and
+   * while a suspend is in progress, it behaves as `resume`.
    *
    * The deferral rule: the handoff-started process must not call this, nor `init_tray`, before `COMMIT`; the glue
    * guarantees it and the glue's tests check it with a fake backend.
