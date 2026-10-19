@@ -147,7 +147,7 @@ namespace system_tray {
       bool loop_exited {false};  ///< `run_main_loop` returned.
       bool initializing {false};  ///< The loop is inside a backend `init`; `suspend` waits for it.
       std::thread::id loop_thread;  ///< The thread that runs `run_main_loop`.
-      bool enabled_for_testing {false};  ///< Count the tray as enabled (tests).
+      std::optional<bool> enabled_for_testing;  ///< Overrides `config::sunshine.system_tray` when set (tests).
       tray_backend_t backend;  ///< Backend entry points; null members take the production values.
     };
 
@@ -1048,7 +1048,7 @@ namespace system_tray {
       {
         const std::scoped_lock lock(state.mutex);
         if (state.enabled_for_testing) {
-          return true;
+          return *state.enabled_for_testing;
         }
       }
       return config::sunshine.system_tray;
@@ -1389,7 +1389,7 @@ namespace system_tray {
       state.loop_entered = false;
       state.loop_exited = false;
       state.loop_thread = {};
-      state.enabled_for_testing = false;
+      state.enabled_for_testing.reset();
       state.backend = {};
     }
     lifecycle_entries_enabled.store(true);
