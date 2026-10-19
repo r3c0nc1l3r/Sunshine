@@ -1079,42 +1079,44 @@ TEST_F(SessionApiHttpTest, DisablingRateLimiterRestoresAccess) {
 }
 
 #ifdef __linux__
-/**
- * @brief Test double for the draining peer that records whether `close` was called.
- */
-class RecordingClosePeer final: public handoff::session_peer_t {
-public:
-  bool close_called = false;  ///< Set when `close` runs.
+namespace {
+  /**
+   * @brief Test double for the draining peer that records whether `close` was called.
+   */
+  class RecordingClosePeer final: public handoff::session_peer_t {
+  public:
+    bool close_called = false;  ///< Set when `close` runs.
 
-  bool exists() override {
-    return true;
-  }
+    bool exists() override {
+      return true;
+    }
 
-  bool gone() override {
-    return false;
-  }
+    bool gone() override {
+      return false;
+    }
 
-  handoff::drain_peer_t::reply_e end_all(std::chrono::milliseconds) override {
-    return handoff::drain_peer_t::reply_e::no_reply;
-  }
+    handoff::drain_peer_t::reply_e end_all(std::chrono::milliseconds) override {
+      return handoff::drain_peer_t::reply_e::no_reply;
+    }
 
-  std::optional<std::vector<handoff::protocol::session_entry_t>> list(std::chrono::milliseconds) override {
-    return std::nullopt;
-  }
+    std::optional<std::vector<handoff::protocol::session_entry_t>> list(std::chrono::milliseconds) override {
+      return std::nullopt;
+    }
 
-  std::optional<rtsp_stream::close_result_e> close(std::uint32_t, std::chrono::milliseconds) override {
-    close_called = true;
-    return rtsp_stream::close_result_e::closed;
-  }
+    std::optional<rtsp_stream::close_result_e> close(std::uint32_t, std::chrono::milliseconds) override {
+      close_called = true;
+      return rtsp_stream::close_result_e::closed;
+    }
 
-  std::optional<std::uint32_t> close_cert(std::string_view, std::chrono::milliseconds) override {
-    return std::nullopt;
-  }
+    std::optional<std::uint32_t> close_cert(std::string_view, std::chrono::milliseconds) override {
+      return std::nullopt;
+    }
 
-  handoff::state_e state() override {
-    return handoff::state_e::draining;
-  }
-};
+    handoff::state_e state() override {
+      return handoff::state_e::draining;
+    }
+  };
+}  // namespace
 
 /**
  * @brief Test: an unauthenticated close of a draining session is rejected and the draining peer is never asked to close.

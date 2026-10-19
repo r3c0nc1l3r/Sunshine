@@ -2496,6 +2496,8 @@ when the switch succeeded. See [Drain handoff](drain-handoff.md) for the exit co
 With the drop-in, Sunshine sends `READY=1` to systemd also when `drain_handoff` is `disabled`. The feature stays off in
 that case.
 
+The handoff needs systemd 254 or newer.
+
 ## NVIDIA NVENC Encoder
 
 ### nvenc_preset
