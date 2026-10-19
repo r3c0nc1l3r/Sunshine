@@ -7,162 +7,40 @@ Upgrade or restart Sunshine while clients are streaming, without ending their st
 
 - new sessions go to a new Sunshine process (for example a newly installed binary);
 - sessions that are already streaming finish on the old process, which then exits;
-- clients notice nothing, except that a launch in flight during the handoff can fail once and is retried.
+- clients notice nothing, except that a request in flight during the switch can fail once and is retried.
 
-The feature is off by default and changes nothing when it is off. It targets Linux with systemd (user or system unit).
+The feature is off by default and changes nothing when it is off. It targets Linux with systemd 254 or newer, as a user
+or system service.
 
 ## Why this works with existing clients
 - The client learns the RTSP URL (and so the RTSP port) from `sessionUrl0` in the `/launch` and `/resume` replies.
-- For video, audio and control, the client takes the UDP port from each stream's RTSP `SETUP` reply
+- For video, audio and control, moonlight-common-c takes the UDP port from each stream's RTSP `SETUP` reply
   (`Transport: server_port=<n>`). The well-known ports (47998, 48000, 47999) are only fallbacks for a missing header.
-  This holds for moonlight-common-c, which Moonlight's clients use. Sunshine always sends the header.
+  Sunshine always sends the header. Clients that do not use moonlight-common-c must be checked separately.
 - So a process that owns the RTSP listener can put its sessions' UDP media on any ports. Two processes can stream at once
-  if they use different UDP bases. The TCP ports (HTTPS, HTTP, web UI, RTSP) stay the same, because the new process
-  inherits the listening sockets.
+  if they use different UDP bases. The TCP ports stay the same, because the new process inherits the listening
+  sockets and both processes share their accept queues.
+
+## Terms
+- **Active process**: the process that accepts new connections.
+- **Draining process**: a former active process that keeps its existing sessions and accepts nothing new.
+- **Switch**: the moment the old process stops accepting and the new one starts (step 5 below).
+- **Rollback window**: `drain_handoff_rollback_window` seconds after the switch, during which the old process is still
+  the unit's main process and can take the sockets back.
 
 ## Configuration
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `drain_handoff` | `disabled` | `enabled` turns the feature on. |
 | `drain_handoff_udp_offset` | `100` | The second UDP base is `port + offset`. Processes alternate between the two bases. |
-| `drain_handoff_deadline` | `3600` | Seconds an old process may drain (1 to 86400). At the deadline it ends the remaining sessions (reason `drain-deadline`) and exits. |
-| `drain_handoff_ready_timeout` | `30` | Seconds the new process has to report ready, or the handoff is rolled back. |
-| `drain_handoff_rollback_window` | `60` | Seconds after the switch during which the old process keeps the listening sockets and takes them back if the new process dies. |
+| `drain_handoff_deadline` | `3600` | Seconds a process may drain, counted from the switch (1 to 86400). At the deadline it ends the remaining sessions (reason `drain-deadline`) and exits. |
+| `drain_handoff_ready_timeout` | `30` | Seconds the new process has to report ready, or the handoff fails. |
+| `drain_handoff_rollback_window` | `60` | See "Terms". |
+| `drain_handoff_cooldown` | `120` | Seconds after a handoff (or a failed attempt) before the next one is accepted. At least the rollback window. |
 | `drain_handoff_binary` | path Sunshine was started from | Binary to execute for the new process. |
 
 Config validation rejects an offset that would make any UDP port of either base overlap a TCP port, overlap the
-other base, or leave 1024-65535.
-
-## Sequence
-Trigger: the helper `sunshine --drain-handoff <pid>` (the unit's `ExecReload`, see "systemd unit"). It connects to the
-running process's control socket and waits for the outcome, so a refused or failed handoff is reported as a non-zero
-exit. There is no signal trigger.
-
-1. **Old process: checks.** It refuses the handoff (logs a Warning, answers the helper with the reason, keeps running
-   unchanged) when:
-   - the feature is disabled;
-   - a handoff is already in progress, this process is itself draining, or **any** draining instance still exists
-     (the active process knows this from its open handoff channel to the draining process, and also checks the
-     instance files). A third process would need the base the draining process still holds;
-   - an application with a running process (non-empty `cmd`, not detached) is active, because the new process cannot
-     adopt it. Apps without a process (desktop-style) are fine;
-   - systemd readiness is not available (no `NOTIFY_SOCKET`, see "systemd unit"): without it the main PID cannot move to
-     the new process, and systemd would end the service when the old process exits. The log names the unit settings
-     that are needed.
-2. **Old process: spawn.** It creates a Unix socketpair (the handoff channel, `SOCK_SEQPACKET`, both ends
-   `FD_CLOEXEC`) and starts `drain_handoff_binary` with the same arguments, using `posix_spawn` (or `fork` plus only
-   async-signal-safe calls before `exec`). The listening sockets are placed at fds 3-6 and the channel at fd 7 in the
-   child only; every other fd of the old process is closed in the child. The new process receives:
-   - the four listening TCP sockets, in the systemd `LISTEN_FDS` / `LISTEN_FDNAMES` / `LISTEN_PID` convention, with
-     the names `https`, `http`, `webui`, `rtsp`;
-   - `SUNSHINE_HANDOFF_FD` (its end of the channel), `SUNSHINE_HANDOFF_UDP_BASE` (the base that the old process does
-     not use), `SUNSHINE_HANDOFF_NEXT_SESSION_ID` (so launch session ids stay unique across both processes), and
-     `SUNSHINE_HANDOFF_GENERATION` (a counter used to keep virtual device ids unique).
-3. **New process: start in handoff mode.** It adopts the inherited sockets instead of binding them, sets `FD_CLOEXEC`
-   on them and on the channel, and unsets `LISTEN_FDS`, `LISTEN_FDNAMES`, `LISTEN_PID` and every `SUNSHINE_HANDOFF_*`
-   variable, so apps and prep commands it launches inherit neither listeners nor the channel. It binds its UDP media
-   ports at the given base, and starts its servers, but does **not accept** connections yet. In handoff mode it skips
-   the startup actions that would disturb the old process's streams (see "Shared resources"), including the startup
-   encoder probe. It then sends `READY` on the channel.
-4. **Old process: switch.** On `READY` within `drain_handoff_ready_timeout`, the old process stops accepting on all
-   four sockets at once (no more `/launch`, `/resume`, pairing, web UI or RTSP), withdraws its mDNS service, and sends
-   `GO`. From that moment it answers nothing new. It keeps its copies of the sockets until the rollback window ends.
-   It answers the helper: switched (exit 0).
-5. **New process: take over.** On `GO` it starts accepting and publishes mDNS. It sends nothing to systemd yet: the old
-   process stays the unit's main PID for the whole rollback window.
-6. **Old process: hand over the main PID.** When the rollback window ends with the new process alive, the old process
-   closes its socket copies and sends `MAINPID=<new pid>` to systemd itself (it is still the main process, so
-   `NotifyAccess=main` allows it). From then on the new process is the main process and sends any later notifications.
-   The old process does not exit before this point, even when its sessions end earlier.
-7. **Old process: drain.** It keeps its sessions until each ends normally, or until `drain_handoff_deadline`. Then it
-   releases its devices, sinks and other resources as described below, and exits with status 0. A drained session ends
-   with its normal stop reason; at the deadline the reason is `drain-deadline`.
-
-### Stopping the service
-`systemctl stop` sends `SIGTERM` to both processes. A draining process does not wait for its deadline: it ends its
-sessions at once with reason `stop` and exits like a normal shutdown (within the existing 10 s forced-shutdown limit).
-So the stop timeout does not depend on `drain_handoff_deadline`; `TimeoutStopSec=30` is enough.
-
-### Process tree
-The new process starts as a child of the old one. It must not set `PR_SET_PDEATHSIG`, and the old process never
-signals it after `GO` (its shutdown path skips the child). When the old process exits, the service manager (PID 1, or
-the user manager, which is a subreaper) adopts the new process, which keeps running, keeps its sessions and stays the
-unit's main PID. Before `GO`, the old process watches its child (`SIGCHLD`, `waitpid`) to detect a failed start.
-
-### The handoff channel
-Messages on the channel are untrusted input:
-- each end checks the peer's credentials (`SO_PEERCRED`): same uid, and the pid of the expected child or parent;
-- the control socket used by the helper is `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock`, mode 0600, and it accepts
-  only peers with the same uid; it exists only while the feature is enabled;
-- messages are length-checked (at most 64 KiB) and parsed strictly; unknown message types are ignored;
-- a malformed message, a peer-credential mismatch or an error closes the channel and logs an Error.
-
-When the channel closes after `GO`, neither side ends any session: the draining process keeps draining until its
-sessions end or its deadline, and the active process keeps serving. The active process then no longer lists or closes
-the draining sessions (it logs a Warning), and it keeps refusing new handoffs while the draining process's instance file
-exists.
-
-### Rollback
-- The new process does not send `READY` in time, exits, or closes the channel before `GO`: the old process kills it if
-  it is still running, logs an Error, and keeps serving as if nothing happened (it never stopped accepting).
-- The new process dies within `drain_handoff_rollback_window` after `GO`: the old process (still the main PID) resumes
-  accepting on its socket copies, publishes mDNS again, and leaves drain mode. systemd sees no main-process exit, so the
-  unit and the old process's sessions are not affected. Sessions that had started on the new process are lost.
-- The new process dies after the window (it is the main PID by then): systemd sees the main process exit. With
-  `KillMode=control-group` it stops the unit, which also ends the draining process and its sessions (they end with
-  reason `stop`, see "Stopping the service"). `Restart=` then applies as for any crash (for example `on-failure`
-  starts a fresh process). This is the same outcome as a crash without this feature.
-
-Why not `ExitType=cgroup` instead: it would keep the unit up when the new main process dies after the window, but then
-only a draining process remains, which accepts nothing, so the service would look up while serving no one. Keeping
-the old process as main for the rollback window gives a real rollback and works with any systemd version that
-supports `Type=notify`.
-
-### The launch race
-A `/launch` that the old process accepted before the switch completes on the old process. Its RTSP connection then
-reaches the new process, which does not know the launch, so the stream fails once; the client retries and the retry
-goes to the new process. The old process stops answering `/launch` at the switch (step 4), so only requests already in
-flight are affected. The e2e covers this case.
-
-## Shared resources while two processes run
-| Resource | Rule |
-|----------|------|
-| GPU (capture, encode) | The new process opens no capture or encoder before its first session: the startup encoder probe is skipped in handoff mode (the `/launch` probe still runs). The e2e checks this from the new process's DRM fds and memory, and measures peak VRAM during the handoff. |
-| Audio sinks | The virtual sinks have fixed names, and the new process adopts the existing ones. A draining process does not unload sink modules on exit and does not restore the default sink when its sessions end; the new process owns them after the switch. |
-| Virtual input devices | In handoff mode the new process creates keyboard, mouse, touch and pen devices at its first session, not at startup. Device stable ids and gamepad MAC addresses include the generation, so the two processes never create devices with the same ids. The old process destroys all of its devices before it exits. A client that reconnects after a handoff gets gamepads with new MAC addresses, so the host may see them as new controllers (for example, per-controller settings keyed by MAC do not carry over). |
-| Display configuration | In handoff mode the new process does not revert display changes at startup. A draining process does not revert them when it exits. |
-| App state and prep commands | The new process starts with no running app; its first launch runs the app's and the global `do` commands again (they must be idempotent). A draining process does not run `undo` commands and does not terminate apps on exit. |
-| `sunshine_state.json`, `apps.json` | Only the process that accepts connections handles pairing and the web UI, so only it writes these files. Writes use a temporary file and rename. |
-| Log file | In handoff mode the new process appends to the log without rotating it. Every line of a draining process carries a `[drain]` tag. |
-| mDNS | Only the process that accepts connections publishes. |
-
-## Visibility and control (session API and logs)
-- The web UI listener belongs to the process that accepts connections (the new one after the switch).
-- `GET /api/sessions` there lists its own sessions and the draining process's sessions, which it queries over the
-  handoff channel. Each entry gets one more key, `draining` (bool), always present (`false` when the feature is off).
-  `docs/api.md` and the key-set test change with it. Ids are unique across both processes.
-- `POST /api/sessions/<id>/close` closes either kind; for a draining session the request goes over the channel. The
-  audit line is unchanged and is written by the process that serves the request.
-- Each process writes its own `Session ended: reason=<r>, active sessions=<N>` line; N counts that process's sessions.
-- Two stop reasons are added: `drain-deadline` (a draining session ended at the deadline) and `stop` (a draining
-  session ended because the service was stopped).
-
-## Active-port discovery for external idle checks
-External tools that detect streams by Sunshine's UDP ports need to know every base that is in use. Each process keeps
-one file of its own, `$XDG_RUNTIME_DIR/sunshine/instances/<pid>.json`, and writes only that file (a temporary file plus
-rename):
-
-```json
-{"pid": 1234, "role": "active", "udp_base": 47989, "sessions": 0}
-```
-
-- A process writes its file at startup and on every role change and session start or end, and deletes it on exit.
-  No process ever writes another process's file, so updates are never lost.
-- Consumers read every file in the directory. A file whose pid no longer runs is ignored (and may be deleted by the
-  next Sunshine start).
-- Fail-safe rule for consumers: treat Sunshine as busy when the directory is missing while a Sunshine process runs,
-  when a running Sunshine process has no file, when any file is unreadable, or when any instance has sessions above 0
-  or traffic on its base ports.
+other base, or leave 1024-65535, and a cooldown shorter than the rollback window.
 
 ## Ports
 The TCP ports do not change (the sockets are inherited). Only the UDP media ports move. With the default `port` 47989
@@ -180,13 +58,225 @@ and `drain_handoff_udp_offset` 100:
 
 The second base must be reachable wherever the first is. Check host and network firewalls (and any port forwarding)
 before enabling the feature; `drain_handoff_udp_offset` can be set so the second base falls inside a range that is
-already allowed. UPnP mappings, when UPnP is enabled, are added for the base in use.
+already allowed. Reachability depends on the deployment allowing the second UDP base. The operator's deployment notes
+must list both port sets.
+
+UDP sockets are bound when a process's first session starts (`start_broadcast`), as today, so a process holds no UDP
+ports while it has no session. The UDP port helper takes the process's UDP base as a parameter (today `map_port` adds
+offsets to the single configured `port`); TCP ports keep using `port`.
+
+## Sequence
+### 1. Trigger and checks
+`ExecReload=sunshine --drain-handoff $MAINPID` (see "systemd unit") connects to the active process's control socket
+and sends the single handoff verb. The active process refuses (logs a Warning naming the reason and the peer pid,
+answers the helper with the reason, keeps running unchanged) when:
+
+- the feature is disabled (then there is no control socket at all, and the helper fails to connect);
+- a handoff is in progress, a draining instance exists (known from the open channel and the instance files), or the
+  cooldown has not passed;
+- an application with a running process (non-empty `cmd`, not detached) is active, because the new process cannot
+  adopt it. Apps without a process (desktop-style) are fine;
+- the process is not a systemd service with readiness (`NOTIFY_SOCKET` unset), or systemd is older than 254 (checked
+  with `systemctl --version`), or the unit name cannot be found from `/proc/self/cgroup`.
+
+### 2. Spawn
+The old process creates a socketpair (the handoff channel, `SOCK_SEQPACKET | SOCK_CLOEXEC`) and starts
+`drain_handoff_binary` with the same arguments, using `posix_spawn` (or `fork` plus only async-signal-safe calls before
+`exec`). In the child only, the listening sockets are placed at fds 3-6 and the channel at fd 7, and every other fd is
+closed (`close_range`/`closefrom`). The child's environment adds:
+
+- `SUNSHINE_HANDOFF_FDS=https:3,http:4,webui:5,rtsp:6` and `SUNSHINE_HANDOFF_CHANNEL=7`;
+- `SUNSHINE_HANDOFF_UDP_BASE` (the base the old process does not use),
+  `SUNSHINE_HANDOFF_NEXT_SESSION_ID` (launch session ids stay unique across both processes), and
+  `SUNSHINE_HANDOFF_GENERATION` (keeps virtual device ids unique).
+
+The systemd `LISTEN_FDS`/`LISTEN_PID` convention is not used: the child's pid is not known before the spawn.
+
+Right after the spawn, the old process opens a pidfd for the child (it is the parent and has not reaped it, so the pid
+cannot be reused yet) and uses it to watch the child for the rest of the handoff. It keeps reaping the child
+(`waitpid`) for as long as it lives, so a dead new process never stays a zombie.
+
+### 3. New process start (handoff mode)
+- Before any other thread starts, it sets `FD_CLOEXEC` on fds 3-7 and unsets every `SUNSHINE_HANDOFF_*` variable, so
+  apps and commands it launches inherit neither listeners nor the channel.
+- It validates the inherited fds: each must be a listening TCP socket (`SO_ACCEPTCONN`) whose local port and address
+  family match its own config (`port`, `address_family`, `bind_address`). A mismatch (config or version drift) is
+  reported as a failed `READY` with the reason.
+- It exchanges `HELLO` with the old process: protocol version and capabilities. An unknown major version is a failed
+  `READY`. The old process's `HELLO` carries its encoder probe results (chosen encoder and the HEVC, AV1 and 4:4:4
+  capability flags that `/serverinfo` reports), which the new process uses until its own `/launch` probe runs (see
+  "GPU").
+- It adopts the sockets instead of binding them (this needs small patches: Simple-Web-Server `start()` must accept an
+  existing listening socket, and the RTSP acceptor in `rtsp.cpp` must adopt one instead of `bind`/`listen`), starts its
+  servers with accepting paused, and sends `READY` (or a failed `READY` with a reason).
+- If the channel reports end-of-file or an error before `GO`, the new process exits with status 1.
+
+### 4. Failed start
+The new process sends a failed `READY`, exits, closes the channel, or does not report within
+`drain_handoff_ready_timeout`: the old process kills it if it still runs (through the pidfd), reaps it, logs an Error,
+answers the helper with a non-zero result, and keeps serving. It never stopped accepting.
+
+### 5. Switch
+On `READY` the old process:
+
+1. pauses accepting on all four sockets (`acceptor.cancel()` / pausing the server's accept loop; never closing the
+   server, which would close live connections);
+2. from now on answers every request that still arrives on an already open (keep-alive) connection, to `/launch`,
+   `/resume`, `/cancel`, pairing and the web UI API, with 503 and `Connection: close`, and refuses new RTSP requests on
+   open RTSP connections; RTSP connections of its own live sessions are unaffected;
+3. withdraws its mDNS service and waits for Avahi to confirm the withdrawal (bounded, 5 s);
+4. stops writing `sunshine_state.json` and `apps.json`;
+5. sends `GO`, and answers the helper: switched (exit 0).
+
+The new process, on `GO`: reloads `sunshine_state.json` and `apps.json` (changes made by the old process after the new
+one first read them must not be lost), resumes accepting, and publishes mDNS. It sends nothing to systemd yet: the old
+process stays the unit's main process for the rollback window.
+
+### 6. Rollback window
+- The new process serves normally.
+- If it dies inside the window (seen through the pidfd): the old process resumes accepting on its socket copies,
+  answers requests normally again, reloads both state files before any write, publishes mDNS, and leaves drain mode.
+  systemd sees no main-process exit, so the unit and the old process's sessions are not affected. The new process's
+  sessions are lost; apps it launched and `do` commands it ran are not undone (logged as a Warning), and its instance
+  file is removed by the old process.
+- If the old process crashes inside the window: it is the main process, so systemd stops the unit and the new process
+  and its sessions end too, then `Restart=` applies. This is the same outcome as a crash without this feature.
+
+### 7. Main PID handover (end of the window)
+1. Check through the pidfd that the new process is alive. If not, roll back as in step 6.
+2. Send `MAINPID=<new pid>` followed by `BARRIER=1` to systemd (as the main process, which `NotifyAccess=main`
+   allows), and wait for the barrier.
+3. Read back `systemctl [--user] show -p MainPID --value <unit>` and require it to equal the new pid.
+4. Only then close the socket copies and the control socket, and tell the new process over the channel that it is the
+   main process.
+5. If the barrier or the read-back fails, log an Error, stay the main process, keep the socket copies, and retry the
+   handover every 10 s until the deadline; the process does not exit while it is the main process.
+
+From the handover on, the new process is the main process and sends any later notifications (`STATUS=`, `STOPPING=1`).
+A dead new process after the handover is a normal main-process exit: with `KillMode=control-group` systemd stops the
+unit, which also ends the draining process (its sessions end with `stop`), then `Restart=` applies.
+
+### 8. Drain
+The old process keeps its sessions until each ends normally, or until `drain_handoff_deadline` (counted from the
+switch). It never exits before the handover in step 7 is done, even when its last session ends earlier. Then it
+releases its devices and other resources as described below and exits with status 0. Sessions it ends at the deadline
+get reason `drain-deadline`.
+
+### Stopping, restarting and quitting
+- `systemctl stop` sends `SIGTERM` to both processes. A draining process ends its sessions at once with reason `stop`
+  and exits like a normal shutdown (within the existing 10 s forced-shutdown limit), so stopping does not wait for the
+  drain deadline. `TimeoutStopSec=30` is enough.
+- `SIGTERM` to the draining process alone (by pid) ends only its sessions, with reason `stop`. This is the way to end
+  draining sessions when the channel is lost.
+- In-place restart (`/api/restart`, tray restart; both `execv` the binary):
+  - in the active role while a draining process exists or a handoff is in progress: refused (409 for the API, a
+    Warning in the log);
+  - otherwise allowed; the restarted process keeps its UDP base (passed in `SUNSHINE_UDP_BASE`, kept across the
+    `execv`) and binds TCP as at a normal start;
+  - a draining process has no web UI and ignores tray restart and quit (it disables those menu entries).
+- Quit (web UI or tray) in the active role ends the main process, so systemd stops the unit, including any draining
+  process (as for `systemctl stop`).
+
+### The launch race and requests that straddle the switch
+- A `/launch` that the old process accepted before the switch completes there; the RTSP connection that follows
+  reaches the new process, which does not know the launch, so the stream fails once and the client retries.
+- A keep-alive request that reaches the old process after the switch gets 503 and `Connection: close`; the client
+  reconnects and reaches the new process.
+- A pairing that straddles the switch fails (its state lives in the process that started it) and must be retried.
+- TLS handshakes in progress on the old process complete there, and their requests get 503.
+
+## The handoff channel
+- It is private: only the old process and its spawned child hold it (`SOCK_CLOEXEC` everywhere else). The peer is
+  identified by that, and the child by the old process's pidfd; `SO_PEERCRED` is not used on the socketpair (it reports
+  the creator's pid on both ends).
+- Messages are length-checked (at most 64 KiB) and parsed strictly. Unknown types are ignored. A malformed message or
+  an error closes the channel and logs an Error.
+- Messages: `HELLO` (version, capabilities, probe results), `READY` (ok or reason), `GO`, `MAIN` (handover done),
+  `SESSIONS?`/`SESSIONS` (list), `CLOSE <id>`/`CLOSED <result>`, `COUNT?`/`COUNT <n>` (session count).
+- When the channel closes after `GO`, neither side ends any session: the draining process keeps draining, the active
+  process keeps serving. The active process then no longer lists or closes the draining sessions (it logs a Warning),
+  treats the draining process's session count as "at least 1" while its instance file exists (see "Display"), and keeps
+  refusing handoffs while that file exists.
+
+## The control socket
+- Path: `$RUNTIME_DIRECTORY/control/<pid>.sock` when `RUNTIME_DIRECTORY` is set (`RuntimeDirectory=sunshine`), else
+  `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock`. Without either, the feature is refused at startup with an Error.
+- Mode 0600; the active process checks the connecting peer with `SO_PEERCRED` (same uid) and logs the peer pid.
+- The trust boundary is the uid: any process of the same user is trusted, as it could already reload or signal the
+  service. Apps launched through Sunshine cannot trigger a handoff while they run (the refusal rule above).
+- It accepts exactly one verb (handoff) with no arguments, once per cooldown. Only the active process has a control
+  socket; a draining process has none.
+
+## Shared resources while two processes run
+### GPU
+- In handoff mode the new process does not run the startup encoder probe, and opens no capture or encoder before its
+  first session. Until then `/serverinfo` reports the probe results received in `HELLO`. Its first `/launch` probes as
+  today (the probe opens a capture and an encoder briefly).
+- NVENC hosts: the `/launch` probe needs a free encoder session while the draining process still holds its own; hosts
+  with a session limit must allow for both processes.
+- Supported capture backends: wlr screencopy and KMS (no exclusive resources; KMS drops DRM master). Portal and X11
+  capture are not supported in handoff mode (the feature is refused with them).
+- The e2e checks the new process's DRM fds and memory before its first session, and peak VRAM during a handoff.
+
+### Display configuration and session-count guards
+Every place that acts on "the first session starts" or "the last session ended" uses a **global** count: its own
+sessions plus the draining process's (`COUNT?` over the channel; "at least 1" if the channel is lost while the draining
+instance file exists). This covers:
+
+- `display_device::configure_display` before a `/launch` or `/resume` (only when the global count is 0);
+- `revert_configuration` and `platf::streaming_will_stop` at session end, in `proc_t::terminate`, and for `/cancel`
+  (only when the global count reaches 0);
+- the encoder reprobe on `/launch` (unchanged; it runs in the active process only).
+
+A draining process never configures or reverts the display, never calls `streaming_will_stop`, and never runs the
+startup revert of the display-device state file. `/cancel` on the active process affects only its own app and sessions.
+
+### Other resources
+| Resource | Rule |
+|----------|------|
+| Audio sinks | The virtual sinks have fixed names; the new process adopts the existing ones. A draining process does not unload sink modules on exit and does not restore the default sink when its sessions end; the active process owns them. |
+| Virtual input devices | In handoff mode the new process creates keyboard, mouse, touch and pen devices at its first session, not at startup. Device stable ids and gamepad MAC addresses include the generation, so the two processes never create devices with the same ids. A draining process destroys all of its devices before it exits. A client that reconnects after a handoff gets gamepads with new MAC addresses, so the host may see them as new controllers. |
+| App state and prep commands | The new process starts with no running app; its first launch runs the app's and the global `do` commands again (they must be idempotent). A draining process does not run `undo` commands and does not terminate apps on exit. |
+| `sunshine_state.json`, `apps.json` | Only the active process writes them (the old process stops at the switch, the new one reloads both after `GO`, the old one reloads both on rollback). Writes use a temporary file and rename. |
+| Log file | In handoff mode the new process appends to the log without rotating it. Every line of a draining process carries a `[drain]` tag. |
+| mDNS | Only the active process publishes (see step 5). |
+| UPnP | Only the active process maps ports. A draining process never unmaps the shared TCP ports, and unmaps only its own UDP base when it exits and the active process does not use that base. |
+| File descriptors | Sunshine's sockets are not close-on-exec today (Boost.Asio and ENet create them without `SOCK_CLOEXEC`), but apps and commands are launched with Boost.Process `limit_handles`, which closes every non-stdio fd in the child, and the in-place restart closes all fds above stderr before `execv`. So launched apps inherit no sockets today. The handoff keeps that true: the spawn closes every fd except 0-2 and 3-7 in the child, the new process sets `FD_CLOEXEC` on 3-7 and on the channel, and every new launch path must use `limit_handles` or close fds the same way. `NOTIFY_SOCKET` stays in app environments (harmless with `NotifyAccess=main`). |
+
+## Visibility and control (session API and logs)
+- The web UI listener belongs to the active process.
+- `GET /api/sessions` there lists its own sessions and the draining process's sessions (`SESSIONS?` over the channel).
+  Each entry has one more key, `draining` (bool), always present (`false` when the feature is off). `docs/api.md` and
+  the key-set test change with it. Ids are unique across both processes.
+- `POST /api/sessions/<id>/close` closes either kind; for a draining session the request goes over the channel. The
+  audit line is unchanged and is written by the active process.
+- `/serverinfo` `currentgame` and `/cancel` refer to the active process's app only.
+- Each process writes its own `Session ended: reason=<r>, active sessions=<N>` line; N counts that process's sessions.
+- New stop reasons: `drain-deadline` (ended at the drain deadline) and `stop` (a draining session ended because the
+  service or the draining process was stopped).
+
+## Active-port discovery for external idle checks
+Each process keeps one file of its own, `<runtime dir>/instances/<pid>.json` (same runtime dir as the control socket),
+and writes only that file (a temporary file plus rename):
+
+```json
+{"pid": 1234, "start_time": 5551234, "role": "active", "udp_base": 47989, "sessions": 0}
+```
+
+- `start_time` is field 22 of `/proc/<pid>/stat`; an entry whose pid now has another start time is stale (pid reuse).
+- A process writes its file at startup and on every role change and session start or end, and deletes it on exit. No
+  process writes another process's file, except that the old process removes a dead new process's file on rollback.
+- Consumers read every file in the directory and ignore stale ones.
+- Fail-safe rule for consumers: treat Sunshine as busy when the directory is missing while a Sunshine process runs,
+  when a running Sunshine process has no file, when any file is unreadable, or when any instance has sessions above 0
+  or traffic on its base ports. Between `/launch` and the first media, `sessions` can still be 0, so consumers also
+  treat recent RTSP connections as busy.
 
 ## systemd unit
-Readiness: whenever `NOTIFY_SOCKET` is set, Sunshine sends `READY=1` once its TCP listeners and UDP sockets are bound
-and its servers run (for a normal start as well as for a handoff start's first process, and whether or not the
-feature is enabled). The encoder probe at a normal start runs before that point, so the default `TimeoutStartSec`
-(90 s) is enough; units that lower it must allow for the probe.
+Readiness: whenever `NOTIFY_SOCKET` is set, Sunshine sends `READY=1` once its servers run (TCP listeners bound or
+adopted), for a normal start and whether or not the feature is enabled. A process started by a handoff sends nothing
+until it is the main process. The encoder probe at a normal start runs before `READY=1`, so the default
+`TimeoutStartSec` (90 s) is enough; units that lower it must allow for the probe.
 
 With the feature enabled, the unit needs:
 ```ini
@@ -195,16 +285,18 @@ Type=notify
 NotifyAccess=main
 ExecReload=/usr/bin/sunshine --drain-handoff $MAINPID
 TimeoutStopSec=30
+# system units only:
+RuntimeDirectory=sunshine
 ```
 - `NotifyAccess=main`: only the main process can notify, so apps and commands that Sunshine launches cannot spoof
-  `READY` or `MAINPID`. The old process moves the main PID itself (step 6); the new process notifies only once it is
-  main.
-- `ExecReload` exits 0 when the switch happened, and non-zero (with the reason on stderr, so it lands in the journal
-  and in `systemctl reload`'s failure) when the feature is off (no control socket), a handoff or a drain is in
-  progress, an app with a process is running, readiness is unavailable, or the new process failed and was rolled
-  back. Its wait is bounded by `drain_handoff_ready_timeout` plus 10 s; that must stay below the timeout systemd
-  applies to `ExecReload` on the target version.
-- The default `KillMode=control-group` stays: stopping the unit ends both processes.
+  `READY` or `MAINPID`.
+- `ExecReload` exits 0 when the switch happened (step 5), and non-zero, with the reason on stderr (so it lands in the
+  journal and in `systemctl reload`'s failure), when the handoff was refused or failed. Its wait is bounded by
+  `drain_handoff_ready_timeout` plus 10 s. systemd applies `TimeoutStartSec` to `ExecReload`; the default 90 s is enough
+  (verify on the target version).
+- Minimum systemd: 254 (tracking a main PID that is not the manager's child through a pidfd). The active process checks
+  the version before a handoff (step 1), and the read-back in step 7 guards against a refused `MAINPID`.
+- The default `KillMode=control-group` stays.
 - Feature enabled but the unit is `Type=simple` (no `NOTIFY_SOCKET`): Sunshine runs normally and refuses every handoff
   with an Error that names the settings above.
 - Feature disabled but the unit is `Type=notify`: Sunshine starts normally and sends `READY=1`; the helper fails
@@ -213,39 +305,54 @@ TimeoutStopSec=30
 ## Tests
 - **Unit (blind):**
   - config validation of the options;
-  - the `LISTEN_FDS` parsing and the socket-name mapping;
-  - the handoff channel protocol (`READY`, `GO`, list and close requests) over a socketpair, including timeouts,
-    early close, oversized and malformed messages, and a peer-credential mismatch;
-  - the instance-file writer (own file only, atomic write, removal on exit) and a reader that applies the fail-safe
-    rules, with stale and unreadable files;
-  - the fd and environment hygiene after adoption;
-  - the generation in device ids.
-- **E2E, on a test host:**
-  0. all e2e runs use a short `drain_handoff_deadline` (for example 60 s);
+  - parsing and validation of `SUNSHINE_HANDOFF_FDS` (wrong port, family, not listening);
+  - the channel protocol over a socketpair: `HELLO` version mismatch, `READY` failure reasons, `GO`, list, close and
+    count requests, timeouts, early close, oversized and malformed messages;
+  - the instance-file writer and the fail-safe reader (stale pid, pid reuse via start time, unreadable file);
+  - fd and environment hygiene after adoption;
+  - the global session-count guards (configure and revert decisions for local and remote counts, channel lost);
+  - the generation in device ids;
+  - the control socket: wrong uid, extra arguments, cooldown, refusal while an app process runs.
+- **E2E, on a test host, with a short `drain_handoff_deadline` (for example 60 s):**
   1. handoff during an active stream: the old stream keeps flowing (no gap longer than 1 s), new streams go to the new
-     process, and the old process exits after its session ends;
-  2. a launch in flight during the handoff fails at most once, and the retry succeeds;
-  3. rollback when the new binary fails before `READY`, and when it dies inside the rollback window;
-  4. deadline expiry ends the old sessions with `drain-deadline`;
-  5. `/api/sessions` lists and closes sessions on both processes;
-  6. `instances.json` and the idle check stay correct throughout;
-  7. after the old process exits: input devices, audio sinks and the default sink are as before the handoff;
-  8. peak VRAM during the handoff and the new process's DRM usage before its first session;
-  9. a reload while a process is still draining is refused with a Warning, and nothing changes;
-  10. an app launched by the new process holds none of the listening sockets or the channel (`/proc/<pid>/fd`), and its
-      environment has no `LISTEN_*` or `SUNSHINE_HANDOFF_*` variables;
-  11. the old process exits after its drain; the new process keeps running, keeps its sessions and stays the unit's
-      main PID;
-  12. garbage or an early close on the channel ends no session on either side;
-  13. with the feature enabled under a `Type=simple` unit, a reload is refused with an Error and nothing changes;
-  14. the new process dies inside the rollback window: the old process takes the sockets back, stays the main PID,
-      and its sessions continue; `systemctl reload` reported success at the switch, and the rollback is logged;
-  15. the new process dies after the window: the unit restarts per `Restart=`, the draining sessions end with `stop`;
-  16. `systemctl reload` exits non-zero when the feature is off, and during a drain;
-  17. `systemctl stop` during a drain returns within `TimeoutStopSec` and ends the draining sessions with `stop`.
+     process, and the old process exits after its session ends and the handover;
+  2. a launch in flight during the switch fails at most once and the retry succeeds; a keep-alive `/launch` on the old
+     process after the switch gets 503;
+  3. failed start: the new binary fails before `READY` (crash, wrong config port, version mismatch); the old process
+     keeps serving and `systemctl reload` fails;
+  4. the new process dies inside the rollback window: the old process takes the sockets back, stays the main PID, its
+     sessions continue, and no display or app state leaks;
+  5. after the window, `systemctl show -p MainPID` equals the new pid; the old process exits after its drain and the
+     new one keeps running, keeps its sessions and stays the main PID;
+  6. the new process dies after the window: the unit stops cleanly and restarts per `Restart=`; draining sessions end
+     with `stop`;
+  7. the old process crashes before `GO` (the new one exits), inside the window (the unit restarts), after the window
+     (the new one keeps serving);
+  8. `systemctl stop` during a handoff and during a drain returns within `TimeoutStopSec`;
+  9. deadline expiry ends the old sessions with `drain-deadline`;
+  10. `/api/sessions` lists and closes sessions on both processes; after a channel loss, a close of a draining session
+      fails cleanly, and `SIGTERM` to the draining pid ends it;
+  11. instance files and the idle check stay correct throughout, including the gap between `/launch` and the first
+      media;
+  12. after the old process exits: input devices, audio sinks and the default sink are as before the handoff;
+  13. peak VRAM during the handoff; the new process's DRM usage before its first session; `/serverinfo` codec flags on
+      the new process before its first launch match the old process's;
+  14. display configuration: the new process's first launch while the old one streams does not reconfigure the
+      display; the old process's last session end does not revert it; `/cancel` on the new process does not affect
+      the old one;
+  15. a pairing and an `apps.json` edit made during the window survive both a completed handoff and a rollback; a
+      pairing that straddles the switch fails once and succeeds on retry;
+  16. a reload while a process is draining, within the cooldown, or while an app process runs is refused with a
+      Warning, and nothing changes; `systemctl reload` exits non-zero;
+  17. `/api/restart` on the active process while a draining process exists is refused; after the drain it works and
+      keeps the UDP base;
+  18. an app launched by either process holds none of Sunshine's sockets or the channel (`/proc/<pid>/fd`) and has no
+      `SUNSHINE_HANDOFF_*` variables;
+  19. garbage or an early close on the channel ends no session on either side;
+  20. with the feature enabled under a `Type=simple` unit, a reload is refused with an Error and nothing changes.
 
 ## Out of scope
 - Moving a live session from one process to another (not possible without client support).
-- Windows and macOS.
-- Socket activation for the first start (the inherited-socket code accepts `LISTEN_FDS` from systemd too, but no
-  `.socket` unit ships with this change).
+- Windows and macOS; portal and X11 capture.
+- Socket activation for the first start.
+- Undoing apps or `do` commands of a new process that died inside the rollback window (logged, not undone).
