@@ -185,13 +185,23 @@ TEST_F(NvhttpHandoffStateTest, ReloadStateEmptyFileIsUnreadable) {
 }
 
 TEST_F(NvhttpHandoffStateTest, ReloadStateMalformedClientListIsUnreadableAndChangesNothing) {
-  // SPEC-QUESTION: the exact shape the client list must have to count as malformed is defined by the state file
-  // format, not by the header. This test uses a scalar where a list of paired clients is expected.
+  // A non-empty scalar where the client list belongs is malformed (nvhttp.h, load_status_e::unreadable).
   http::unique_id = "keep-this-id";
   write_text(state_file, R"({"root":{"uniqueid":"new-id-from-bad-file","named_devices":"not-a-list"}})");
 
   EXPECT_EQ(nvhttp::reload_state(), nvhttp::load_status_e::unreadable) << "a malformed client list must report unreadable";
   EXPECT_EQ(http::unique_id, "keep-this-id") << "a file that fails to parse completely must not replace the host unique id";
+}
+
+TEST_F(NvhttpHandoffStateTest, ReloadStateEmptyNamedDevicesLoadsAsEmptyList) {
+  // An empty string is the empty array in the state file format, so it is an empty client list, not malformed.
+  const auto cert = add_paired_client();
+  ASSERT_TRUE(nvhttp::test_support::authorize_client_certificate(cert)) << "precondition: the client must be authorized before the reload";
+  write_text(state_file, R"({"root":{"uniqueid":"empty-list-host-id","named_devices":""}})");
+
+  EXPECT_EQ(nvhttp::reload_state(), nvhttp::load_status_e::loaded) << "named_devices with an empty string must load, not be unreadable";
+  EXPECT_EQ(http::unique_id, "empty-list-host-id") << "a loaded reload must take the file's host unique id";
+  EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(cert)) << "an empty client list must replace the in-memory paired clients with none";
 }
 
 TEST_F(NvhttpHandoffStateTest, ReloadStateFrozenStillReloads) {
@@ -207,6 +217,7 @@ TEST_F(NvhttpHandoffStateTest, ReloadStateFrozenStillReloads) {
 TEST_F(NvhttpHandoffStateTest, SaveStateCheckedCreatesFileWithUniqueId) {
   http::unique_id = "save-checked-id";
   add_paired_client();
+  fs::remove(state_file);  // add_client already wrote the file; start from no file
   ASSERT_FALSE(fs::exists(state_file));
 
   EXPECT_TRUE(nvhttp::save_state_checked()) << "a save with no existing file and a valid directory must return true";
@@ -245,9 +256,9 @@ TEST_F(NvhttpHandoffStateTest, SaveStateCheckedLeavesNoTemporaryFile) {
 }
 
 TEST_F(NvhttpHandoffStateTest, SaveStateCheckedFailsOnUnparsableExistingFileAndWritesNothing) {
+  add_paired_client();  // add_client saves the state file itself, so write the broken file after it
   const std::string broken = "{ broken state";
   write_text(state_file, broken);
-  add_paired_client();
 
   EXPECT_FALSE(nvhttp::save_state_checked()) << "an existing file that cannot be parsed must make the save fail";
   EXPECT_EQ(read_text(state_file), broken) << "a failed save must not change the existing file";
@@ -263,6 +274,7 @@ TEST_F(NvhttpHandoffStateTest, SaveStateCheckedFailsWhenDirectoryIsMissing) {
 
 TEST_F(NvhttpHandoffStateTest, SaveStateCheckedWhileFrozenWritesNothingAndReturnsTrue) {
   add_paired_client();
+  fs::remove(state_file);  // add_client already wrote the file; remove it so the frozen save's absence check is meaningful
   nvhttp::set_state_frozen(true);
   ASSERT_TRUE(nvhttp::state_frozen());
 
@@ -271,9 +283,9 @@ TEST_F(NvhttpHandoffStateTest, SaveStateCheckedWhileFrozenWritesNothingAndReturn
 }
 
 TEST_F(NvhttpHandoffStateTest, SaveStateCheckedWhileFrozenDoesNotTouchBrokenFile) {
+  add_paired_client();  // add_client saves the state file itself, so write the broken file after it
   const std::string broken = "{ still broken";
   write_text(state_file, broken);
-  add_paired_client();
   nvhttp::set_state_frozen(true);
 
   EXPECT_TRUE(nvhttp::save_state_checked()) << "while frozen the save returns true even when the existing file would fail to parse";
@@ -282,6 +294,7 @@ TEST_F(NvhttpHandoffStateTest, SaveStateCheckedWhileFrozenDoesNotTouchBrokenFile
 
 TEST_F(NvhttpHandoffStateTest, SaveStateCheckedWritesAgainAfterUnfreeze) {
   add_paired_client();
+  fs::remove(state_file);  // add_client already wrote the file; remove it so the absence check after the frozen save is meaningful
   nvhttp::set_state_frozen(true);
   ASSERT_TRUE(nvhttp::save_state_checked());
   ASSERT_FALSE(fs::exists(state_file));
@@ -295,11 +308,13 @@ TEST_F(NvhttpHandoffStateTest, FrozenBlocksClientEnableChangeFromWritingFile) {
   const auto credentials = test_utils::certificates::generate_ca_credentials();
   const auto uuid = nvhttp::test_support::add_client("frozen-enable", credentials.x509, true);
   ASSERT_FALSE(uuid.empty()) << "precondition: add_client must return a uuid";
+  ASSERT_TRUE(fs::exists(state_file)) << "precondition: add_client writes the state file, so the content can be compared";
+  const auto before = read_text(state_file);
   nvhttp::set_state_frozen(true);
 
   (void) nvhttp::set_client_enabled(uuid, false);
 
-  EXPECT_FALSE(fs::exists(state_file)) << "while frozen a client enable/disable save must not write the state file";
+  EXPECT_EQ(read_text(state_file), before) << "while frozen a client enable/disable save must not rewrite the state file";
 }
 
 // ---- set_state_frozen / state_frozen ------------------------------------------------------------------------------
