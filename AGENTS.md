@@ -61,6 +61,9 @@ The rules above are upstream's. This section adds the rules for this fork.
   `cmake -B cmake-build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF -DBUILD_TESTS=ON
   -DSUNSHINE_ENABLE_CUDA=OFF -DCUDA_FAIL_ON_MISSING=OFF` then `ninja -C cmake-build-release`.
 - Unit tests: `cmake-build-release/tests/test_sunshine` (gtest; use `--gtest_filter=` for one suite).
+  Never run the full binary on a desktop session: the system tray visual tests take screenshots of the
+  display. Run it under Xvfb (as the package build does), or with `DISPLAY`/`WAYLAND_DISPLAY` unset and
+  `--gtest_filter='-SystemTray*'`.
 - Run `clang-format --dry-run --Werror` on changed C/C++ files.
 - Docs: `BUILD_DOCS=ON` runs doxygen, which fails on undocumented symbols. Run it before merging.
 - The local checks are the merge gate. GitHub Actions stay disabled on the fork.
