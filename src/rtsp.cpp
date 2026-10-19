@@ -10,12 +10,14 @@ extern "C" {
 }
 
 // standard includes
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <format>
 #include <set>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 // lib includes
 #include <boost/asio.hpp>
@@ -655,10 +657,10 @@ namespace rtsp_stream {
       for (auto i = _session_slots->begin(); i != _session_slots->end();) {
         auto &slot = *(*i);
         if (all || stream::session::state(slot) == stream::session::state_e::STOPPING) {
-          stream::session::stop(slot);
+          stream::session::stop(slot, stream::stop_reason_e::terminated);
           stream::session::join(slot);
 
-          i = _session_slots->erase(i);
+          i = erase_ended(i);
         } else {
           i++;
         }
@@ -675,13 +677,52 @@ namespace rtsp_stream {
       for (auto i = _session_slots->begin(); i != _session_slots->end();) {
         auto &slot = *(*i);
         if (stream::session::client_cert(slot) == cert) {
-          stream::session::stop(slot);
+          stream::session::stop(slot, stream::stop_reason_e::terminated);
           stream::session::join(slot);
-          i = _session_slots->erase(i);
+          i = erase_ended(i);
         } else {
           i++;
         }
       }
+    }
+
+    /**
+     * @brief Describe all tracked sessions.
+     * @return One entry per session, ordered by id.
+     */
+    std::vector<session_info_t> list() {
+      std::vector<session_info_t> sessions;
+      {
+        auto lg = _session_slots.lock();
+        sessions.reserve(_session_slots->size());
+        for (const auto &slot : *_session_slots) {
+          sessions.push_back(stream::session::describe(*slot));
+        }
+      }
+
+      std::ranges::sort(sessions, {}, &session_info_t::id);
+      return sessions;
+    }
+
+    /**
+     * @brief Ask the session with the given launch session id to stop.
+     *
+     * The session is neither joined nor erased here: `clear(false)`, run by the RTSP loop, joins and removes it
+     * once it is `STOPPING`. `stream::session::stop()` only waits while a session is `STARTING`, a state no
+     * code path currently enters, so holding the slots lock for the call cannot block the RTSP loop for long.
+     *
+     * @param id Launch session id.
+     * @return `true` when a session with this id was found and asked to stop.
+     */
+    bool close(std::uint32_t id) {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (stream::session::describe(*slot).id == id) {
+          stream::session::stop(*slot, stream::stop_reason_e::api_close);
+          return true;
+        }
+      }
+      return false;
     }
 
     /**
@@ -726,6 +767,23 @@ namespace rtsp_stream {
     }
 
   private:
+    using slots_t = std::set<std::shared_ptr<stream::session_t>>;  ///< Container type of the tracked sessions.
+
+    /**
+     * @brief Erase a joined session from the slots and log why it ended.
+     *
+     * The caller must hold the slots lock.
+     *
+     * @param i Iterator to the session to erase.
+     * @return Iterator following the erased session.
+     */
+    slots_t::iterator erase_ended(slots_t::iterator i) {
+      auto reason = stream::session::stop_reason(**i);
+      i = _session_slots->erase(i);
+      BOOST_LOG(info) << "Session ended: reason="sv << stream::to_string(reason) << ", active sessions="sv << _session_slots->size();
+      return i;
+    }
+
     std::unordered_map<std::string_view, cmd_func_t> _map_cmd_cb;
 
     sync_util::sync_t<std::set<std::shared_ptr<stream::session_t>>> _session_slots;
@@ -755,6 +813,14 @@ namespace rtsp_stream {
     server.clear(false);
 
     return server.session_count();
+  }
+
+  std::vector<session_info_t> list_sessions() {
+    return server.list();
+  }
+
+  bool request_session_close(std::uint32_t id) {
+    return server.close(id);
   }
 
   void terminate_sessions() {
@@ -1299,7 +1365,7 @@ namespace rtsp_stream {
       return;
     }
 
-    auto stream_session = stream::session::alloc(config, session);
+    auto stream_session = stream::session::alloc(config, session, sock.remote_endpoint().address().to_string());
     server->insert(stream_session);
 
     if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {
