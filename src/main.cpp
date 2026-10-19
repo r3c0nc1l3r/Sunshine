@@ -481,7 +481,10 @@ int main(int argc, char *argv[]) {
 
   std::unique_ptr<platf::deinit_t> upnp_unmap;
   auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
-    upnp_unmap = upnp::start(handoff::hooks::udp_base());
+    // A process started by a handoff maps nothing before COMMIT; the handoff glue starts UPnP there.
+    if (!handoff::hooks::started_by_handoff()) {
+      upnp_unmap = upnp::start(handoff::hooks::udp_base());
+    }
   });
 
   // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
