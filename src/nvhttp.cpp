@@ -280,7 +280,6 @@ namespace nvhttp {
 
     // Only the keys this save owns are replaced; every other key under `root` is kept.
     root.put("root.uniqueid", http::unique_id);
-    root.erase("root.named_devices"s);
     client_t &client = client_root;
     pt::ptree node;
 
@@ -293,7 +292,8 @@ namespace nvhttp {
       named_cert_node.put("enabled"s, named_cert.enabled);
       named_cert_nodes.push_back(std::make_pair(""s, named_cert_node));
     }
-    root.add_child("root.named_devices"s, named_cert_nodes);
+    // put_child replaces the existing list at this path; add_child would append a second one.
+    root.put_child("root.named_devices"s, named_cert_nodes);
 
     std::ostringstream data;
     try {
