@@ -48,9 +48,8 @@ namespace {
   /**
    * @brief Text that is not a valid integer for a `drain_handoff*` key.
    */
-  constexpr std::array<std::string_view, 9> INVALID_INTEGER_TEXT {{
+  constexpr std::array<std::string_view, 8> INVALID_INTEGER_TEXT {{
     "0x10"sv,  // hex
-    ""sv,  // empty (reaches apply_config directly, so it is invalid there)
     "12abc"sv,  // trailing text
     "ten"sv,  // words
     "1.5"sv,  // not an integer
@@ -243,9 +242,8 @@ TEST_F(HandoffConfigTest, EnabledFlagIsCaseSensitiveAndStrict) {
 }
 
 /**
- * @brief Every integer key rejects hex, empty, non-integer, quoted, out-of-int-range and signed-with-plus text; the
- *        feature goes off and that field keeps its default. Empty text is passed straight to `apply_config_for_test`,
- *        the direct path where the header says an empty value is invalid (a config file drops the line instead).
+ * @brief Every integer key rejects hex, non-integer, quoted, out-of-int-range and signed-with-plus text; the feature
+ *        goes off and that field keeps its default. Empty text is tested separately (`EmptyIntegerValueKeepsDefault`).
  */
 TEST_F(HandoffConfigTest, InvalidIntegerTextTurnsFeatureOffAndKeepsDefault) {
   for (const auto &option : INTEGER_OPTIONS) {
@@ -260,6 +258,24 @@ TEST_F(HandoffConfigTest, InvalidIntegerTextTurnsFeatureOffAndKeepsDefault) {
         << "An invalid integer must leave its field at the default, not partially parsed.";
     }
   }
+}
+
+/**
+ * @brief An empty integer value through the seam keeps the default and does not turn an enabled feature off.
+ *
+ * The config-file parser drops a `key =` line with an empty value, so the default stays in place.
+ */
+TEST_F(HandoffConfigTest, EmptyIntegerValueKeepsDefault) {
+  apply("drain_handoff_deadline =\n");
+
+  EXPECT_EQ(config::drain_handoff.deadline_s, 3600) << "An empty drain_handoff_deadline must keep the default 3600.";
+  EXPECT_FALSE(config::drain_handoff.enabled) << "An empty value must not turn on a feature that was not enabled.";
+#ifdef __linux__
+  config::drain_handoff = handoff::settings_t {};
+  apply("drain_handoff = enabled\ndrain_handoff_deadline =\n");
+  EXPECT_TRUE(config::drain_handoff.enabled) << "An empty integer value must not turn an enabled feature off.";
+  EXPECT_EQ(config::drain_handoff.deadline_s, 3600) << "An empty drain_handoff_deadline must keep the default with the feature on.";
+#endif
 }
 
 /**
