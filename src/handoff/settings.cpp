@@ -100,7 +100,8 @@ namespace handoff {
 
     // Both bases: the configured port and port + offset. Computed in 64-bit so a huge offset cannot overflow.
     const std::int64_t bases[] = {static_cast<std::int64_t>(port), static_cast<std::int64_t>(port) + settings.udp_offset};
-    const std::int64_t tcp[] = {port - 5, port, port + 1, port + 21};
+    const std::int64_t wide_port = port;
+    const std::int64_t tcp[] = {wide_port - 5, wide_port, wide_port + 1, wide_port + 21};
 
     // Every UDP port of both bases must be inside the range before any other port rule is checked.
     for (auto base : bases) {

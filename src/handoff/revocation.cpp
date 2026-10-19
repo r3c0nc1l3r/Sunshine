@@ -6,8 +6,8 @@
 #include <nlohmann/json.hpp>
 
 // local includes
-#include "../logging.h"
 #include "revocation.h"
+#include "src/logging.h"
 
 namespace handoff {
   /**
