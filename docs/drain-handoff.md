@@ -1,6 +1,7 @@
 # Drain handoff (spec, Linux, opt-in)
 
-Status: **draft spec, not implemented.** This page is the contract for the implementation, the tests and the review.
+Status: **implemented** (fork, Linux, opt-in). This page is the contract for the implementation, the tests and the
+review.
 
 ## Goal
 Upgrade or restart Sunshine while clients are streaming, without ending their streams:

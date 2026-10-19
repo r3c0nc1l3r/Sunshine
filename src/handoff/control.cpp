@@ -486,6 +486,13 @@ namespace handoff {
     }
   }  // namespace
 
+  /**
+   * @brief Path of the control socket of process `pid` under the runtime directory.
+   *
+   * @param runtime_dir Runtime directory (see `runtime_dir()`).
+   * @param pid Process id.
+   * @return Socket path.
+   */
   fs::path control_socket_path(const fs::path &runtime_dir, pid_t pid) {
     return runtime_dir / "control" / (std::to_string(pid) + ".sock");
   }

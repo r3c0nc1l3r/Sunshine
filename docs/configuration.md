@@ -2480,6 +2480,24 @@ The drain handoff options control upgrading or restarting Sunshine while clients
     </tr>
 </table>
 
+#### systemd
+
+The packages install an example drop-in, `drain-handoff.conf`, in the `systemd` directory of the Sunshine assets. It is
+not active. To use the handoff with the user service:
+
+1. Set `drain_handoff = enabled`.
+2. Copy the file to `~/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d/drain-handoff.conf`. A system
+   unit needs the same file in its own drop-in directory, and the `RuntimeDirectory=sunshine` line in it uncommented.
+3. Run `systemctl --user daemon-reload`, then restart the unit once so it runs as `Type=notify`.
+
+After that, `systemctl --user reload app-dev.lizardbyte.app.Sunshine.service` runs the handoff. The reload exits 0 only
+when the switch succeeded. See [Drain handoff](drain-handoff.md) for the exit codes.
+
+With the drop-in, Sunshine sends `READY=1` to systemd also when `drain_handoff` is `disabled`. The feature stays off in
+that case.
+
+The handoff needs systemd 254 or newer.
+
 ## NVIDIA NVENC Encoder
 
 ### nvenc_preset

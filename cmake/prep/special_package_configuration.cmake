@@ -26,6 +26,9 @@ elseif(UNIX)
     # configure service
     configure_file(packaging/linux/app-${PROJECT_FQDN}.service.in app-${PROJECT_FQDN}.service @ONLY)
 
+    # configure the optional drain-handoff drop-in example (installed as an example, not activated)
+    configure_file(packaging/linux/drain-handoff.conf.in drain-handoff.conf @ONLY)
+
     # configure kwin desktop permission file
     if (${SUNSHINE_ENABLE_KWIN})
         configure_file(packaging/linux/${PROJECT_FQDN}.kwin.desktop.in ${PROJECT_FQDN}.kwin.desktop @ONLY)

@@ -32,7 +32,7 @@
 #include "src/logging.h"
 
 // The parent environment, copied for the systemctl child in `read_back_mainpid`.
-extern char **environ;
+extern char **environ;  ///< The parent environment, copied for the systemctl child.
 
 namespace handoff::sd {
   namespace {

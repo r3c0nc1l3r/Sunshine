@@ -112,13 +112,25 @@ curl -u user:pass -H "X-CSRF-Token: your_token_here" \
 
 ## GET /api/sessions
 Lists the sessions that are running or stopping, with `id`, `started` (Unix seconds), `transport` (`udp/ipv4` or
-`udp/ipv6`) and `client_category` (`local`, `lan` or `wan`). No client names, addresses, certificates or keys are returned.
+`udp/ipv6`), `client_category` (`local`, `lan` or `wan`) and `draining` (boolean, always present). No client names,
+addresses, certificates or keys are returned.
+
+While a drain handoff is in progress, the list also contains the sessions of the draining process (`draining` is
+`true` on those entries). They are listed after this process's own sessions. Ids are unique across both processes.
+If the draining process does not answer in time, only this process's sessions are listed and a warning is logged.
+
+The reply also has a top-level `handoff` key, always present, with the handoff state:
+- `none`: no handoff state.
+- `draining`: a draining process exists.
+- `handover_failed`: the handover to the new process keeps failing.
+- `kill_pending`: a rollback waits for the new process to be reaped. This value is seen only while the web UI is
+  reachable; the instance file is authoritative.
 
 This endpoint exists only on the admin web UI listener (the same port as the configuration pages). It is not served on
 the game stream ports.
 
 Responses:
-- `200`: `{"status": true, "sessions": [...]}`. The list is empty when no session is running.
+- `200`: `{"status": true, "sessions": [...], "handoff": "none"}`. The list is empty when no session is running.
 - `401`: no credentials, or wrong username or password.
 - `403`: the client address is not allowed.
 - `429`: the client address is locked out after too many failed logins (see [Failed Login Limit](#failed-login-limit)).
@@ -130,7 +142,8 @@ Session ids are sequential and not secret. Access is protected by admin authenti
 
 ## POST /api/sessions/{id}/close
 Ends one session through the normal stop path, with the stop reason `api-close`. `{id}` is the decimal session id from
-`GET /api/sessions`.
+`GET /api/sessions`. The session may be one of this process or one of the draining process; for a draining session the
+request is passed to the draining process over the handoff channel.
 
 This endpoint exists only on the admin web UI listener and requires admin authentication. Cross-origin requests also need
 a valid CSRF token (see [CSRF Protection](#csrf-protection)).
@@ -140,7 +153,8 @@ Responses:
 - `400`: `{id}` is not a 32-bit unsigned decimal number, or the CSRF token is missing, invalid or expired.
 - `401`: no credentials, or wrong username or password.
 - `403`: the client address is not allowed.
-- `404`: no session with this id is running or stopping (unknown, not yet started, or already ended).
+- `404`: no session with this id is running or stopping (unknown, not yet started, or already ended). Also returned when
+  the draining process does not answer the request in time.
 - `429`: the client address is locked out after too many failed logins (see [Failed Login Limit](#failed-login-limit)).
 
 If no admin user is configured yet, the request redirects to the welcome page and nothing is done.

@@ -478,6 +478,9 @@ namespace handoff::entry {
     }
   }
 
+  /**
+   * @brief State of the device release: the once-flag and the input guard.
+   */
   struct device_release_t::state_t {
     std::once_flag once;  ///< Makes the release run at most once and blocks a concurrent caller.
     std::unique_ptr<platf::deinit_t> guard;  ///< The guard from `input::init()`.

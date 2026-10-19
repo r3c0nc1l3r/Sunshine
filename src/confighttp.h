@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -19,6 +20,7 @@
 // local includes
 #ifdef __linux__
   #include "handoff/listener.h"
+  #include "handoff/protocol.h"
 #endif
 #include "rtsp.h"
 #include "thread_safe.h"
@@ -50,6 +52,9 @@ namespace confighttp {
 #endif
 
   // Type aliases for HTTPS server components
+  /**
+   * @brief HTTPS server type of the admin web UI.
+   */
   using https_server_t = adoptable_https_server_t;
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
   using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
@@ -135,7 +140,11 @@ namespace confighttp {
   void getCSRFToken(const resp_https_t &response, const req_https_t &request);
 
   /**
-   * @brief List the active streaming sessions.
+   * @brief List the streaming sessions of this process and, on Linux, of the draining process.
+   *
+   * Requires admin authentication. The body is built by `sessions_reply()`: this process's sessions first, then
+   * the draining process's sessions (`draining` true), plus the top-level `handoff` state. When the draining process
+   * does not answer in time, only this process's sessions are listed.
    *
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client.
@@ -145,10 +154,12 @@ namespace confighttp {
   /**
    * @brief Close one streaming session by id (`POST /api/sessions/<id>/close`).
    *
-   * Requires admin authentication and a CSRF token. Every authenticated request is logged at Info with the
-   * session id, the authenticated user, the source address and the result (`closed`, `already-stopping`,
-   * `not-found`, `csrf-rejected` or `bad-id`). A session that is already stopping, or whose stop another request
-   * just won, gets 200 like `closed`.
+   * Requires admin authentication and a CSRF token. The session may belong to this process or, on Linux, to the
+   * draining process (the request goes over the handoff channel through `close_session_any()`). Every authenticated
+   * request is logged at Info with the session id, the authenticated user, the source address and the result
+   * (`closed`, `already-stopping`, `not-found`, `csrf-rejected` or `bad-id`). A session that is already stopping, or
+   * whose stop another request just won, gets 200 like `closed`. A draining process that does not answer in time
+   * gives `not-found` (404).
    *
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client; `path_match[1]` is the session id.
@@ -179,9 +190,46 @@ namespace confighttp {
    * @brief Convert a session description to the JSON object returned by `GET /api/sessions`.
    *
    * @param info Session description.
-   * @return Object with exactly `id`, `started` (Unix seconds), `transport` and `client_category`.
+   * @param draining Value of the `draining` key: `true` for a session of the draining process.
+   * @return Object with exactly `id`, `started` (Unix seconds), `transport`, `client_category` and `draining` (bool).
    */
-  nlohmann::json session_info_to_json(const rtsp_stream::session_info_t &info);
+  nlohmann::json session_info_to_json(const rtsp_stream::session_info_t &info, bool draining = false);
+
+#ifdef __linux__
+  /**
+   * @brief Convert a session entry reported by the draining process to the JSON object returned by `GET /api/sessions`.
+   *
+   * @param entry Session entry from the handoff channel (`SESSIONS` reply).
+   * @return Object with exactly `id`, `started` (Unix seconds, `started_unix_ms / 1000`), `transport`,
+   *         `client_category` and `draining` (always `true`).
+   */
+  nlohmann::json session_entry_to_json(const handoff::protocol::session_entry_t &entry);
+#endif
+
+  /**
+   * @brief Build the full body of `GET /api/sessions`.
+   *
+   * Contains `status` (`true`), `sessions` and `handoff`. `sessions` holds this process's sessions (`draining`
+   * false) first, then, on Linux with a session peer, the draining process's sessions (`draining` true). If the
+   * draining process does not answer in time, only this process's sessions are listed and a Warning is logged.
+   * `handoff` is the state of the instance file (`none`, `draining`, `handover_failed` or `kill_pending`), or `none`
+   * when there is no instance or on platforms without handoff.
+   *
+   * @return The reply object.
+   */
+  nlohmann::json sessions_reply();
+
+  /**
+   * @brief Close a session of this process or, on Linux, of the draining process.
+   *
+   * Tries `rtsp_stream::request_session_close()` first. When that reports `not_found`, on Linux with a session peer,
+   * the close request is sent to the draining process with the handoff timeout. A draining process that does not
+   * answer in time gives a Warning and `not_found`. Without a peer, the result is `not_found`.
+   *
+   * @param id Launch session id.
+   * @return The close result, as for `rtsp_stream::request_session_close()`.
+   */
+  rtsp_stream::close_result_e close_session_any(std::uint32_t id);
 
   /**
    * @brief List authenticated pairing requests awaiting operator approval.

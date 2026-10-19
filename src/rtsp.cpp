@@ -826,6 +826,7 @@ namespace rtsp_stream {
      * @brief Accept a pending connection and arm the server for the next client.
      *
      * @param ec Error code returned by the asynchronous operation.
+     * @param generation Generation of the accept that completed.
      */
     void handle_accept(boost::system::error_code ec, std::uint64_t generation) {
       if (generation <= _stale_below.load()) {
@@ -1557,9 +1558,6 @@ namespace rtsp_stream {
 
   /**
    * @brief Map a handoff shutdown reason to the session stop reason it records.
-   *
-   * @param reason Shutdown reason from `handoff::hooks::shutdown_reason()`.
-   * @return `stop` for `shutdown_reason_e::stop`, otherwise `terminated`.
    */
   stream::stop_reason_e to_stop_reason(handoff::shutdown_reason_e reason) {
     switch (reason) {

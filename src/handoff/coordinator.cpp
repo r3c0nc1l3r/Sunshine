@@ -1095,6 +1095,9 @@ namespace handoff {
   // The coordinator
   // -------------------------------------------------------------------------------------------------------------------
 
+  /**
+   * @brief One switch attempt of the old process: channel, child, side effects and the watcher thread.
+   */
   struct coordinator_t::attempt_t {
     int new_base {0};  ///< The child's UDP base.
     std::shared_ptr<channel_t> channel;  ///< The old process's channel end.
@@ -1141,6 +1144,12 @@ namespace handoff {
 
     // --- environment (the test seams of `coordinator_env_t`, else the production value) ---------------------------
 
+    /**
+     * @brief The runtime: the test seam `_env.runtime` when set, else `runtime()`.
+     *
+     * @param c The coordinator.
+     * @return The runtime.
+     */
     static runtime_t &rt(const coordinator_t &c) {
 #ifdef SUNSHINE_TESTS
       if (c._env.runtime) {
@@ -1150,6 +1159,12 @@ namespace handoff {
       return runtime();
     }
 
+    /**
+     * @brief The current steady time: the test seam `_env.now` when set.
+     *
+     * @param c The coordinator.
+     * @return The time point.
+     */
     static std::chrono::steady_clock::time_point now(const coordinator_t &c) {
 #ifdef SUNSHINE_TESTS
       if (c._env.now) {
@@ -1159,6 +1174,12 @@ namespace handoff {
       return std::chrono::steady_clock::now();
     }
 
+    /**
+     * @brief The refusal sources: the test seam `_env.sources` when set, else the production sources.
+     *
+     * @param c The coordinator.
+     * @return The refusal sources.
+     */
     static refusal_sources_t sources(const coordinator_t &c) {
 #ifdef SUNSHINE_TESTS
       if (c._env.sources_set) {
@@ -1168,6 +1189,12 @@ namespace handoff {
       return production_refusal_sources();
     }
 
+    /**
+     * @brief Set the UPnP unmap scope: the test seam when set, else `upnp::set_unmap_scope()`.
+     *
+     * @param c The coordinator.
+     * @param scope New unmap scope.
+     */
     static void set_scope(const coordinator_t &c, upnp::unmap_scope_e scope) {
 #ifdef SUNSHINE_TESTS
       if (c._env.set_unmap_scope) {
@@ -1178,6 +1205,12 @@ namespace handoff {
       upnp::set_unmap_scope(scope);
     }
 
+    /**
+     * @brief The instances directory: the test environment's value, else the production directory.
+     *
+     * @param c The coordinator.
+     * @return The instances directory.
+     */
     static std::filesystem::path instances_dir(const coordinator_t &c) {
 #ifdef SUNSHINE_TESTS
       return c._env.instances_dir;
@@ -1187,6 +1220,12 @@ namespace handoff {
 #endif
     }
 
+    /**
+     * @brief Create the channel pair: the test seam when set, else `make_channel_pair()`.
+     *
+     * @param c The coordinator.
+     * @return The two ends, or nothing when the pair could not be made.
+     */
     static std::optional<std::pair<int, int>> make_pair(const coordinator_t &c) {
 #ifdef SUNSHINE_TESTS
       if (c._env.make_channel_pair) {
@@ -1197,6 +1236,14 @@ namespace handoff {
       return make_channel_pair();
     }
 
+    /**
+     * @brief Spawn the child: the test seam when set, else `spawn_child()`.
+     *
+     * @param c The coordinator.
+     * @param request The spawn request.
+     * @param error Receives the error text on failure.
+     * @return The child, or nothing on failure.
+     */
     static std::optional<child_t> spawn(const coordinator_t &c, const spawn_request_t &request, std::string *error) {
 #ifdef SUNSHINE_TESTS
       if (c._env.spawn) {
@@ -1207,6 +1254,13 @@ namespace handoff {
       return spawn_child(request, error);
     }
 
+    /**
+     * @brief Start time of process `pid`: the test seam when set, else `read_start_time()`.
+     *
+     * @param c The coordinator.
+     * @param pid Process id.
+     * @return The start time, or nothing when unknown.
+     */
     static std::optional<std::uint64_t> start_time(const coordinator_t &c, pid_t pid) {
 #ifdef SUNSHINE_TESTS
       if (c._env.start_time) {
@@ -1217,6 +1271,13 @@ namespace handoff {
       return read_start_time(pid);
     }
 
+    /**
+     * @brief Wrap a child: the test seam when set, else a `pidfd_child_t`.
+     *
+     * @param c The coordinator.
+     * @param child The child.
+     * @return The child operations.
+     */
     static std::unique_ptr<child_ops_t> make_child(const coordinator_t &c, child_t child) {
 #ifdef SUNSHINE_TESTS
       if (c._env.make_child) {
@@ -1227,6 +1288,12 @@ namespace handoff {
       return std::make_unique<pidfd_child_t>(child);
     }
 
+    /**
+     * @brief The process arguments: the test seam when set, else the lifetime argv.
+     *
+     * @param c The coordinator.
+     * @return The arguments.
+     */
     static std::vector<std::string> argv(const coordinator_t &c) {
 #ifdef SUNSHINE_TESTS
       if (c._env.argv) {
@@ -1243,6 +1310,12 @@ namespace handoff {
       return arguments;
     }
 
+    /**
+     * @brief The recorded host sink: the test seam when set, else the recorded audio host sink.
+     *
+     * @param c The coordinator.
+     * @return The host sink, or an empty string.
+     */
     static std::string host_sink(const coordinator_t &c) {
 #ifdef SUNSHINE_TESTS
       if (c._env.host_sink) {

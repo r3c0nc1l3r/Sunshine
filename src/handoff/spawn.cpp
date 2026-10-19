@@ -28,10 +28,10 @@
 // local includes
 #include "spawn.h"
 
-extern char **environ;
+extern char **environ;  ///< The parent environment, copied for the child.
 
 #ifndef P_PIDFD
-  #define P_PIDFD 3
+  #define P_PIDFD 3  ///< Value of `P_PIDFD` (waitid id type of a pidfd) when the headers do not define it.
 #endif
 
 namespace handoff {
