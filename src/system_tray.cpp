@@ -146,6 +146,7 @@ namespace system_tray {
       bool loop_entered {false};  ///< `run_main_loop` was entered.
       bool loop_exited {false};  ///< `run_main_loop` returned.
       std::uint64_t suspends_completed {0};  ///< Suspends the loop completed; `suspend` waits for it to grow.
+      bool tearing_down {false};  ///< The loop is inside `complete_suspend`; `suspend` must not queue another exit.
       bool initializing {false};  ///< The loop is inside a backend `init`; `suspend` waits for it.
       std::thread::id loop_thread;  ///< The thread that runs `run_main_loop`.
       std::optional<bool> enabled_for_testing;  ///< Overrides `config::sunshine.system_tray` when set (tests).
@@ -1070,6 +1071,7 @@ namespace system_tray {
     void complete_suspend(std::unique_lock<std::mutex> &lock, bool from_exec) {
       auto &state = lifecycle();
       const auto backend = effective_backend_locked();
+      state.tearing_down = true;
       // The command stays `suspend` until the end: while the teardown runs, `resume` and `request_start` still see a
       // suspend in progress and defer instead of being lost.
       lock.unlock();
@@ -1089,6 +1091,7 @@ namespace system_tray {
       backend.exit();
 
       lock.lock();
+      state.tearing_down = false;
       state.command = tray_command_e::none;
       if (!state.ended) {
         state.phase = tray_phase_e::suspended;
@@ -1256,7 +1259,7 @@ namespace system_tray {
       bool still_pending = false;
       {
         const std::scoped_lock check(state.mutex);
-        still_pending = state.phase == tray_phase_e::running && state.command == tray_command_e::suspend;
+        still_pending = state.phase == tray_phase_e::running && state.command == tray_command_e::suspend && !state.tearing_down;
       }
       if (still_pending) {
         tray_initialized_state().store(false);
