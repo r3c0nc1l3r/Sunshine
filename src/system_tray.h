@@ -198,6 +198,7 @@ namespace system_tray {
     int (*init)() = nullptr;  ///< Create the icon on the calling (main) thread. 0 on success.
     int (*loop)() = nullptr;  ///< Run one blocking event iteration. 0 to continue, non-zero when the loop ended.
     void (*exit)() = nullptr;  ///< Ask `loop` to return non-zero and remove the icon. Callable from any thread.
+    void (*poll)() = nullptr;  ///< Deliver pending events without blocking, on the loop thread (production: `tray_loop(0)`). Null: no-op.
   };
 
   /**
@@ -222,7 +223,8 @@ namespace system_tray {
    *    Warning "Failed to create system tray", keep the phase, drop the command (the next `resume` may retry).
    * 3. If the phase is `running` and a suspend command is pending, complete it without calling `loop` (this covers a
    *    suspend that arrived between two iterations, or before this function was entered after `init_tray`; a backend's
-   *    `exit` has no memory, so the loop must look at the command itself): first call the backend's `exit` once more
+   *    `exit` has no memory, so the loop must look at the command itself): first call the backend's `poll` (if set) so a
+   *    queued `exit` from `suspend()` is delivered to the old icon now and not to the next one, then `exit` once more
    *    on this thread (the call `suspend()` made from another thread was only queued, and nothing pumped it; Qt's exit
    *    handler is idempotent, and a fake backend sees two `exit` calls for such a suspend), then the teardown below,
    *    phase `suspended`, waiters notified, repeat from 1. Otherwise, if the phase is `running`: call the backend's `loop` (blocking).

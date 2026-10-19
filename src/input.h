@@ -211,8 +211,9 @@ namespace input {
     /**
      * @brief Whether the platform input backend has been created (by the factory, or by `set_platform_input`).
      *
-     * @return `true` when `ensure_platform_input()` or `set_platform_input()` has produced a backend and it is not
-     *         reset.
+     * @return `true` once `ensure_platform_input()` has run the factory (also when the factory returned an empty
+     *         `platf::input_t`: that result is kept and not retried, and callers handle an empty backend as upstream
+     *         does) or `set_platform_input()` was called, until the test seam resets it; otherwise `false`.
      */
     bool platform_input_created_for_test();
 
