@@ -178,9 +178,8 @@ On `READY` the old process, in this order:
    answers 503); the switcher first sets the gate, then waits for zero (sequentially consistent atomics). Only these
    counters are waited on. A launch that answers during this wait raises a launch session (its `do` commands have run);
    switch substep 4 handles it. The wait is bounded (5 s). If it times out, the handoff fails: the old process kills the
-   new process and waits for it to be reaped (the kill-first rule, step 6), removes the new process's instance file,
-   lifts the 503 gate, resumes accepting, and answers the helper non-zero. Clients that got a 503 during the attempt
-   retry;
+   new process and waits for it to be reaped (the kill-first rule, step 6), answers the helper non-zero, removes the new
+   process's instance file, lifts the 503 gate, and resumes accepting. Clients that got a 503 during the attempt retry;
 4. repeats the step-1 checks that can have changed since then: an app that is not adoptable fails the handoff as in
    switch substep 3. A pairing session (the map holds it while it waits for the PIN, after `/pair` has answered [C14])
    can only end now, because the gate refuses new ones: the old process waits for it to finish or expire, up to
@@ -221,8 +220,8 @@ reload (a reload replaces the whole `proc_t` [C31]) it checks the snapshot again
 adoption, but installs nothing yet. Then it sends `GO_ACK ok` (or a reason) and waits for `COMMIT`:
 
 - On `COMMIT` it installs the adoption (the app, `host_audio`, the session id counter), resumes accepting, publishes
-  mDNS, maps its UPnP ports, starts its tray icon and writes role `active` (see step 3). Only from here on can it run
-  any `undo` command.
+  mDNS, maps its UPnP ports, starts its tray icon (Quit and restart disabled until `MAIN`) and writes role `active` (see
+  step 3). Only from here on can it run any `undo` command.
 - After a failed `GO_ACK`, or with no `COMMIT` within 5 s of its `GO_ACK`, or on a channel error before `COMMIT`, it
   exits with status 1 by itself and has adopted nothing: no app, no accept, no mDNS, no tray. Its exit runs no `undo`
   (it holds no app). A `COMMIT` read after that bound (on the monotonic clock) is ignored; the old process then sees the
@@ -272,8 +271,9 @@ re-arm its accept after `operation_aborted`, so resuming must start its accept a
   visible (next item). Only once the new process is gone does it continue with the steps below, so a slow or stuck new
   process can never accept, publish mDNS or hold the app next to the old one.
 - A kill that does not complete within its 5 s wait is visible: the old process answers a waiting helper non-zero with
-  the reason `kill_pending`, shows `handoff` `kill_pending` in its instance file and in `/api/sessions` responses, and
-  logs an Error every 5 s until the reap, after which it continues the rollback and returns to `none`.
+  the reason `kill_pending`, shows `handoff` `kill_pending` in its instance file (authoritative) and in `/api/sessions`
+  responses (only when its web UI is reachable; after the switch has begun it is gated), and logs an Error every 5 s
+  until the reap, after which it continues the rollback and returns to `none`.
 - The helper is answered non-zero as soon as the kill-first step completes (or with `kill_pending` when it does not
   complete in 5 s), before the in-flight wait, the reload and the swap; the rest of the rollback runs without it, so the
   `ExecReload` bound (see "systemd unit") holds.
@@ -554,7 +554,7 @@ app: it has no process, and it is never executed again. The last session's end l
 | Tray icon | Only the active process shows one (removed at the switch, restored on rollback). The tray updates at session start and end [C9] are skipped while the icon is removed. |
 | Log file | In handoff mode the new process appends to the log without rotating it. Every line of a draining process carries a `[drain]` tag. |
 | mDNS | Only the active process publishes. `publish.cpp` has only start and deinit today; the change adds withdraw and republish. The old process withdraws at the switch and waits up to 5 s for Avahi to drop the entry. If Avahi still renames the new process's service on a collision (for example to "name #2"), the new process resets it to the configured name once the old entry is gone. On rollback the old process republishes. |
-| UPnP | Only the active process maps ports. A draining process never unmaps the shared TCP ports, and unmaps only its own UDP base when it exits and the active process does not use that base. A new process maps ports only at `COMMIT`; after a rollback that killed it, the old process removes the new process's UDP-base mapping (after the reap) unless it uses that base itself. |
+| UPnP | Only the active process maps ports. A draining process never unmaps the shared TCP ports, and unmaps only its own UDP base when it exits and the active process does not use that base. A new process maps ports only at `COMMIT`; after a rollback that killed it, the old process removes the new process's UDP-base mapping, best effort, on a background task after the reap (skipped when UPnP is off); it never delays accept, mDNS or the helper's answer. |
 | File descriptors | Sunshine's sockets are not close-on-exec today (Boost.Asio and ENet create them without `SOCK_CLOEXEC`), but apps and commands are launched with Boost.Process `limit_handles`, which closes every non-stdio fd in the child, and the in-place restart closes all fds above stderr before `execv`. So launched apps inherit no sockets today. The handoff keeps that true: the spawn closes every fd except 0-2 and 3-7 in the child, the new process sets `FD_CLOEXEC` on 3-7 and on the channel, and every new launch path must use `limit_handles` or close fds the same way. `NOTIFY_SOCKET` stays in app environments (harmless with `NotifyAccess=main`). |
 
 ## Visibility and control (session API and logs)
@@ -608,8 +608,8 @@ or from the draining process's file when the channel is gone.
 - A process writes its file at startup (a new process in handoff mode with role `pending`, which becomes `active` only
   at `COMMIT`) and on every role change and session start or end, and deletes it on exit. No process writes another
   process's file, except that the old process removes a dead new process's file on rollback.
-- Consumers read every file in the directory and ignore stale ones. A `pending` file never names the active ports,
-  but it counts as a running Sunshine instance for the busy check below.
+- Consumers read every file in the directory and ignore stale ones. A `pending` file never names the active ports, and
+  it makes consumers treat Sunshine as busy (a handoff is in progress).
 - Fail-safe rule for consumers: treat Sunshine as busy when the directory is missing while a Sunshine process runs,
   when a running Sunshine process has no file, when any file is unreadable, or when any instance has sessions above 0
   or traffic on its base ports. Between `/launch` and the first media, `sessions` can still be 0, so consumers also
@@ -638,8 +638,9 @@ RuntimeDirectory=sunshine
   `drain_handoff_ready_timeout` plus `ping_timeout` plus 25 s (the `ping_timeout` term covers the switch substep 4 wait;
   the 25 s are four 5 s waits, namely the in-flight wait, the mDNS withdraw, `GO_ACK` and one kill-first wait, plus 5 s
   margin; 65 s with the defaults of 30 s and 10 s). When the kill is still pending at the end of that wait, the helper
-  exits non-zero with `kill_pending`. systemd applies `TimeoutStartSec` to `ExecReload`; the default 90 s is enough
-  (verify on the target version).
+  exits non-zero with `kill_pending`. systemd applies `TimeoutStartSec` to `ExecReload`; the default 90 s is enough for
+  the default timeouts (verify on the target version). With larger `drain_handoff_ready_timeout` or `ping_timeout`
+  values, set `TimeoutStartSec` to at least the bound plus 10 s.
 - Minimum systemd: 254 (tracking a main PID that is not the manager's child through a pidfd). The active process checks
   the version before a handoff (step 1), and the read-back in step 7 guards against a refused `MAINPID`.
 - The default `KillMode=control-group` stays.
@@ -680,6 +681,12 @@ RuntimeDirectory=sunshine
     `pending`;
   - a reload that fails on `GO` is a failed `GO_ACK`; a reload that fails on rollback keeps the frozen state;
   - a kill that does not complete in 5 s shows `kill_pending` and answers the helper non-zero;
+  - the new process's bound before `GO` (`ping_timeout` plus 25 s from `READY`, monotonic clock) makes it exit with
+    status 1 having adopted, accepted and published nothing;
+  - a `COMMIT` read after the new process's bound (test hook delaying the old process after its deadline re-check):
+    the new process exits, the old process logs an Error and rolls back cleanly;
+  - after a rollback that killed a new process past `COMMIT`, the old process removes the new process's UDP-base UPnP
+    mapping without delaying accept or the helper's answer;
   - `systemctl stop` (both processes get `SIGTERM`) between `GO` and `GO_ACK`: the `undo` commands run at most once;
   - the `END_ALL` state machine: `END_REJECTED` while rolling back, a rollback during `ending` or after `ended` drops
     the app, the mutex is never held across a join or a send;
@@ -784,7 +791,10 @@ RuntimeDirectory=sunshine
   39. the old process is stopped with `SIGSTOP` right after it sends `GO`: the new process sends `GO_ACK`, gets no
       `COMMIT`, and exits within about 5 s; while it ran it accepted no connection, published no mDNS entry, mapped no
       UPnP port and showed no tray icon, and its instance file never showed role `active`. After `SIGCONT` the old
-      process rolls back (kill-first) and serves alone.
+      process rolls back (kill-first) and serves alone;
+  40. the old process is stopped with `SIGSTOP` right after the new process's `READY`: the new process exits within
+      `ping_timeout` plus 25 s, having accepted, published and mapped nothing; after `SIGCONT` the old process rolls
+      back (kill-first) and serves alone.
 
 ## Out of scope
 - Moving a live session from one process to another (not possible without client support).
