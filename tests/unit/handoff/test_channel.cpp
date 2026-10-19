@@ -12,6 +12,8 @@
   #include <chrono>
   #include <cstdint>
   #include <cstring>
+  #include <filesystem>
+  #include <functional>
   #include <future>
   #include <memory>
   #include <string>
@@ -394,6 +396,79 @@ TEST(HandoffChannelTest, OversizedDatagramClosesItsAttachedFd) {
   pollfd pfd {wr.fd, 0, 0};
   ASSERT_EQ(1, ::poll(&pfd, 1, 200));
   EXPECT_TRUE(pfd.revents & POLLERR) << "an fd that arrived with an oversized datagram must be closed (leak)";
+}
+
+namespace {
+  std::size_t open_fd_count() {
+    std::size_t n = 0;
+    for (const auto &e : std::filesystem::directory_iterator("/proc/self/fd")) {
+      (void) e;
+      ++n;
+    }
+    return n;
+  }
+}  // namespace
+
+TEST(HandoffChannelTest, TooManyAttachedFdsIsMalformedAndLeaksNothing) {
+  auto p = make_raw_pair();
+  ASSERT_TRUE(p);
+  int null = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(null, 0);
+  fd_closer_t null_closer(null);
+  constexpr int count = 16;
+  int fds[count];
+  for (int &f : fds) {
+    f = null;
+  }
+  const std::string payload = R"({"type":"PING","seq":1})";
+  iovec iov {};
+  iov.iov_base = const_cast<char *>(payload.data());
+  iov.iov_len = payload.size();
+  msghdr msg {};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int) * count)] {};
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+  cmsghdr *c = CMSG_FIRSTHDR(&msg);
+  c->cmsg_level = SOL_SOCKET;
+  c->cmsg_type = SCM_RIGHTS;
+  c->cmsg_len = CMSG_LEN(sizeof(int) * count);
+  std::memcpy(CMSG_DATA(c), fds, sizeof(int) * count);
+  ASSERT_EQ(static_cast<ssize_t>(payload.size()), ::sendmsg(p->raw.fd, &msg, MSG_NOSIGNAL));
+
+  auto before = open_fd_count();
+  handoff::received_t r;
+  EXPECT_EQ(handoff::recv_status_e::malformed, p->channel.receive(r, 500ms))
+    << "a datagram whose control data was truncated (MSG_CTRUNC) is malformed";
+  EXPECT_EQ(-1, r.fd);
+  EXPECT_EQ(before, open_fd_count()) << "fds received with a truncated control message must not stay open (leak)";
+}
+
+TEST(HandoffChannelTest, CloseWakesReceiveBlockedWithoutTimeout) {
+  auto fds = handoff::make_channel_pair();
+  ASSERT_TRUE(fds.has_value());
+  auto ch = std::make_shared<handoff::channel_t>(fds->first);
+  fd_closer_t peer(fds->second);
+  auto status = std::make_shared<std::atomic<int>>(-1);
+  std::promise<void> done;
+  auto fut = done.get_future();
+  std::thread t([&, ch, status] {
+    handoff::received_t r;
+    *status = static_cast<int>(ch->receive(r, -1ms));
+    done.set_value();
+  });
+  std::this_thread::sleep_for(60ms);
+  ch->close();
+  bool woke = fut.wait_for(1500ms) == std::future_status::ready;
+  if (woke) {
+    t.join();
+    // SPEC-QUESTION: the status of a receive interrupted by close() is not named; eof is expected.
+    EXPECT_EQ(static_cast<int>(handoff::recv_status_e::eof), status->load());
+  } else {
+    t.detach();
+    ADD_FAILURE() << "close() did not wake a receive blocked with a negative timeout";
+  }
 }
 
 TEST(HandoffChannelTest, MalformedDatagramIsReported) {

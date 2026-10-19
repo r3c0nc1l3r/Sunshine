@@ -403,6 +403,28 @@ TEST(HandoffSpawnTest, ValidateListenerAcceptsIpv6AndRejectsItForIpv4) {
   EXPECT_NE("", handoff::validate_listener(s.fd, port, false)) << "IPv4 expected, IPv6 socket";
 }
 
+TEST(HandoffSpawnTest, ValidateListenerIpv6RejectsV6OnlyAndAcceptsDualStack) {
+  for (int v6only : {1, 0}) {
+    fd_t s(::socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (s.fd < 0) {
+      GTEST_SKIP() << "IPv6 not available";
+    }
+    ASSERT_EQ(0, ::setsockopt(s.fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)));
+    sockaddr_in6 addr {};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_loopback;
+    if (::bind(s.fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 || ::listen(s.fd, 4) != 0) {
+      GTEST_SKIP() << "cannot listen on the IPv6 loopback";
+    }
+    auto reason = handoff::validate_listener(s.fd, port_of(s.fd), true);
+    if (v6only) {
+      EXPECT_NE("", reason) << "ipv6=true (address_family = both) needs a dual-stack socket; IPV6_V6ONLY=1 is invalid";
+    } else {
+      EXPECT_EQ("", reason) << "a dual-stack IPv6 listener is valid for ipv6=true";
+    }
+  }
+}
+
 TEST(HandoffSpawnTest, ValidateListenerRejectsNonListeningTcpSocket) {
   fd_t s(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
   ASSERT_GE(s.fd, 0);
@@ -521,68 +543,89 @@ TEST(HandoffSpawnTest, ParentFdsSurviveTheSpawn) {
 }
 
 TEST(HandoffSpawnTest, SourcesAlreadyAtTargetFdsLandCorrectly) {
-  // Put the sources on fds 3-7 in a permuted order, so that a naive placement would clobber one with another.
-  sources_t src;
-  ASSERT_TRUE(src.init());
-  std::string links_before[5] = {
-    link_of(src.https.fd),
-    link_of(src.http.fd),
-    link_of(src.webui.fd),
-    link_of(src.rtsp.fd),
-    link_of(src.channel.fd),
-  };
-  int hi[5];
-  int *orig[5] = {&src.https.fd, &src.http.fd, &src.webui.fd, &src.rtsp.fd, &src.channel.fd};
-  for (int i = 0; i < 5; ++i) {
-    hi[i] = ::fcntl(*orig[i], F_DUPFD_CLOEXEC, 100);
-    ASSERT_GE(hi[i], 100);
-  }
-  src.https.reset();
-  src.http.reset();
-  src.webui.reset();
-  src.rtsp.reset();
-  src.channel.reset();
-  src.channel_peer.reset();
-  for (int i = 3; i <= 7; ++i) {
-    if (::fcntl(i, F_GETFD) >= 0) {
-      for (int h : hi) {
-        ::close(h);
-      }
-      GTEST_SKIP() << "fd " << i << " is in use in the test process";
-    }
-  }
-  // https->4, http->3, webui->6, rtsp->5, channel->7.
-  const int target[5] = {4, 3, 6, 5, 7};
-  for (int i = 0; i < 5; ++i) {
-    ASSERT_EQ(target[i], ::dup2(hi[i], target[i]));
-    ::close(hi[i]);
-  }
-  src.https.fd = 4;
-  src.http.fd = 3;
-  src.webui.fd = 6;
-  src.rtsp.fd = 5;
-  src.channel.fd = 7;
-
+  // Runs in a forked child that first clears fds 3-7 and puts the sources there in a permuted order, so a naive
+  // placement would clobber one with another. The child writes the sockets it set up to "before" and the spawned shell
+  // writes what it found on fds 3-7 to "out.links"; the parent compares.
   temp_dir_t dir;
   ASSERT_FALSE(dir.path.empty());
+  auto before_path = (dir.path / "before").string();
   auto out = dir.path / "out";
-  auto req = shell_request(src, R"(for i in 3 4 5 6 7; do readlink /proc/$$/fd/$i; done > "$1.links")", out);
-  std::string err;
-  int status = run_shell(req, &err);
-  src.https.reset();
-  src.http.reset();
-  src.webui.reset();
-  src.rtsp.reset();
-  src.channel.reset();
-  EXPECT_EQ(0, status) << err;
+  fflush(nullptr);
+  pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    sources_t src;
+    if (!src.init()) {
+      _exit(1);
+    }
+    std::string links_before[5] = {
+      link_of(src.https.fd),
+      link_of(src.http.fd),
+      link_of(src.webui.fd),
+      link_of(src.rtsp.fd),
+      link_of(src.channel.fd),
+    };
+    int hi[5];
+    int *orig[5] = {&src.https.fd, &src.http.fd, &src.webui.fd, &src.rtsp.fd, &src.channel.fd};
+    for (int i = 0; i < 5; ++i) {
+      hi[i] = ::fcntl(*orig[i], F_DUPFD_CLOEXEC, 100);
+      if (hi[i] < 100) {
+        _exit(2);
+      }
+    }
+    src.https.reset();
+    src.http.reset();
+    src.webui.reset();
+    src.rtsp.reset();
+    src.channel.reset();
+    src.channel_peer.reset();
+    // https->4, http->3, webui->6, rtsp->5, channel->7 (dup2 replaces whatever sits on those fds).
+    const int target[5] = {4, 3, 6, 5, 7};
+    for (int i = 0; i < 5; ++i) {
+      if (::dup2(hi[i], target[i]) != target[i]) {
+        _exit(3);
+      }
+      ::close(hi[i]);
+    }
+    src.https.fd = 4;
+    src.http.fd = 3;
+    src.webui.fd = 6;
+    src.rtsp.fd = 5;
+    src.channel.fd = 7;
+    {
+      std::ofstream o(before_path);
+      for (const auto &l : links_before) {
+        o << l << "\n";
+      }
+    }
+    auto req = shell_request(src, R"(for i in 3 4 5 6 7; do readlink /proc/$$/fd/$i; done > "$1.links")", out);
+    std::string err;
+    auto child = handoff::spawn_child(req, &err);
+    if (!child) {
+      _exit(4);
+    }
+    if (!wait_pidfd(child->pidfd, 5000)) {
+      cleanup_child(*child);
+      _exit(5);
+    }
+    int st = reap(*child);
+    _exit(st == 0 ? 0 : 6);
+  }
+  int ws = 0;
+  ASSERT_EQ(pid, ::waitpid(pid, &ws, 0));
+  ASSERT_TRUE(WIFEXITED(ws)) << "the helper process crashed";
+  ASSERT_EQ(0, WEXITSTATUS(ws)) << "helper failed with code " << WEXITSTATUS(ws)
+                                << " (1 sockets, 2 dup, 3 dup2, 4 spawn_child failed, 5 child timeout, 6 child failed)";
 
+  auto before = lines_of(read_file(before_path));
   auto links = lines_of(read_file(dir.path / "out.links"));
+  ASSERT_EQ(5u, before.size());
   ASSERT_EQ(5u, links.size());
-  EXPECT_EQ(links_before[0], links[0]) << "fd 3 must be the https listener even if its source sat at fd 4";
-  EXPECT_EQ(links_before[1], links[1]) << "fd 4 must be the http listener even if its source sat at fd 3";
-  EXPECT_EQ(links_before[2], links[2]) << "fd 5 must be the web UI listener even if its source sat at fd 6";
-  EXPECT_EQ(links_before[3], links[3]) << "fd 6 must be the rtsp listener even if its source sat at fd 5";
-  EXPECT_EQ(links_before[4], links[4]) << "fd 7 must be the channel";
+  EXPECT_EQ(before[0], links[0]) << "fd 3 must be the https listener even if its source sat at fd 4";
+  EXPECT_EQ(before[1], links[1]) << "fd 4 must be the http listener even if its source sat at fd 3";
+  EXPECT_EQ(before[2], links[2]) << "fd 5 must be the web UI listener even if its source sat at fd 6";
+  EXPECT_EQ(before[3], links[3]) << "fd 6 must be the rtsp listener even if its source sat at fd 5";
+  EXPECT_EQ(before[4], links[4]) << "fd 7 must be the channel";
 }
 
 TEST(HandoffSpawnTest, ExtraEnvIsAddedAndReplacesParentValues) {
@@ -702,6 +745,23 @@ TEST(HandoffSpawnTest, SpawnOfMissingBinaryFailsWithReason) {
     cleanup_child(*child);
   }
   EXPECT_FALSE(child.has_value()) << "a missing binary must fail the spawn";
+  EXPECT_FALSE(err.empty()) << "a failed spawn must give a reason";
+}
+
+TEST(HandoffSpawnTest, SpawnWithExtraEnvWithoutEqualsFailsWithReason) {
+  sources_t src;
+  ASSERT_TRUE(src.init());
+  handoff::spawn_request_t req;
+  req.binary = "/bin/true";
+  req.argv = {"true"};
+  req.fds = src.fds();
+  req.extra_env = {"NOEQUALSSIGN"};
+  std::string err;
+  auto child = handoff::spawn_child(req, &err);
+  if (child) {
+    cleanup_child(*child);
+  }
+  EXPECT_FALSE(child.has_value()) << "an extra_env entry without '=' must fail the spawn";
   EXPECT_FALSE(err.empty()) << "a failed spawn must give a reason";
 }
 
