@@ -141,6 +141,17 @@ namespace confighttp {
   void register_session_routes(https_server_t &server);
 
   /**
+   * @brief Register the app and client routes (`POST /api/apps/close`, `/api/clients/unpair`,
+   * `/api/clients/unpair-all` and `/api/clients/update`) on the admin server, with their production handlers and checks.
+   *
+   * `start()` uses this instead of registering the four routes inline, so the route table and the handlers are
+   * unchanged; tests use it to exercise the production handlers, including the drain-handoff terminate rule.
+   *
+   * @param server Admin web UI HTTPS server.
+   */
+  void register_app_client_routes(https_server_t &server);
+
+  /**
    * @brief Convert a session description to the JSON object returned by `GET /api/sessions`.
    *
    * @param info Session description.
