@@ -644,8 +644,7 @@ TEST_F(HandoffInstanceFileTest, ConsumerIdleForActiveProcessWithoutSessions) {
 }
 
 TEST_F(HandoffInstanceFileTest, ConsumerIdleForDrainingProcessWithoutSessions) {
-  // SPEC-QUESTION: the header's busy list does not name role draining or state draining / handover_failed. This
-  // test follows the list literally (not busy). Confirm with the spec owner.
+  // SPEC-ANSWERED (lead): a draining or handover_failed instance with 0 sessions is not busy.
   hf::scan_result_t scan;
   scan.live.push_back(make_instance(100, 1, hf::role_e::draining, hf::state_e::draining, 0));
   EXPECT_FALSE(hf::consumer_busy(scan, {100}))
@@ -653,7 +652,7 @@ TEST_F(HandoffInstanceFileTest, ConsumerIdleForDrainingProcessWithoutSessions) {
 }
 
 TEST_F(HandoffInstanceFileTest, ConsumerIdleForHandoverFailedWithoutSessions) {
-  // SPEC-QUESTION: the header's busy list does not name state handover_failed. Followed literally (not busy).
+  // SPEC-ANSWERED (lead): handover_failed with 0 sessions is not busy (an alert for tooling only).
   hf::scan_result_t scan;
   scan.live.push_back(make_instance(100, 1, hf::role_e::active, hf::state_e::handover_failed, 0));
   EXPECT_FALSE(hf::consumer_busy(scan, {100}))
