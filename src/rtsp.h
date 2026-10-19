@@ -6,6 +6,10 @@
 
 // standard includes
 #include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 // local includes
 #include "crypto.h"
@@ -75,6 +79,40 @@ namespace rtsp_stream {
    * @param cert Certificate data or object used by the operation.
    */
   void terminate_sessions_by_cert(std::string_view cert);
+
+  /**
+   * @brief Minimal description of one streaming session, for an operator to pick a session to close.
+   *
+   * It holds only what is needed to choose a session. It never contains client identities (names, UUIDs,
+   * addresses, certificates), keys, IVs, ping payloads or connect data.
+   */
+  struct session_info_t {
+    std::uint32_t id {0};  ///< Launch session id; stable for the session's lifetime.
+    std::chrono::system_clock::time_point started {};  ///< Time the session was created.
+    std::string transport;  ///< `udp/ipv4` or `udp/ipv6`.
+    std::string client_category;  ///< Network class of the client: `local`, `lan` or `wan`.
+  };
+
+  /**
+   * @brief List the live streaming sessions (running or stopping) that the RTSP server tracks.
+   *
+   * Sessions that have not started yet are not listed.
+   *
+   * @return One entry per live session, ordered by id.
+   */
+  std::vector<session_info_t> list_sessions();
+
+  /**
+   * @brief Ask one streaming session to stop, through the normal stop path.
+   *
+   * The session is stopped with reason `api-close`; the RTSP server then joins and removes it as usual.
+   * Callers must authenticate the requester first (admin web UI only).
+   *
+   * @param id Launch session id from `list_sessions()`.
+   * @return `true` when the session is running and was asked to stop, or is already stopping; `false` for an unknown id
+   *         or a session that has not started yet.
+   */
+  bool request_session_close(std::uint32_t id);
 
   /**
    * @brief Runs the RTSP server loop.

@@ -15,6 +15,7 @@
 #include <new>
 #include <optional>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -1407,6 +1408,127 @@ namespace confighttp {
   }
 
   /**
+   * @brief Convert a session description to the JSON object returned by `GET /api/sessions`.
+   * @param info Session description.
+   * @return Object with exactly `id`, `started` (Unix seconds), `transport` and `client_category`.
+   */
+  nlohmann::json session_info_to_json(const rtsp_stream::session_info_t &info) {
+    nlohmann::json output;
+    output["id"] = info.id;
+    output["started"] = std::chrono::duration_cast<std::chrono::seconds>(info.started.time_since_epoch()).count();
+    output["transport"] = info.transport;
+    output["client_category"] = info.client_category;
+    return output;
+  }
+
+  /**
+   * @brief Reduce a session id from the request path to a short string that is safe to log.
+   * @param id_text Session id as captured from the request path.
+   * @return The first 32 characters of `id_text`, keeping only the decimal digits.
+   */
+  std::string sanitise_session_id_for_log(std::string_view id_text) {
+    std::string logged_id;
+    for (const char c : id_text.substr(0, 32)) {
+      if (c >= '0' && c <= '9') {
+        logged_id += c;
+      }
+    }
+    return logged_id;
+  }
+
+  /**
+   * @brief Log one session close request made through the API.
+   * @param id Session id as logged; for `bad-id` and `csrf-rejected`, the sanitised path id.
+   * @param source Normalized address of the client that made the request.
+   * @param result `closed`, `not-found`, `csrf-rejected` or `bad-id`.
+   */
+  void log_session_close(const std::string &id, const std::string &source, std::string_view result) {
+    BOOST_LOG(info) << "Session close requested via API: id="sv << id << ", user="sv << config::sunshine.username << ", source="sv << source << ", result="sv << result;
+  }
+
+  /**
+   * @brief List the active streaming sessions.
+   *
+   * Requires admin authentication, like the other API calls. Returns only `id`, `started`, `transport` and
+   * `client_category` for each session.
+   *
+   * @api_examples{/api/sessions| GET| null}
+   */
+  void getSessions(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json sessions = nlohmann::json::array();
+    for (const auto &info : rtsp_stream::list_sessions()) {
+      sessions.push_back(session_info_to_json(info));
+    }
+
+    nlohmann::json output_tree;
+    output_tree["status"] = true;
+    output_tree["sessions"] = sessions;
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Close one streaming session through the normal stop path.
+   *
+   * Requires admin authentication and, for cross-origin requests, a valid CSRF token. Every request that passes
+   * authentication is logged at Info with the admin user, the client address and the result (`closed`,
+   * `not-found`, `csrf-rejected` or `bad-id`). The log line never contains credentials or the CSRF token.
+   *
+   * @api_examples{/api/sessions/1/close| POST| null}
+   */
+  void closeSession(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    const auto source = net::addr_to_normalized_string(request->remote_endpoint().address());
+    const std::string id_text = request->path_match[1];
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      log_session_close(sanitise_session_id_for_log(id_text), source, "csrf-rejected"sv);
+      return;
+    }
+
+    print_req(request);
+
+    std::uint32_t session_id = 0;
+    const auto [end, ec] = std::from_chars(id_text.data(), id_text.data() + id_text.size(), session_id);
+    if (ec != std::errc {} || end != id_text.data() + id_text.size()) {
+      log_session_close(sanitise_session_id_for_log(id_text), source, "bad-id"sv);
+      bad_request(response, request, "Session id must be a 32-bit unsigned number");
+      return;
+    }
+
+    const bool closed = rtsp_stream::request_session_close(session_id);
+    log_session_close(std::to_string(session_id), source, closed ? "closed"sv : "not-found"sv);
+    if (!closed) {
+      not_found(response, request, "Session not found");
+      return;
+    }
+
+    nlohmann::json output_tree;
+    output_tree["status"] = true;
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Register the session API routes on the admin web UI server.
+   *
+   * Registers exactly `GET /api/sessions` (getSessions) and `POST /api/sessions/<id>/close` (closeSession).
+   * `start()` calls this, so tests can exercise the production route table.
+   */
+  void register_session_routes(https_server_t &server) {
+    server.resource["^/api/sessions$"]["GET"] = getSessions;
+    server.resource["^/api/sessions/([0-9]+)/close$"]["POST"] = closeSession;
+  }
+
+  /**
    * @brief Get the configuration settings.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -2377,6 +2499,7 @@ namespace confighttp {
     server.resource["^/api/reset-display-device-persistence$"]["POST"] = resetDisplayDevicePersistence;
     server.resource["^/api/reset-portal-token$"]["POST"] = resetPortalToken;
     server.resource["^/api/restart$"]["POST"] = restart;
+    register_session_routes(server);
     server.resource["^/api/virtual-input/license$"]["GET"] = getVirtualInputLicense;
     server.resource["^/api/virtual-input/license$"]["POST"] = updateVirtualInputLicense;
     server.resource["^/api/virtual-input/status$"]["GET"] = getVirtualInputStatus;

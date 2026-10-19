@@ -97,6 +97,57 @@ curl -u user:pass -H "X-CSRF-Token: your_token_here" \
 ## POST /api/restart
 @copydoc confighttp::restart()
 
+## GET /api/sessions
+Lists the sessions that are running or stopping, with `id`, `started` (Unix seconds), `transport` (`udp/ipv4` or
+`udp/ipv6`) and `client_category` (`local`, `lan` or `wan`). No client names, addresses, certificates or keys are returned.
+
+This endpoint exists only on the admin web UI listener (the same port as the configuration pages). It is not served on
+the game stream ports.
+
+Responses:
+- `200`: `{"status": true, "sessions": [...]}`. The list is empty when no session is running.
+- `401`: no credentials, or wrong username or password.
+- `403`: the client address is not allowed.
+
+If no admin user is configured yet, both session endpoints redirect to the welcome page and do nothing.
+
+Session ids are sequential and not secret. Access is protected by admin authentication, not by the id.
+@copydoc confighttp::getSessions()
+
+## POST /api/sessions/{id}/close
+Ends one session through the normal stop path, with the stop reason `api-close`. `{id}` is the decimal session id from
+`GET /api/sessions`.
+
+This endpoint exists only on the admin web UI listener and requires admin authentication. Cross-origin requests also need
+a valid CSRF token (see [CSRF Protection](#csrf-protection)).
+
+Responses:
+- `200`: `{"status": true}`. The session exists and was asked to stop.
+- `400`: `{id}` is not a 32-bit unsigned decimal number, or the CSRF token is missing, invalid or expired.
+- `401`: no credentials, or wrong username or password.
+- `403`: the client address is not allowed.
+- `404`: no session with this id is running or stopping (unknown, not yet started, or already ended).
+
+If no admin user is configured yet, the request redirects to the welcome page and nothing is done.
+
+Session ids are sequential and not secret. Access is protected by admin authentication, not by the id.
+
+Every request that passes authentication is logged at Info, including requests rejected by the CSRF check:
+
+```
+Session close requested via API: id=<id>, user=<admin user>, source=<client address>, result=<result>
+```
+
+- `id`: the requested id. For `bad-id` and `csrf-rejected`, it is the sanitised path id (digits only, at most 32 characters).
+- `user`: the authenticated admin user.
+- `source`: the TCP peer address of the client. A forwarded-for header is never used.
+- `result`: `closed` (the session was asked to stop), `not-found` (no running or stopping session has this id),
+  `csrf-rejected` (the CSRF check failed), or `bad-id` (the id is not a valid 32-bit unsigned number).
+
+The password, the `Authorization` header and the CSRF token never appear in the log. Unauthenticated requests are
+rejected before this line is written.
+@copydoc confighttp::closeSession()
+
 ## GET /api/virtual-input/status
 @copydoc confighttp::getVirtualInputStatus()
 

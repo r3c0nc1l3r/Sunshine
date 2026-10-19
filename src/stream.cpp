@@ -29,9 +29,11 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
 #include "stream.h"
+#include "stream_liveness.h"
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
@@ -475,6 +477,8 @@ namespace stream {
     std::jthread audio_thread;  ///< Thread that sends encoded audio packets.
     std::jthread control_thread;  ///< Thread that runs the ENet control server.
 
+    liveness::media_ping_registry_t media_pings;  ///< Media-ping trackers of started sessions, keyed by ping payload or client address; the UDP receive thread records post-start pings here.
+
     asio::io_context io_context;  ///< Asio context used by the UDP broadcast sockets.
 
     udp::socket video_sock {io_context};  ///< UDP socket bound for video packet transmission.
@@ -497,6 +501,15 @@ namespace stream {
     std::jthread videoThread;  ///< Video thread.
 
     std::chrono::steady_clock::time_point pingTimeout;  ///< Deadline for receiving the next client ping.
+    std::chrono::steady_clock::time_point last_enet_ping;  ///< Time of the last explicit ENet ping; touched only by the control broadcast thread.
+
+    std::shared_ptr<liveness::shared_media_liveness_t> media_ping {std::make_shared<liveness::shared_media_liveness_t>()};  ///< Post-start video and audio ping tracking, shared with the broadcast context registry.
+    std::atomic<stop_reason_e> stop_reason {stop_reason_e::unknown};  ///< First reason recorded for ending the session.
+
+    // Immutable after `session::alloc()`, so they may be read from any thread.
+    std::chrono::system_clock::time_point started;  ///< Time the session was created.
+    std::string transport;  ///< Transport shown in the session list: `udp/ipv4` or `udp/ipv6`.
+    std::string client_category;  ///< Network class of the client shown in the session list: `local`, `lan` or `wan`.
 
     safe::shared_t<broadcast_ctx_t>::ptr_t broadcast_ref;  ///< Shared broadcast context retained while the session is active.
 
@@ -774,12 +787,15 @@ namespace stream {
           break;
         case ENET_EVENT_TYPE_CONNECT:
           BOOST_LOG(info) << "CLIENT CONNECTED"sv;
+          liveness::configure_peer(event.peer, config::stream.ping_timeout);
           break;
         case ENET_EVENT_TYPE_DISCONNECT:
           BOOST_LOG(info) << "CLIENT DISCONNECTED"sv;
           // No more clients to send video data to ^_^
+          // ENet reports a timed out peer and a client-initiated disconnect identically (event data 0, state
+          // already reset), so both are recorded as a disconnect.
           if (session->state == session::state_e::RUNNING) {
-            session::stop(*session);
+            session::stop(*session, stop_reason_e::disconnect);
           }
           break;
         case ENET_EVENT_TYPE_NONE:
@@ -1224,7 +1240,7 @@ namespace stream {
 
         BOOST_LOG(error) << "Failed to verify tag"sv;
 
-        session::stop(*session);
+        session::stop(*session, stop_reason_e::protocol_error);
         return;
       }
 
@@ -1279,7 +1295,7 @@ namespace stream {
 
         BOOST_LOG(error) << "Failed to verify tag"sv;
 
-        session::stop(*session);
+        session::stop(*session, stop_reason_e::protocol_error);
         return;
       }
 
@@ -1288,7 +1304,7 @@ namespace stream {
 
       if (type == packetTypes[IDX_ENCRYPTED]) {
         BOOST_LOG(error) << "Bad packet type [IDX_ENCRYPTED] found"sv;
-        session::stop(*session);
+        session::stop(*session, stop_reason_e::protocol_error);
         return;
       }
 
@@ -1329,7 +1345,16 @@ namespace stream {
           if (now > session->pingTimeout) {
             auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
             BOOST_LOG(info) << address << ": Ping Timeout"sv;
-            session::stop(*session);
+            session::stop(*session, stop_reason_e::ping_timeout);
+          }
+
+          // The client may keep the control stream alive while no longer sending its video/audio pings
+          if (session->state.load(std::memory_order_acquire) == session::state_e::RUNNING) {
+            if (session->media_ping->expired(now, config::stream.ping_timeout)) {
+              auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
+              BOOST_LOG(info) << address << ": Media Ping Timeout"sv;
+              session::stop(*session, stop_reason_e::media_ping_timeout);
+            }
           }
 
           if (session->state.load(std::memory_order_acquire) == session::state_e::STOPPING) {
@@ -1354,6 +1379,8 @@ namespace stream {
           if (!session->control.peer) {
             has_session_awaiting_peer = true;
           } else {
+            liveness::tick(session->control.peer, now, session->last_enet_ping);
+
             auto &feedback_queue = session->control.feedback_queue;
             while (feedback_queue->peek()) {
               auto feedback_msg = feedback_queue->pop();
@@ -1407,6 +1434,9 @@ namespace stream {
           BOOST_LOG(warning) << "Couldn't send termination code to ["sv << addr << ':' << port << ']';
         }
       }
+
+      // Records `terminated` only if this call stops a running session; an already stopping session keeps its reason.
+      session::stop(*session, stop_reason_e::terminated);
 
       session->shutdown_event->raise(true);
       session->controlEnd.raise(true);
@@ -1482,6 +1512,16 @@ namespace stream {
         if (ec || !bytes) {
           BOOST_LOG(error) << "Couldn't receive data from udp socket: "sv << ec.message();
           return;
+        }
+
+        // Record post-start pings; the message queues below only serve the initial ping.
+        {
+          if (bytes == 4) {
+            ctx.media_pings.on_ping(peer.address().to_string(), std::chrono::steady_clock::now());
+          } else if (bytes >= sizeof(SS_PING)) {
+            auto ping = (PSS_PING) buf[buf_elem].data();
+            ctx.media_pings.on_ping(std::string {ping->payload, sizeof(ping->payload)}, std::chrono::steady_clock::now());
+          }
         }
 
         if (bytes == 4) {
@@ -2131,7 +2171,7 @@ namespace stream {
   void videoThread(session_t *session) {
     platf::set_thread_name("session::video");
     auto fg = util::fail_guard([&]() {
-      session::stop(*session);
+      session::stop(*session, stop_reason_e::stream_ended);
     });
 
     while_starting_do_nothing(session->state);
@@ -2139,6 +2179,7 @@ namespace stream {
     auto ref = broadcast.ref();
     auto error = recv_ping(session, ref, socket_e::video, session->video.ping_payload, session->video.peer, config::stream.ping_timeout);
     if (error < 0) {
+      session::stop(*session, stop_reason_e::initial_ping_timeout);
       return;
     }
 
@@ -2158,7 +2199,7 @@ namespace stream {
   void audioThread(session_t *session) {
     platf::set_thread_name("session::audio");
     auto fg = util::fail_guard([&]() {
-      session::stop(*session);
+      session::stop(*session, stop_reason_e::stream_ended);
     });
 
     while_starting_do_nothing(session->state);
@@ -2166,6 +2207,7 @@ namespace stream {
     auto ref = broadcast.ref();
     auto error = recv_ping(session, ref, socket_e::audio, session->audio.ping_payload, session->audio.peer, config::stream.ping_timeout);
     if (error < 0) {
+      session::stop(*session, stop_reason_e::initial_ping_timeout);
       return;
     }
 
@@ -2206,6 +2248,70 @@ namespace stream {
       }
 
       session.shutdown_event->raise(true);
+    }
+
+    /**
+     * @brief Stop a streaming session and record why it ended.
+     */
+    void stop(session_t &session, stop_reason_e reason) {
+      while_starting_do_nothing(session.state);
+      auto expected = state_e::RUNNING;
+      if (!session.state.compare_exchange_strong(expected, state_e::STOPPING)) {
+        return;
+      }
+
+      // Only the call that moved the session to STOPPING records the reason. It is stored before the shutdown
+      // event is raised, so the workers (and the join that follows) always observe it.
+      session.stop_reason.store(reason);
+      session.shutdown_event->raise(true);
+    }
+
+    /**
+     * @brief Get the reason recorded for the end of a session.
+     */
+    stop_reason_e stop_reason(const session_t &session) {
+      return session.stop_reason.load();
+    }
+
+    /**
+     * @brief Get the launch session id of a session.
+     */
+    std::uint32_t id(const session_t &session) {
+      return session.launch_session_id;
+    }
+
+    /**
+     * @brief Describe a session for the session list.
+     */
+    rtsp_stream::session_info_t describe(const session_t &session) {
+      rtsp_stream::session_info_t result;
+      result.id = session.launch_session_id;
+      result.started = session.started;
+      result.transport = session.transport;
+      result.client_category = session.client_category;
+      return result;
+    }
+
+    /**
+     * @brief Get the network class of a session's client as shown in the session list.
+     * @param address Client address as seen by the RTSP server.
+     * @return `local`, `lan` or `wan`. Unparseable addresses are reported as `wan`.
+     */
+    static std::string client_category_of(std::string_view address) {
+      sys::error_code ec;
+      asio::ip::make_address(address, ec);
+      if (ec) {
+        return "wan";
+      }
+
+      switch (net::from_address(address)) {
+        case net::PC:
+          return "local";
+        case net::LAN:
+          return "lan";
+        default:
+          return "wan";
+      }
     }
 
     /**
@@ -2256,6 +2362,11 @@ namespace stream {
         platf::streaming_will_stop();
       }
 
+      // Stop receiving media pings for this session. Only entries routed to its own tracker are removed.
+      if (session.broadcast_ref) {
+        session.broadcast_ref->media_pings.remove(session.media_ping);
+      }
+
       BOOST_LOG(debug) << "Session ended"sv;
     }
 
@@ -2272,6 +2383,12 @@ namespace stream {
 
       session.control.expected_peer_address = addr_string;
       BOOST_LOG(debug) << "Expecting incoming session connections from "sv << addr_string;
+
+      // Route the client's post-start video and audio pings to this session
+      session.broadcast_ref->media_pings.add(std::string {session.video.ping_payload}, session.media_ping);
+      if (!(session.config.mlFeatureFlags & ML_FF_SESSION_ID_V1)) {
+        session.broadcast_ref->media_pings.add(boost::asio::ip::make_address(addr_string).to_string(), session.media_ping);
+      }
 
       // Insert this session into the session list
       {
@@ -2307,8 +2424,19 @@ namespace stream {
     /**
      * @brief Allocate and initialize platform input state for a stream.
      */
-    std::shared_ptr<session_t> alloc(config_t &config, rtsp_stream::launch_session_t &launch_session) {
+    std::shared_ptr<session_t> alloc(config_t &config, rtsp_stream::launch_session_t &launch_session, std::string_view peer_address) {
       auto session = std::make_shared<session_t>();
+
+      session->started = std::chrono::system_clock::now();
+
+      // The peer address is used only to derive the session list fields; it is not stored.
+      const auto is_ipv6 = [&]() {
+        sys::error_code ec;
+        const auto address = asio::ip::make_address(peer_address, ec);
+        return !ec && address.is_v6() && !address.to_v6().is_v4_mapped();
+      }();
+      session->transport = is_ipv6 ? "udp/ipv6" : "udp/ipv4";
+      session->client_category = client_category_of(peer_address);
 
       auto mail = std::make_shared<safe::mail_raw_t>();
 

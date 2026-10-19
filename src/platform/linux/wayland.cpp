@@ -16,12 +16,14 @@
 #include <lizardbyte/common/env.h>
 
 // local includes
+#include "fd_counts.h"
 #include "graphics.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/round_robin.h"
 #include "src/utility.h"
 #include "wayland.h"
+#include "wayland_stats.h"
 
 extern const wl_interface wl_output_interface;  ///< Wayland output interface.
 
@@ -42,7 +44,54 @@ namespace wl {
       .get_offset = gbm_bo_get_offset,
       .get_modifier = gbm_bo_get_modifier,
     };
+
+    int open_render_node(const char *path) {
+      return open(path, O_RDWR | O_CLOEXEC);
+    }
+
+    const gbm_device_accessors_t gbm_device_accessors {
+      .open_render_node = open_render_node,
+      .create_device = gbm_create_device,
+      .destroy_device = gbm_device_destroy,
+    };
   }  // namespace
+
+  gbm_device_t::~gbm_device_t() {
+    reset();
+  }
+
+  bool gbm_device_t::init(const std::string &render_path, const gbm_device_accessors_t &accessors) {
+    reset();
+    this->accessors = accessors;
+
+    drm_fd = accessors.open_render_node(render_path.c_str());
+    if (drm_fd < 0) {
+      BOOST_LOG(error) << "[wayland] Failed to open DRM render node: "sv << render_path;
+      return false;
+    }
+
+    device = accessors.create_device(drm_fd);
+    if (!device) {
+      BOOST_LOG(error) << "[wayland] Failed to create GBM device"sv;
+      reset();
+      return false;
+    }
+
+    return true;
+  }
+
+  void gbm_device_t::reset() {
+    if (device) {
+      accessors.destroy_device(device);
+      device = nullptr;
+    }
+
+    // gbm_device_destroy() does not close the descriptor the device was created from
+    if (drm_fd >= 0) {
+      close(drm_fd);
+      drm_fd = -1;
+    }
+  }
 
   // Helper to call C++ method from wayland C callback
   template<class T, class Method, Method m, class... Params>
@@ -258,38 +307,68 @@ namespace wl {
 
   // Initialize GBM
   bool dmabuf_t::init_gbm() {
-    if (gbm_device) {
+    if (gbm) {
       return true;
     }
 
-    auto render_path = platf::resolve_render_device();
-    int drm_fd = open(render_path.c_str(), O_RDWR);
-    if (drm_fd < 0) {
-      BOOST_LOG(error) << "[wayland] Failed to open DRM render node: "sv << render_path;
-      return false;
-    }
-
-    gbm_device = gbm_create_device(drm_fd);
-    if (!gbm_device) {
-      close(drm_fd);
-      BOOST_LOG(error) << "[wayland] Failed to create GBM device"sv;
-      return false;
-    }
-
-    return true;
+    return gbm.init(platf::resolve_render_device(), gbm_device_accessors);
   }
 
   // Cleanup GBM
   void dmabuf_t::cleanup_gbm() {
+    destroy_bo();
+    destroy_wl_buffer();
+  }
+
+  void dmabuf_t::destroy_bo() {
     if (current_bo) {
       gbm_bo_destroy(current_bo);
       current_bo = nullptr;
+      stats::bo_destroyed();
     }
+  }
 
+  void dmabuf_t::destroy_wl_buffer() {
     if (current_wl_buffer) {
       wl_buffer_destroy(current_wl_buffer);
       current_wl_buffer = nullptr;
+      stats::wl_buffer_destroyed();
     }
+  }
+
+  // Destroy the frame of the request that just ended
+  void dmabuf_t::finish_request(zwlr_screencopy_frame_v1 *frame) {
+    zwlr_screencopy_frame_v1_destroy(frame);
+    if (frame == pending_frame) {
+      pending_frame = nullptr;
+    }
+  }
+
+  void dmabuf_t::erase_params_request(const params_request_t *request) {
+    std::erase_if(params_requests, [request](const auto &entry) {
+      return entry.get() == request;
+    });
+  }
+
+  void dmabuf_t::cancel() {
+    if (!pending_frame) {
+      return;
+    }
+
+    BOOST_LOG(debug) << "[wayland] Cancelling the screencopy request that is still waiting"sv;
+
+    // Params still in flight cannot be destroyed before the compositor answers: they become orphans
+    for (auto &request : params_requests) {
+      if (request->frame == pending_frame) {
+        request->frame = nullptr;
+      }
+    }
+
+    finish_request(pending_frame);
+    cleanup_gbm();
+    get_next_frame()->destroy();
+    status = READY;
+    stats::request_cancelled();
   }
 
   dmabuf_t::dmabuf_t():
@@ -315,6 +394,11 @@ namespace wl {
     wl_output *output,
     bool blend_cursor
   ) {
+    // A request that is still waiting must not leak its objects
+    if (status == WAITING) {
+      cancel();
+    }
+
     this->dmabuf_interface = dmabuf_interface;
     this->supported_modifiers = supported_modifiers;
     // Reset state
@@ -328,8 +412,7 @@ namespace wl {
       output
     );
 
-    // Store frame data pointer for callbacks
-    zwlr_screencopy_frame_v1_set_user_data(frame, this);
+    pending_frame = frame;
 
     // Add listener
     zwlr_screencopy_frame_v1_add_listener(frame, &listener, this);
@@ -338,17 +421,24 @@ namespace wl {
   }
 
   dmabuf_t::~dmabuf_t() {
+    cancel();
+
+    // The connection is still open: answer-less params, orphans included, are destroyed here
+    for (auto &request : params_requests) {
+      zwp_linux_buffer_params_v1_destroy(request->params);
+      stats::params_resolved();
+    }
+    params_requests.clear();
+
     cleanup_gbm();
 
     for (auto &frame : frames) {
       frame.destroy();
     }
 
-    if (gbm_device) {
-      // We should close the DRM FD, but it's owned by GBM
-      gbm_device_destroy(gbm_device);
-      gbm_device = nullptr;
-    }
+    gbm.reset();
+
+    BOOST_LOG(info) << "[wayland] capture buffers: "sv << stats::format(stats::snapshot(), platf::count_open_fds());
   }
 
   // Buffer format callback
@@ -359,6 +449,11 @@ namespace wl {
     uint32_t height,
     uint32_t stride
   ) {
+    if (frame != pending_frame) {
+      BOOST_LOG(debug) << "[wayland] Ignoring buffer event of a stale frame"sv;
+      return;
+    }
+
     shm_info.supported = true;
     shm_info.format = format;
     shm_info.width = width;
@@ -373,6 +468,11 @@ namespace wl {
     std::uint32_t width,
     std::uint32_t height
   ) {
+    if (frame != pending_frame) {
+      BOOST_LOG(debug) << "[wayland] Ignoring linux_dmabuf event of a stale frame"sv;
+      return;
+    }
+
     dmabuf_info.supported = true;
     dmabuf_info.format = format;
     dmabuf_info.width = width;
@@ -381,6 +481,11 @@ namespace wl {
 
   // Flags callback
   void dmabuf_t::flags(zwlr_screencopy_frame_v1 *frame, std::uint32_t flags) {
+    if (frame != pending_frame) {
+      BOOST_LOG(debug) << "[wayland] Ignoring flags event of a stale frame"sv;
+      return;
+    }
+
     y_invert = flags & ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT;
     BOOST_LOG(verbose) << "Frame flags: "sv << flags << (y_invert ? " (y_invert)" : "");
   }
@@ -414,37 +519,43 @@ namespace wl {
   void dmabuf_t::create_and_copy_dmabuf(zwlr_screencopy_frame_v1 *frame) {
     if (!init_gbm()) {
       BOOST_LOG(error) << "Failed to initialize GBM"sv;
-      zwlr_screencopy_frame_v1_destroy(frame);
+      finish_request(frame);
       status = REINIT;
       return;
+    }
+
+    // A live buffer object must never be replaced without being destroyed
+    if (current_bo) {
+      stats::object_overwritten();
+      destroy_bo();
     }
 
     // Create GBM buffer
     if (supported_modifiers) {
       auto it = supported_modifiers->find(dmabuf_info.format);
       if (it != supported_modifiers->end() && !it->second.empty()) {
-        current_bo = gbm_bo_create_with_modifiers2(gbm_device, dmabuf_info.width, dmabuf_info.height, dmabuf_info.format, it->second.data(), it->second.size(), GBM_BO_USE_RENDERING);
+        current_bo = gbm_bo_create_with_modifiers2(gbm.get(), dmabuf_info.width, dmabuf_info.height, dmabuf_info.format, it->second.data(), it->second.size(), GBM_BO_USE_RENDERING);
       }
     }
 
     if (!current_bo) {
-      current_bo = gbm_bo_create(gbm_device, dmabuf_info.width, dmabuf_info.height, dmabuf_info.format, GBM_BO_USE_RENDERING);
+      current_bo = gbm_bo_create(gbm.get(), dmabuf_info.width, dmabuf_info.height, dmabuf_info.format, GBM_BO_USE_RENDERING);
     }
 
     if (!current_bo) {
       BOOST_LOG(error) << "Failed to create GBM buffer"sv;
-      zwlr_screencopy_frame_v1_destroy(frame);
+      finish_request(frame);
       status = REINIT;
       return;
     }
+    stats::bo_created();
 
     // Export every memory plane into the surface descriptor
     auto next_frame = get_next_frame();
     const auto plane_count = export_gbm_bo_planes(current_bo, *next_frame, gbm_bo_accessors);
     if (!plane_count) {
-      gbm_bo_destroy(current_bo);
-      current_bo = nullptr;
-      zwlr_screencopy_frame_v1_destroy(frame);
+      destroy_bo();
+      finish_request(frame);
       status = REINIT;
       return;
     }
@@ -463,15 +574,22 @@ namespace wl {
       );
     }
 
-    // Add listener for buffer creation
-    zwp_linux_buffer_params_v1_add_listener(params, &params_listener, frame);
+    // Add listener for buffer creation; the request outlives the frame if the capture is cancelled
+    auto &request = params_requests.emplace_back(std::make_unique<params_request_t>(params_request_t {this, frame, params}));
+    zwp_linux_buffer_params_v1_add_listener(params, &params_listener, request.get());
 
     // Create Wayland buffer (async - callback will handle copy)
     zwp_linux_buffer_params_v1_create(params, dmabuf_info.width, dmabuf_info.height, dmabuf_info.format, 0);
+    stats::params_pending();
   }
 
   // Buffer done callback - time to create buffer
   void dmabuf_t::buffer_done(zwlr_screencopy_frame_v1 *frame) {
+    if (frame != pending_frame) {
+      BOOST_LOG(debug) << "[wayland] Ignoring buffer_done event of a stale frame"sv;
+      return;
+    }
+
     auto next_frame = get_next_frame();
 
     // Prefer DMA-BUF if supported
@@ -486,11 +604,11 @@ namespace wl {
     } else if (shm_info.supported) {
       // SHM fallback would go here
       BOOST_LOG(warning) << "[wayland] SHM capture not implemented"sv;
-      zwlr_screencopy_frame_v1_destroy(frame);
+      finish_request(frame);
       status = REINIT;
     } else {
       BOOST_LOG(error) << "[wayland] No supported buffer types"sv;
-      zwlr_screencopy_frame_v1_destroy(frame);
+      finish_request(frame);
       status = REINIT;
     }
   }
@@ -501,14 +619,31 @@ namespace wl {
     struct zwp_linux_buffer_params_v1 *params,
     struct wl_buffer *buffer
   ) {
-    auto frame = static_cast<zwlr_screencopy_frame_v1 *>(data);
-    auto self = static_cast<dmabuf_t *>(zwlr_screencopy_frame_v1_get_user_data(frame));
+    auto request = static_cast<params_request_t *>(data);
+    auto self = request->owner;
+    auto frame = request->frame;
 
-    // Store for cleanup
+    stats::params_resolved();
+    stats::wl_buffer_created();
+    zwp_linux_buffer_params_v1_destroy(params);
+    self->erase_params_request(request);
+
+    // The request was cancelled while the compositor was creating the buffer
+    if (!frame) {
+      BOOST_LOG(debug) << "[wayland] Releasing the buffer of a cancelled request"sv;
+      wl_buffer_destroy(buffer);
+      stats::wl_buffer_destroyed();
+      return;
+    }
+
+    // A live buffer must never be replaced without being destroyed
+    if (self->current_wl_buffer) {
+      stats::object_overwritten();
+      self->destroy_wl_buffer();
+    }
     self->current_wl_buffer = buffer;
 
     // Start the actual copy
-    zwp_linux_buffer_params_v1_destroy(params);
     zwlr_screencopy_frame_v1_copy(frame, buffer);
   }
 
@@ -517,15 +652,25 @@ namespace wl {
     void *data,
     struct zwp_linux_buffer_params_v1 *params
   ) {
-    auto frame = static_cast<zwlr_screencopy_frame_v1 *>(data);
-    auto self = static_cast<dmabuf_t *>(zwlr_screencopy_frame_v1_get_user_data(frame));
+    auto request = static_cast<params_request_t *>(data);
+    auto self = request->owner;
+    auto frame = request->frame;
+
+    stats::params_resolved();
+    zwp_linux_buffer_params_v1_destroy(params);
+    self->erase_params_request(request);
+
+    // The request was cancelled already and released its objects
+    if (!frame) {
+      BOOST_LOG(debug) << "[wayland] Buffer creation failed for a cancelled request"sv;
+      return;
+    }
 
     BOOST_LOG(error) << "[wayland] Failed to create buffer from params"sv;
     self->cleanup_gbm();
     self->get_next_frame()->destroy();
 
-    zwp_linux_buffer_params_v1_destroy(params);
-    zwlr_screencopy_frame_v1_destroy(frame);
+    self->finish_request(frame);
     self->status = REINIT;
   }
 
@@ -536,6 +681,11 @@ namespace wl {
     std::uint32_t tv_sec_lo,
     std::uint32_t tv_nsec
   ) {
+    if (frame != pending_frame) {
+      BOOST_LOG(debug) << "[wayland] Ignoring ready event of a stale frame"sv;
+      return;
+    }
+
     // Frame is ready for use, GBM buffer now contains screen content
     current_frame->destroy();
     current_frame = get_next_frame();
@@ -547,19 +697,19 @@ namespace wl {
     };
 
     // Keep the GBM buffer alive but destroy the Wayland objects
-    if (current_wl_buffer) {
-      wl_buffer_destroy(current_wl_buffer);
-      current_wl_buffer = nullptr;
-    }
-
     cleanup_gbm();
 
-    zwlr_screencopy_frame_v1_destroy(frame);
+    finish_request(frame);
     status = READY;
   }
 
   // Failed callback
   void dmabuf_t::failed(zwlr_screencopy_frame_v1 *frame) {
+    if (frame != pending_frame) {
+      BOOST_LOG(debug) << "[wayland] Ignoring failed event of a stale frame"sv;
+      return;
+    }
+
     BOOST_LOG(error) << "[wayland] Frame capture failed"sv;
 
     // Clean up resources
@@ -567,7 +717,14 @@ namespace wl {
     auto next_frame = get_next_frame();
     next_frame->destroy();
 
-    zwlr_screencopy_frame_v1_destroy(frame);
+    // Params still in flight cannot be destroyed before the compositor answers: they become orphans
+    for (auto &request : params_requests) {
+      if (request->frame == frame) {
+        request->frame = nullptr;
+      }
+    }
+
+    finish_request(frame);
     status = REINIT;
   }
 
@@ -578,7 +735,11 @@ namespace wl {
     std::uint32_t y,
     std::uint32_t width,
     std::uint32_t height
-  ) {};
+  ) {
+    if (frame != pending_frame) {
+      BOOST_LOG(debug) << "[wayland] Ignoring damage event of a stale frame"sv;
+    }
+  };
 
   void frame_t::destroy() {
     for (auto x = 0; x < 4; ++x) {

@@ -61,6 +61,9 @@ The rules above are upstream's. This section adds the rules for this fork.
   `cmake -B cmake-build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF -DBUILD_TESTS=ON
   -DSUNSHINE_ENABLE_CUDA=OFF -DCUDA_FAIL_ON_MISSING=OFF` then `ninja -C cmake-build-release`.
 - Unit tests: `cmake-build-release/tests/test_sunshine` (gtest; use `--gtest_filter=` for one suite).
+  Never run the full binary on a desktop session: the system tray visual tests take screenshots of the
+  display. Run it under Xvfb (as the package build does), or with `DISPLAY`/`WAYLAND_DISPLAY` unset and
+  `--gtest_filter='-SystemTray*'`.
 - Run `clang-format --dry-run --Werror` on changed C/C++ files.
 - Docs: `BUILD_DOCS=ON` runs doxygen, which fails on undocumented symbols. Run it before merging.
 - The local checks are the merge gate. GitHub Actions stay disabled on the fork.
@@ -72,6 +75,8 @@ The rules above are upstream's. This section adds the rules for this fork.
 - The Arch package comes from `packaging/linux/Arch/PKGBUILD`, configured with
   `cmake -DSUNSHINE_CONFIGURE_ONLY=ON -DSUNSHINE_CONFIGURE_PKGBUILD=ON` and the env vars `BRANCH`, `BUILD_VERSION`,
   `CLONE_URL` (this fork) and `COMMIT` (a pushed commit). Set `_use_cuda=false` for the VA-API build.
+- `scripts/lanternbox/build_arch_pkg.sh --commit <sha> --base-version <ver> --release <n> --out <dir>` builds that package
+  in a disposable `archlinux:base-devel` container; run it with `--help` for options.
 
 ## Rules
 - Never open issues, PRs or comments on LizardByte projects. Fork changes stay upstream-ready (clean, opt-in where they

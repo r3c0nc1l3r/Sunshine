@@ -9,7 +9,9 @@
 #include <bitset>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #ifdef SUNSHINE_BUILD_WAYLAND
@@ -28,6 +30,7 @@
 #ifdef SUNSHINE_BUILD_WAYLAND
 
 struct gbm_bo;
+struct gbm_device;
 
 namespace wl {
   /**
@@ -52,6 +55,84 @@ namespace wl {
     std::uint32_t (*get_stride_for_plane)(gbm_bo *bo, int plane);  ///< Return the row stride for one plane.
     std::uint32_t (*get_offset)(gbm_bo *bo, int plane);  ///< Return the byte offset for one plane.
     std::uint64_t (*get_modifier)(gbm_bo *bo);  ///< Return the DRM format modifier shared by the planes.
+  };
+
+  /**
+   * @brief Functions used to open a render node and create/destroy a GBM device on it.
+   */
+  struct gbm_device_accessors_t {
+    int (*open_render_node)(const char *path);  ///< Open the render node and return its descriptor, or -1.
+    gbm_device *(*create_device)(int fd);  ///< Create a GBM device on the descriptor, or nullptr.
+    void (*destroy_device)(gbm_device *device);  ///< Destroy a GBM device (does not close the descriptor).
+  };
+
+  /**
+   * @brief Owner of a GBM device together with the render-node descriptor it was created from.
+   *
+   * `gbm_device_destroy()` does not close the descriptor passed to `gbm_create_device()`,
+   * so the descriptor has to be tracked and closed here once the device is gone.
+   */
+  class gbm_device_t {
+  public:
+    /**
+     * @brief Construct an empty owner that holds neither a device nor a descriptor.
+     */
+    gbm_device_t() = default;
+
+    /**
+     * @brief Copying is disabled: the descriptor and the device have exactly one owner.
+     */
+    gbm_device_t(const gbm_device_t &) = delete;
+
+    /**
+     * @brief Copy assignment is disabled: the descriptor and the device have exactly one owner.
+     */
+    gbm_device_t &operator=(const gbm_device_t &) = delete;
+
+    /**
+     * @brief Destroy the GBM device and close the render-node descriptor.
+     */
+    ~gbm_device_t();
+
+    /**
+     * @brief Open the render node and create the GBM device on it.
+     *
+     * @param render_path Path of the DRM render node.
+     * @param accessors Functions used to open the node and create the device.
+     * @return `true` when the device is ready, `false` when nothing is held.
+     */
+    bool init(const std::string &render_path, const gbm_device_accessors_t &accessors);
+
+    /**
+     * @brief Destroy the GBM device and close the render-node descriptor.
+     */
+    void reset();
+
+    /**
+     * @return The GBM device, or nullptr.
+     */
+    gbm_device *get() const {
+      return device;
+    }
+
+    /**
+     * @return The render-node descriptor, or -1.
+     */
+    int fd() const {
+      return drm_fd;
+    }
+
+    /**
+     * @return `true` when a GBM device is held.
+     */
+    explicit operator bool() const {
+      return device != nullptr;
+    }
+
+  private:
+    gbm_device_accessors_t accessors {};  ///< Functions used to create and destroy the device.
+    int drm_fd {-1};  ///< Render-node descriptor the device was created from, or -1.
+    gbm_device *device {nullptr};  ///< The GBM device, or nullptr.
   };
 
   /**
@@ -112,9 +193,17 @@ namespace wl {
      */
     void listen(zwlr_screencopy_manager_v1 *screencopy_manager, zwp_linux_dmabuf_v1 *dmabuf_interface, const std::map<std::uint32_t, std::vector<std::uint64_t>> *supported_modifiers, wl_output *output, bool blend_cursor = false);
     /**
+     * @brief Cancel the screencopy request that is still waiting, if any.
+     *
+     * Destroys the pending frame (the library drops its late events), releases the request's GBM buffer, `wl_buffer`
+     * and the exported descriptors of the next frame, and leaves the state at `READY`. A buffer-params request still in
+     * flight is kept as an orphan and cleaned up when the compositor answers it.
+     */
+    void cancel();
+    /**
      * @brief Store the Wayland buffer created for a DMA-BUF parameter request.
      *
-     * @param data Pointer to the `dmabuf_t` instance associated with the callback.
+     * @param data Pointer to the `params_request_t` that tracks the request.
      * @param params DMA-BUF parameter object that completed buffer creation.
      * @param wl_buffer Wayland buffer created from the DMA-BUF planes.
      */
@@ -122,7 +211,7 @@ namespace wl {
     /**
      * @brief Mark DMA-BUF buffer creation as failed.
      *
-     * @param data Pointer to the `dmabuf_t` instance associated with the callback.
+     * @param data Pointer to the `params_request_t` that tracks the request.
      * @param params DMA-BUF parameter object that failed buffer creation.
      */
     static void buffer_params_failed(void *data, struct zwp_linux_buffer_params_v1 *params);
@@ -199,8 +288,21 @@ namespace wl {
     zwlr_screencopy_frame_v1_listener listener;  ///< Callback table registered on screencopy frames.
 
   private:
+    /**
+     * @brief One `zwp_linux_buffer_params_v1` create request that has not been answered yet.
+     */
+    struct params_request_t {
+      dmabuf_t *owner;  ///< Capture state that sent the request.
+      zwlr_screencopy_frame_v1 *frame;  ///< Screencopy frame the request belongs to, or nullptr once it is an orphan.
+      zwp_linux_buffer_params_v1 *params;  ///< The pending parameter object.
+    };
+
     bool init_gbm();
     void cleanup_gbm();
+    void destroy_bo();
+    void destroy_wl_buffer();
+    void finish_request(zwlr_screencopy_frame_v1 *frame);
+    void erase_params_request(const params_request_t *request);
     void create_and_copy_dmabuf(zwlr_screencopy_frame_v1 *frame);
 
     zwp_linux_dmabuf_v1 *dmabuf_interface {nullptr};
@@ -221,7 +323,9 @@ namespace wl {
       std::uint32_t height;
     } dmabuf_info;
 
-    struct gbm_device *gbm_device {nullptr};
+    zwlr_screencopy_frame_v1 *pending_frame {nullptr};  ///< Screencopy frame of the request in flight, or nullptr.
+    std::vector<std::unique_ptr<params_request_t>> params_requests;  ///< Unanswered params requests, including orphans.
+    gbm_device_t gbm;  ///< GBM device and render-node descriptor used to allocate capture buffers.
     struct gbm_bo *current_bo {nullptr};
     struct wl_buffer *current_wl_buffer {nullptr};
     bool y_invert {false};

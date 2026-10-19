@@ -320,7 +320,11 @@ list(APPEND PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/linux/graphics.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/misc.h"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/misc.cpp"
-        "${CMAKE_SOURCE_DIR}/src/platform/linux/audio.cpp")
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/audio.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/fd_counts.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/fd_counts.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/wayland_stats.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/wayland_stats.cpp")
 
 list(APPEND PLATFORM_LIBRARIES
         dl

@@ -35,6 +35,7 @@ extern "C" {
 #include "platform/common.h"
 #include "sync.h"
 #include "video.h"
+#include "video_retry_backoff.h"
 
 #ifdef _WIN32
 extern "C" {
@@ -1754,6 +1755,11 @@ namespace video {
             // Wait for the other shared_ptr's of display to be destroyed.
             // New displays will only be created in this thread.
             while (display_wp->use_count() != 1) {
+              if (!capture_ctx_queue->running()) {
+                BOOST_LOG(warning) << "Capture queue stopped while waiting for the display to be released"sv;
+                return;
+              }
+
               // Free images that weren't consumed by the encoders. These can reference the display and prevent
               // the ref count from reaching 1. We do this here rather than on the encoder thread to avoid race
               // conditions where the encoding loop might free a good frame after reinitializing if we capture
@@ -2396,8 +2402,9 @@ namespace video {
    * @param reinit_event Signal raised while the encoder/display is reinitializing.
    * @param encoder Selected encoder.
    * @param channel_data Opaque channel data passed to packets.
+   * @return True if the run ended with an error, false otherwise.
    */
-  void encode_run(
+  bool encode_run(
     int &frame_nr,  // Store progress of the frame number
     safe::mail_t mail,
     img_event_t images,
@@ -2410,7 +2417,7 @@ namespace video {
   ) {
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
-      return;
+      return true;
     }
 
     // As a workaround for NVENC hangs and to generally speed up encoder reinit,
@@ -2447,7 +2454,7 @@ namespace video {
       // in a separate scope.
       auto dummy_img = disp->alloc_img();
       if (!dummy_img || disp->dummy_img(dummy_img.get()) || session->convert(*dummy_img)) {
-        return;
+        return true;
       }
     }
 
@@ -2477,7 +2484,7 @@ namespace video {
           frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
-            return;
+            return true;
           }
         } else if (!images->running()) {
           break;
@@ -2500,7 +2507,7 @@ namespace video {
 
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
-        return;
+        return true;
       }
 
       session->request_normal_frame();
@@ -2509,6 +2516,8 @@ namespace video {
       // This is useful for KVM switch scenarios where mouse may disappear during streaming
       platf::enable_mouse_keys();
     }
+
+    return false;
   }
 
   /**
@@ -2904,6 +2913,8 @@ namespace video {
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
+    video::retry_backoff_t backoff {100ms, 2s, 1s};
+
     while (!shutdown_event->peek() && images->running()) {
       // Wait for the main capture event when the display is being reinitialized
       if (ref->reinit_event.peek()) {
@@ -2914,11 +2925,13 @@ namespace video {
       std::shared_ptr<platf::display_t> display;
       {
         auto lg = ref->display_wp.lock();
-        if (ref->display_wp->expired()) {
-          continue;
+        if (!ref->display_wp->expired()) {
+          display = ref->display_wp->lock();
         }
-
-        display = ref->display_wp->lock();
+      }
+      if (!display) {
+        std::this_thread::sleep_for(20ms);
+        continue;
       }
 
       auto &encoder = *chosen_encoder;
@@ -2942,7 +2955,8 @@ namespace video {
       }
       hdr_event->raise(std::move(hdr_info));
 
-      encode_run(
+      auto run_start = std::chrono::steady_clock::now();
+      bool failed = encode_run(
         frame_nr,
         mail,
         images,
@@ -2953,6 +2967,17 @@ namespace video {
         *ref->encoder_p,
         channel_data
       );
+
+      auto run_duration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - run_start);
+      auto delay = backoff.on_run_end(run_duration, failed);
+      if (delay > 0ms) {
+        BOOST_LOG(warning) << "Encode run failed "sv << backoff.consecutive_failures() << " time(s), retrying in "sv << delay.count() << "ms"sv;
+        // Wait in short slices so the backoff ends as soon as this session stops
+        auto deadline = std::chrono::steady_clock::now() + delay;
+        while (images->running() && !shutdown_event->peek() && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(20ms);
+        }
+      }
     }
   }
 
