@@ -617,6 +617,24 @@ namespace {
   }
 
   /**
+   * @brief Stops and joins a flood thread when it leaves scope, so an early `ASSERT` cannot leave it joinable.
+   */
+  struct flood_joiner_t {
+    std::atomic<bool> &stop;  ///< Stop flag polled by the flood loop.
+    std::thread &flooder;  ///< Flood thread to join.
+
+    /**
+     * @brief Set the stop flag and join the flood thread if it is still running.
+     */
+    ~flood_joiner_t() {
+      stop = true;
+      if (flooder.joinable()) {
+        flooder.join();
+      }
+    }
+  };
+
+  /**
    * @brief Fixture: old side under test, fakes, real channel and a scripted peer.
    */
   class HandoffOldSideTest: public testing::Test {
@@ -684,6 +702,9 @@ namespace {
             ::close(r.fd);
           }
           std::unique_lock lock {handler_mutex};
+          if (handled.empty()) {
+            first_handled_at = std::chrono::steady_clock::now();
+          }
           handled.push_back(protocol::type_name(r.message));
           handler_cv.notify_all();
           if (handler_blocks) {
@@ -839,6 +860,39 @@ namespace {
       }
     }
 
+    /**
+     * @brief Flood the old side from a thread of its own while this thread answers PINGs until `MAIN` arrives.
+     *
+     * The flood thread retries a send while the socket is full, so all `count` messages are sent (more than the
+     * drain queue bound, so the queue-full path runs). The test thread keeps pumping, so PINGs are answered however
+     * slow the sends are (sanitizer builds). The flood thread is stopped and joined before this returns.
+     *
+     * @param message Message sent `count` times.
+     * @param count Number of sends.
+     * @return The time at which the pump saw `MAIN`, or the time at the deadline when it did not arrive.
+     */
+    std::chrono::steady_clock::time_point flood_until_main(const protocol::message_t &message, int count) {
+      std::atomic<bool> stop_flood {false};
+      std::thread flooder([this, &message, count, &stop_flood]() {
+        for (int i = 0; i < count && !stop_flood; ++i) {
+          while (!stop_flood && !peer->send(message)) {
+            std::this_thread::yield();  // socket full: the old side has not drained it yet
+          }
+        }
+      });
+      flood_joiner_t joiner {stop_flood, flooder};
+      const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+      while (peer->mains == 0 && std::chrono::steady_clock::now() < deadline) {
+        if (peer->pump(5ms) == peer_t::pump_end_e::eof) {
+          break;
+        }
+      }
+      const auto seen = std::chrono::steady_clock::now();
+      stop_flood = true;
+      flooder.join();
+      return seen;
+    }
+
     /// Expected tail of a rollback of a failed start (before the first switch substep).
     static std::vector<std::string> start_tail() {
       return {"answer:failed", "remove_new_instance_file"};
@@ -890,6 +944,7 @@ namespace {
     std::vector<std::string> handled;  ///< Types passed to the drain handler.
     bool handler_blocks {false};  ///< Whether the drain handler blocks until released.
     bool handler_release {false};  ///< Releases a blocked handler.
+    std::chrono::steady_clock::time_point first_handled_at {};  ///< When the drain handler was first called (guarded by `handler_mutex`).
   };
 }  // namespace
 
@@ -1879,18 +1934,21 @@ TEST_F(HandoffOldSideTest, FloodOfDrainRequestsWithBlockedHandlerDoesNotDelayHan
   start();
   ASSERT_TRUE(to_committed());
   const auto committed_at = std::chrono::steady_clock::now();
-  for (int i = 0; i < 2000; ++i) {
-    peer->send(protocol::sessions_request_t {static_cast<std::uint64_t>(i + 1)});  // may fail with EAGAIN once the socket is full
-    if (i % 40 == 0 && peer->mains == 0) {
-      peer->pump(2ms);
+  const protocol::message_t request = protocol::sessions_request_t {7};
+  const auto seen = flood_until_main(request, 2000);
+  EXPECT_EQ(1, peer->mains) << "MAIN must still arrive while the drain handler is blocked and requests flood in";
+  // Measured from the first blocked handler call, not from the start of the flood: a handover that waited for the
+  // handler would arrive about 700 ms after that call (the handler's cap), while a correct one arrives about the
+  // rollback window (200 ms) after COMMIT.
+  std::chrono::steady_clock::time_point base = committed_at;
+  {
+    std::lock_guard lock {handler_mutex};
+    if (!handled.empty()) {
+      base = first_handled_at;
     }
   }
-  if (peer->mains == 0) {
-    peer->pump(1500ms);
-  }
-  const auto elapsed = std::chrono::steady_clock::now() - committed_at;
-  EXPECT_EQ(1, peer->mains) << "MAIN must still arrive while the drain handler is blocked and requests flood in";
-  EXPECT_LT(elapsed, 650ms) << "the handover must not wait for the blocked drain handler (it would take until the handler's 700 ms cap)";
+  const auto elapsed = seen - base;
+  EXPECT_LT(elapsed, 650ms) << "the handover must not wait for the blocked drain handler (it would take until the handler's 700 ms cap after its first call)";
   {
     std::lock_guard lock {handler_mutex};
     handler_release = true;
@@ -1908,16 +1966,9 @@ TEST_F(HandoffOldSideTest, FloodOfPongsDoesNotDelayPingsOrHandover) {
   start();
   ASSERT_TRUE(to_committed());
   const auto committed_at = std::chrono::steady_clock::now();
-  for (int i = 0; i < 2000; ++i) {
-    peer->send(protocol::pong_t {100000});
-    if (i % 40 == 0 && peer->mains == 0) {
-      peer->pump(2ms);
-    }
-  }
-  if (peer->mains == 0) {
-    peer->pump(1500ms);
-  }
-  const auto elapsed = std::chrono::steady_clock::now() - committed_at;
+  const protocol::message_t pong = protocol::pong_t {100000};
+  const auto seen = flood_until_main(pong, 2000);
+  const auto elapsed = seen - committed_at;
   EXPECT_EQ(1, peer->mains) << "MAIN must arrive after a flood of PONGs";
   EXPECT_LT(elapsed, 900ms) << "the handover must happen about rollback_window after COMMIT despite the flood";
   EXPECT_GE(peer->pings.size(), 2U) << "PINGs keep being sent during the flood";
