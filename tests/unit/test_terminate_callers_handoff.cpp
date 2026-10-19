@@ -1223,6 +1223,24 @@ protected:
   }
 
   /**
+   * @brief Whether a reply is the drain guard's refusal rather than one of upstream's own 503 answers.
+   *
+   * Upstream also answers 503 when the encoder probe fails (no display in the test environment) and when `/resume`
+   * finds no running app, so a 503 alone does not show the guard refused.
+   *
+   * @param tree Parsed reply.
+   * @return `true` for a 503 whose `status_message` is not one of upstream's 503 messages.
+   */
+  static bool is_guard_refusal(const boost::property_tree::ptree &tree) {
+    if (status_code(tree) != 503) {
+      return false;
+    }
+    const auto message = tree.get<std::string>("root.<xmlattr>.status_message", "");
+    return message != "Failed to initialize video capture/encoding. Is a display connected and turned on?" &&
+           message != "No running app to resume";
+  }
+
+  /**
    * @brief A `/launch` query that passes the argument check.
    *
    * SPEC-QUESTION: the exact argument names are the upstream ones; a request that fails the argument check answers
@@ -1323,7 +1341,7 @@ TEST_F(HandoffCallersNvhttpTest, LaunchIsNotRefusedWithoutAPeer) {
 
   boost::property_tree::ptree tree;
   fetch(launch_target(), tree);
-  EXPECT_NE(status_code(tree), 503) << "without a peer the guard must not refuse /launch";
+  EXPECT_FALSE(is_guard_refusal(tree)) << "without a peer the guard must not refuse /launch";
 }
 
 TEST_F(HandoffCallersNvhttpTest, LaunchIsNotRefusedWhenThePeerHasNoSessions) {
@@ -1333,7 +1351,7 @@ TEST_F(HandoffCallersNvhttpTest, LaunchIsNotRefusedWhenThePeerHasNoSessions) {
 
   boost::property_tree::ptree tree;
   fetch(launch_target(), tree);
-  EXPECT_NE(status_code(tree), 503) << "a peer without sessions must not refuse /launch";
+  EXPECT_FALSE(is_guard_refusal(tree)) << "a peer without sessions must not refuse /launch";
   EXPECT_EQ(peer->list_calls.load(), 1) << "the guard must ask the peer once";
 }
 
@@ -1344,7 +1362,7 @@ TEST_F(HandoffCallersNvhttpTest, LaunchIsNotGuardedInNewPendingMode) {
 
   boost::property_tree::ptree tree;
   fetch(launch_target(), tree);
-  EXPECT_NE(status_code(tree), 503) << "mode new_pending must not refuse /launch";
+  EXPECT_FALSE(is_guard_refusal(tree)) << "mode new_pending must not refuse /launch";
   EXPECT_EQ(peer->list_calls.load(), 0) << "mode new_pending must send nothing";
 }
 
@@ -1367,7 +1385,7 @@ TEST_F(HandoffCallersNvhttpTest, ResumeIsNotGuarded) {
 
   boost::property_tree::ptree tree;
   fetch("/resume?uniqueid=0123456789ABCDEF&rikey=00112233445566778899aabbccddeeff&rikeyid=1", tree);
-  EXPECT_NE(status_code(tree), 503) << "/resume must not be guarded";
+  EXPECT_FALSE(is_guard_refusal(tree)) << "/resume must not be guarded";
   EXPECT_EQ(peer->list_calls.load(), 0) << "/resume must not ask the peer for sessions";
 }
 
