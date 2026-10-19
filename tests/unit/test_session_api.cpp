@@ -526,6 +526,7 @@ TEST_F(SessionApiHttpTest, GetSessionsReturnsEmptyListWhenAuthenticated) {
   const nlohmann::json expected {
     {"status", true},
     {"sessions", nlohmann::json::array()},
+    {"handoff", "none"},
   };
   EXPECT_EQ(json, expected);
 }
