@@ -312,6 +312,13 @@ namespace proc {
       // A concurrent drop_released_app() or terminate() may have set the id to -1: report 0 then, never -1.
       int id = _live.app_id.load();
       return id > 0 ? id : 0;
+    } else if (_live.app_id.load() <= 0 && _process) {
+      // A dropped or released app left an exited process object behind (drop_released_app() must not assign
+      // it from another thread). Forget it here, on the control thread, without terminate(): that would run the
+      // gamepad and process group cleanup against sessions this process took back.
+      _process = boost::process::v1::child();
+      _process_group = boost::process::v1::group();
+      return 0;
     } else if (_app.wait_all && _process_group && platf::process_group_running((std::uintptr_t) _process_group.native_handle())) {
       // The app is still running if any process in the group is still running
       return _live.app_id.load();
@@ -338,12 +345,16 @@ namespace proc {
     if (_live.released.load()) {
       // The app was released to another process: only drop the state. No undo command, no process group kill, no
       // tray, gamepad or display revert (the other process owns all of that now).
-      _live.placebo.store(false);
+      // The callers run on the control thread, so the process objects may be reset here (an exited auto-detached
+      // command can still be recorded in them).
       _app_prep_it = _app_prep_begin;
       _pipe.reset();
+      _process = boost::process::v1::child();
+      _process_group = boost::process::v1::group();
       _live.app_id.store(-1);
-      _live.pgid.store(0);
       _live.applied.store(0);
+      _live.pgid.store(0);
+      _live.placebo.store(false);
       _live.released.store(false);
       return;
     }
@@ -517,15 +528,16 @@ namespace proc {
       return false;
     }
 
-    _live.app_id.store(-1);
-    _live.applied.store(0);
-    _live.placebo.store(false);
-    _live.pgid.store(0);
-
-    // Not read by any other thread while the app is released; _process and _process_group stay untouched.
+    // First the non-atomic members, while placebo and released are still set: a concurrent running() then stays
+    // in its placebo branch and cannot reach terminate(). _process and _process_group stay untouched (running()
+    // and terminate() clear them on the control thread).
     _app_prep_it = _app_prep_begin;
     _pipe.reset();
 
+    _live.app_id.store(-1);
+    _live.applied.store(0);
+    _live.pgid.store(0);
+    _live.placebo.store(false);
     _live.released.store(false);
     return true;
   }
