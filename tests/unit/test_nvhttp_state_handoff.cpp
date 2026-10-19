@@ -317,6 +317,70 @@ TEST_F(NvhttpHandoffStateTest, FrozenBlocksClientEnableChangeFromWritingFile) {
   EXPECT_EQ(read_text(state_file), before) << "while frozen a client enable/disable save must not rewrite the state file";
 }
 
+// ---- legacy root.devices ----------------------------------------------------------------------------------------
+
+namespace {
+  /**
+   * @brief Build a state file with a legacy `root.devices` list, the pre-`named_devices` Sunshine shape.
+   *
+   * Each legacy entry has `uniqueid` and a `certs` list of PEM certificates; the loader imports it into
+   * `root.named_devices`.
+   *
+   * @param pem PEM certificate of the legacy client.
+   * @return The state file text.
+   */
+  std::string legacy_state_text(const std::string &pem) {
+    nlohmann::json legacy_entry {{"uniqueid", "legacy-device-uniqueid"}, {"certs", nlohmann::json::array({pem})}};
+    nlohmann::json state {
+      {"root", {{"uniqueid", "legacy-host-id"}, {"custom_key", "kept-value"}, {"devices", nlohmann::json::array({legacy_entry})}}},
+    };
+    return state.dump();
+  }
+}  // namespace
+
+TEST_F(NvhttpHandoffStateTest, LegacyDevicesAreImportedOnReload) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  write_text(state_file, legacy_state_text(credentials.x509));
+
+  EXPECT_EQ(nvhttp::reload_state(), nvhttp::load_status_e::loaded) << "a legacy state file with root.uniqueid must load";
+  EXPECT_TRUE(nvhttp::test_support::authorize_client_certificate(credentials.x509)) << "the legacy root.devices client must be imported on load";
+}
+
+TEST_F(NvhttpHandoffStateTest, SaveAfterLegacyLoadRemovesDevicesAndKeepsOtherKeys) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  write_text(state_file, legacy_state_text(credentials.x509));
+  ASSERT_EQ(nvhttp::reload_state(), nvhttp::load_status_e::loaded) << "precondition: the legacy file must load";
+
+  ASSERT_TRUE(nvhttp::save_state_checked()) << "a save over a loaded legacy file must return true";
+
+  const auto json = nlohmann::json::parse(read_text(state_file), nullptr, false);
+  ASSERT_FALSE(json.is_discarded()) << "the saved state file must be valid JSON";
+  ASSERT_TRUE(json.contains("root")) << "the saved state must keep the root object";
+  EXPECT_FALSE(json["root"].contains("devices")) << "the save must drop the legacy root.devices list";
+  EXPECT_EQ(json["root"].value("custom_key", std::string {}), "kept-value") << "keys other than the legacy list must be kept";
+  EXPECT_EQ(json["root"].value("uniqueid", std::string {}), "legacy-host-id") << "the host unique id must be kept";
+}
+
+TEST_F(NvhttpHandoffStateTest, UnpairedLegacyClientStaysUnknownAfterSaveAndReload) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  write_text(state_file, legacy_state_text(credentials.x509));
+  ASSERT_EQ(nvhttp::reload_state(), nvhttp::load_status_e::loaded) << "precondition: the legacy file must load";
+  ASSERT_TRUE(nvhttp::test_support::authorize_client_certificate(credentials.x509)) << "precondition: the legacy client must be imported";
+
+  const auto clients = nvhttp::get_all_clients();
+  ASSERT_EQ(clients.size(), 1u) << "precondition: exactly the one imported client must be paired";
+  // SPEC-QUESTION: the uuid key of get_all_clients() entries is not documented in nvhttp.h; "uuid" is assumed here.
+  const auto uuid = clients.front().value("uuid", std::string {});
+  ASSERT_FALSE(uuid.empty()) << "the imported client must have a uuid to unpair";
+
+  ASSERT_TRUE(nvhttp::unpair_client(uuid)) << "unpairing the imported client must succeed";
+  ASSERT_TRUE(nvhttp::save_state_checked()) << "the save after unpairing must succeed";
+  EXPECT_EQ(nvhttp::reload_state(), nvhttp::load_status_e::loaded) << "the saved state must reload as loaded";
+
+  EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509)) << "an unpaired legacy client must not be re-imported from root.devices on a later load";
+  EXPECT_EQ(nvhttp::get_all_clients().size(), 0u) << "no client may come back after the save and reload";
+}
+
 // ---- set_state_frozen / state_frozen ------------------------------------------------------------------------------
 
 TEST_F(NvhttpHandoffStateTest, StateFrozenFollowsSetStateFrozen) {
