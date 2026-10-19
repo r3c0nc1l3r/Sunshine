@@ -6,6 +6,9 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <utility>
 
 // lib includes
 #include <boost/core/null_deleter.hpp>
@@ -49,6 +52,21 @@ bl::sources::severity_logger<int> tests {10};  ///< Automatic tests output.
 
 BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", int)
 
+namespace {
+  std::mutex process_tag_mutex;  ///< Guards `process_tag_value`. Held only for a pointer copy or swap.
+  std::shared_ptr<const std::string> process_tag_value;  ///< Current process tag; null when none is set.
+
+  /**
+   * @brief Take a snapshot of the current process tag.
+   *
+   * @return Shared pointer to the tag without brackets, or null when no tag is set.
+   */
+  std::shared_ptr<const std::string> current_process_tag() {
+    std::lock_guard lock {process_tag_mutex};
+    return process_tag_value;
+  }
+}  // namespace
+
 namespace logging {
   deinit_t::~deinit_t() {
     deinit();
@@ -58,6 +76,25 @@ namespace logging {
     log_flush();
     bl::core::get()->remove_sink(sink);
     sink.reset();
+  }
+
+  void set_process_tag(std::string tag) {
+    std::shared_ptr<const std::string> value;
+    if (!tag.empty()) {
+      value = std::make_shared<const std::string>(std::move(tag));
+    }
+
+    // Swap under the lock and let the previous tag be released outside it.
+    std::shared_ptr<const std::string> previous;
+    {
+      std::lock_guard lock {process_tag_mutex};
+      previous = std::exchange(process_tag_value, std::move(value));
+    }
+  }
+
+  std::string process_tag() {
+    const auto tag = current_process_tag();
+    return tag ? *tag : std::string {};
   }
 
   /**
@@ -104,8 +141,15 @@ namespace logging {
     auto t = std::chrono::system_clock::to_time_t(now);
     auto lt = *std::localtime(&t);
 
+    // Read the tag once per record so the whole line uses one consistent value.
+    const auto tag = current_process_tag();
+
     os << "["sv << std::put_time(&lt, "%Y-%m-%d %H:%M:%S.") << boost::format("%03u") % ms.count() << "]: "sv
-       << log_type << view.attribute_values()[message].extract<std::string>();
+       << log_type;
+    if (tag) {
+      os << '[' << *tag << "] "sv;
+    }
+    os << view.attribute_values()[message].extract<std::string>();
   }
 #ifdef __ANDROID__
   namespace sinks = boost::log::sinks;
@@ -150,15 +194,19 @@ namespace logging {
   };
 #endif
 
-  [[nodiscard]] std::unique_ptr<deinit_t> init(int min_log_level, const std::string &log_file) {
+  [[nodiscard]] std::unique_ptr<deinit_t> init(int min_log_level, const std::string &log_file, bool append_no_rotate) {
     if (sink) {
       // Deinitialize the logging system before reinitializing it. This can probably only ever be hit in tests.
       deinit();
     }
 
-    const auto log_path = std::filesystem::path {std::u8string {log_file.begin(), log_file.end()}};
-    if (const auto rotation_error = rotate_log_file(log_path)) {
-      std::cerr << "Failed to rotate log file '" << log_file << "': " << rotation_error.message() << '\n';
+    // A drain-handoff child must not rename the running process's log away, so rotation is skipped on request.
+    if (!append_no_rotate) {
+      const auto log_path = std::filesystem::path {std::u8string {log_file.begin(), log_file.end()}};
+      // On failure the old file stays in place and is appended to below.
+      if (const auto rotation_error = rotate_log_file(log_path)) {
+        std::cerr << "Failed to rotate log file '" << log_file << "': " << rotation_error.message() << '\n';
+      }
     }
 
 #ifndef __ANDROID__
@@ -173,7 +221,8 @@ namespace logging {
     sink->locked_backend()->add_stream(stream);
 #endif
 
-    sink->locked_backend()->add_stream(boost::make_shared<std::ofstream>(log_file));
+    // Always append, so a process that shares the file with its predecessor never overwrites its data.
+    sink->locked_backend()->add_stream(boost::make_shared<std::ofstream>(log_file, std::ios::app));
     sink->set_filter(severity >= min_log_level);
     sink->set_formatter(&formatter);
 
