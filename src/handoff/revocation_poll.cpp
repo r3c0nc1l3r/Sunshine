@@ -8,11 +8,14 @@
 #include <cstring>
 #include <exception>
 #include <fcntl.h>
+#include <iterator>
+#include <map>
 #include <optional>
 #include <poll.h>
 #include <string>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
 #include <utility>
@@ -59,11 +62,17 @@ namespace handoff {
      * @return The content, or `std::nullopt` when it is missing, unreadable, empty or longer than 4 MiB.
      */
     std::optional<std::string> read_state_file(const std::filesystem::path &path) {
-      const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
       if (fd < 0) {
         return std::nullopt;
       }
       fd_guard_t guard {fd};
+
+      // Only a regular file is read: a FIFO, device or directory must never block the poller or hang stop().
+      struct stat st {};
+      if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return std::nullopt;
+      }
 
       std::string content;
       char buffer[8192];
@@ -255,6 +264,9 @@ namespace handoff {
       ++_failed_passes;
     };
 
+    // Raw PEM -> time of the last logged callback Error, so a persistently throwing callback is not logged every pass.
+    std::map<std::string, steady_t::time_point> error_logged;
+
     const auto pass = [&]() {
       auto content = read_state_file(_state_file);
       if (!content) {
@@ -292,11 +304,19 @@ namespace handoff {
           }
           _terminate(canonical);
           handled.insert(pem);
-        } catch (const std::exception &e) {
-          BOOST_LOG(error) << "Drain handoff: ending the sessions of a revoked client failed: " << e.what();
+          error_logged.erase(pem);
         } catch (...) {
-          BOOST_LOG(error) << "Drain handoff: ending the sessions of a revoked client failed";
+          const auto now = _now();
+          const auto it = error_logged.find(pem);
+          if (it == error_logged.end() || now - it->second >= warn_interval) {
+            error_logged[pem] = now;
+            BOOST_LOG(error) << "Drain handoff: ending the sessions of a revoked client failed";
+          }
         }
+      }
+      // Forget the Error timestamps of certificates that left the disabled set.
+      for (auto it = error_logged.begin(); it != error_logged.end();) {
+        it = disabled->count(it->first) != 0 ? std::next(it) : error_logged.erase(it);
       }
       _handled = std::move(handled);
       ++_passes;
