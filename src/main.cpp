@@ -721,7 +721,20 @@ int main(int argc, char *argv[]) {
     coordinator->join_attempt();
   }
   handoff::listeners().clear(handoff::listener_e::rtsp);
+#endif
 
+  // Released here, as upstream's scope end did, before the app terminate and the device and platform guards; declared
+  // early only for the new side's UPnP slot.
+  if (sync_upnp.valid()) {
+    sync_upnp.wait();
+  }
+  if (sync_mDNS.valid()) {
+    sync_mDNS.wait();
+  }
+  upnp_unmap.reset();
+  mDNS.reset();
+
+#ifdef __linux__
   handoff::note_shutdown_stage("client server thread (nvhttp)");
 #endif
   if (httpThread.joinable()) {
