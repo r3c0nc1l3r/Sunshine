@@ -154,8 +154,8 @@ namespace handoff {
    * @brief The terminate rule: before any terminate, get `ENDED` or see the draining process gone.
    *
    * With no draining process: `no_drain`. Otherwise: if the peer is already gone, `peer_gone`; else send `END_ALL`
-   * with the whole budget; `ended` → `ended`; on `rejected` or `no_reply`, `peer_gone` when the peer is gone by then,
-   * else `refused`. Never returns before the budget for `refused` unless the peer answered `rejected`.
+   * with the remaining budget; `ended` → `ended`; `rejected` is treated like `no_reply` (a timeout): the peer's pidfd is
+   * polled until the budget ends, `peer_gone` as soon as it is gone, else `refused` at the end of the budget.
    *
    * @param peer Draining peer.
    * @param budget 15 s for request paths, 5 s on the shutdown path.
