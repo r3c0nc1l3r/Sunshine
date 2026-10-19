@@ -2972,8 +2972,11 @@ namespace video {
       auto delay = backoff.on_run_end(run_duration, failed);
       if (delay > 0ms) {
         BOOST_LOG(warning) << "Encode run failed "sv << backoff.consecutive_failures() << " time(s), retrying in "sv << delay.count() << "ms"sv;
-        // Wake early if the stream shuts down while waiting
-        shutdown_event->view(delay);
+        // Wait in short slices so the backoff ends as soon as this session stops
+        auto deadline = std::chrono::steady_clock::now() + delay;
+        while (images->running() && !shutdown_event->peek() && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(20ms);
+        }
       }
     }
   }
