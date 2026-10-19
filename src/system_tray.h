@@ -197,7 +197,7 @@ namespace system_tray {
   struct tray_backend_t {
     int (*init)() = nullptr;  ///< Create the icon on the calling (main) thread. 0 on success.
     int (*loop)() = nullptr;  ///< Run one blocking event iteration. 0 to continue, non-zero when the loop ended.
-    void (*exit)() = nullptr;  ///< Ask `loop` to return non-zero and remove the icon. Callable from any thread.
+    void (*exit)() = nullptr;  ///< Ask `loop` to return non-zero and remove the icon. Callable from any thread, also under the lifecycle mutex: it must not wait for the loop thread and must not call back into the `system_tray` lifecycle functions.
     void (*poll)() = nullptr;  ///< Deliver pending events without blocking, on the loop thread (production: `tray_loop(0)`). Null: no-op.
   };
 
