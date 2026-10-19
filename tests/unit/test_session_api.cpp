@@ -9,6 +9,7 @@
 #include "../tests_common.h"
 
 // standard includes
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -1012,8 +1013,22 @@ TEST_F(SessionApiHttpTest, RateLimitLocksOutCorrectLoginAfterTenFailures) {
   const nlohmann::json body = nlohmann::json::parse(close_response->content.string());
   EXPECT_TRUE(body.is_object());
 
+  const auto retry_after = close_response->header.find("Retry-After");
+  ASSERT_NE(retry_after, close_response->header.end()) << "a 429 must carry a Retry-After header";
+  const std::string &retry_value = retry_after->second;
+  ASSERT_FALSE(retry_value.empty());
+  ASSERT_LE(retry_value.size(), 9U);
+  EXPECT_TRUE(std::all_of(retry_value.begin(), retry_value.end(), [](unsigned char c) {
+    return std::isdigit(c) != 0;
+  }))
+    << "Retry-After must be whole seconds, got: " << retry_value;
+  const long long retry_seconds = std::stoll(retry_value);
+  EXPECT_GE(retry_seconds, 1LL);
+  EXPECT_LE(retry_seconds, 300LL);
+
   const auto list_response = client->request("GET", "/api/sessions", "", auth_headers());
   EXPECT_EQ(list_response->status_code, "429 Too Many Requests");
+  EXPECT_NE(list_response->header.find("Retry-After"), list_response->header.end()) << "every 429 must carry Retry-After";
 
   EXPECT_EQ(stream::session::state(*session), stream::session::state_e::RUNNING) << "a locked-out request must not close the session";
 }
