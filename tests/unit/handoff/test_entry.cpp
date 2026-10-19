@@ -1364,7 +1364,7 @@ TEST_F(HandoffEntryProcessTest, PostCommitDeliversEndedToAWaitingEndAll) {
   }
   protocol::ended_t reply;
   reply.request_id = request->request_id;
-  ASSERT_TRUE(peer->send(reply));
+  EXPECT_TRUE(peer->send(reply));
   caller.join();
   EXPECT_EQ(result.load(), static_cast<int>(reply_e::ended)) << "ENDED must be routed to deliver, which completes the waiting end_all";
 }
@@ -1391,7 +1391,7 @@ TEST_F(HandoffEntryProcessTest, PostCommitDeliversEndRejected) {
   }
   protocol::end_rejected_t reply;
   reply.request_id = request->request_id;
-  ASSERT_TRUE(peer->send(reply));
+  EXPECT_TRUE(peer->send(reply));
   caller.join();
   EXPECT_EQ(result.load(), static_cast<int>(reply_e::rejected)) << "END_REJECTED must be routed to deliver";
 }
@@ -1423,7 +1423,7 @@ TEST_F(HandoffEntryProcessTest, PostCommitDeliversASessionsReply) {
   entry.transport = "udp/ipv4";
   entry.client_category = "lan";
   reply.sessions.push_back(entry);
-  ASSERT_TRUE(peer->send(reply));
+  EXPECT_TRUE(peer->send(reply));
   caller.join();
   ASSERT_TRUE(sessions.has_value()) << "SESSIONS must be routed to deliver";
   ASSERT_EQ(sessions->size(), 1u);

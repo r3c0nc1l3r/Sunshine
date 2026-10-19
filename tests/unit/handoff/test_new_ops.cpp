@@ -715,8 +715,9 @@ TEST_F(HandoffNewOpsTest, OnMainIsIdempotent) {
 
 TEST_F(HandoffNewOpsTest, OnMainBeforeCommittedIsIgnored) {
   run_pre_commit();
+  const auto before = rec.all().size();
   ops->on_main();
-  EXPECT_EQ(rec.all().size(), 0u) << "on_main before COMMIT must call no seam (a confused peer must not make this the main process)";
+  EXPECT_EQ(rec.all().size(), before) << "on_main before COMMIT must call no seam (a confused peer must not make this the main process)";
   EXPECT_FALSE(handoff::runtime().is_main()) << "on_main before COMMIT must not set the main flag";
   EXPECT_EQ(handoff::runtime().mode(), handoff::mode_e::new_pending) << "mode must not change";
   EXPECT_EQ(ops->stage(), new_stage_e::go) << "stage must not change";
@@ -818,7 +819,7 @@ TEST_F(HandoffNewOpsTest, ProbeOverrideIsInstalledBeforeTheWaiterReturns) {
     result = ops->wait_probe_decision(3000ms);
     installed_when_returned = probe_installed.load();
   });
-  ASSERT_TRUE(wait_until([&] {
+  EXPECT_TRUE(wait_until([&] {
     return waiting.load();
   },
                          1000ms));
@@ -1125,7 +1126,13 @@ TEST_F(HandoffNewOpsTest, StartServersPausedReturnsEmptyAfterFourListeningCalls)
     std::this_thread::sleep_for(10ms);
     ops->server_listening();
   }
-  ASSERT_EQ(future.wait_for(1500ms), std::future_status::ready) << "start_servers_paused must return after the fourth server_listening";
+  if (future.wait_for(1500ms) != std::future_status::ready) {
+    ops->abort();
+    ops->servers_failed("test timeout");
+    ops->mark_finished();
+    future.wait_for(1s);
+    ADD_FAILURE() << "start_servers_paused must return after the fourth server_listening";
+  }
   worker.join();
   EXPECT_EQ(future.get(), "") << "success is the empty string";
   EXPECT_EQ(ops->stage(), new_stage_e::ready) << "stage ready after success";
@@ -1158,7 +1165,13 @@ TEST_F(HandoffNewOpsTest, ServersFailedWakesStartServersPausedWithTheReason) {
   });
   std::this_thread::sleep_for(30ms);
   ops->servers_failed("HTTP interface failed to initialize");
-  ASSERT_EQ(future.wait_for(1500ms), std::future_status::ready) << "servers_failed must wake start_servers_paused";
+  if (future.wait_for(1500ms) != std::future_status::ready) {
+    ops->abort();
+    ops->servers_failed("test timeout");
+    ops->mark_finished();
+    future.wait_for(1s);
+    ADD_FAILURE() << "servers_failed must wake start_servers_paused";
+  }
   worker.join();
   EXPECT_EQ(future.get(), "HTTP interface failed to initialize") << "the reason given to servers_failed";
 }
@@ -1188,7 +1201,13 @@ TEST_F(HandoffNewOpsTest, AbortWakesStartServersPaused) {
   });
   std::this_thread::sleep_for(30ms);
   ops->abort();
-  ASSERT_EQ(future.wait_for(1500ms), std::future_status::ready) << "abort() must end the wait for the servers";
+  if (future.wait_for(1500ms) != std::future_status::ready) {
+    ops->abort();
+    ops->servers_failed("test timeout");
+    ops->mark_finished();
+    future.wait_for(1s);
+    ADD_FAILURE() << "abort() must end the wait for the servers";
+  }
   worker.join();
   EXPECT_NE(future.get(), "") << "an aborted wait is a failure (non-empty reason)";
 }
@@ -1203,7 +1222,13 @@ TEST_F(HandoffNewOpsTest, MarkFinishedWakesStartServersPaused) {
   });
   std::this_thread::sleep_for(30ms);
   ops->mark_finished();
-  ASSERT_EQ(future.wait_for(1500ms), std::future_status::ready) << "mark_finished must wake start_servers_paused";
+  if (future.wait_for(1500ms) != std::future_status::ready) {
+    ops->abort();
+    ops->servers_failed("test timeout");
+    ops->mark_finished();
+    future.wait_for(1s);
+    ADD_FAILURE() << "mark_finished must wake start_servers_paused";
+  }
   worker.join();
 }
 
