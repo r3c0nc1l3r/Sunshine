@@ -17,6 +17,7 @@
   #include <cstring>
   #include <filesystem>
   #include <fstream>
+  #include <iterator>
   #include <optional>
   #include <poll.h>
   #include <string>
@@ -565,20 +566,48 @@ TEST_F(HandoffControlTest, ServerReplacesStaleFileAtPath) {
   temp_dir_t tmp;
   fs::path path = hf::control_socket_path(tmp.path, 4242);
   fs::create_directories(path.parent_path());
+  // A stale socket: bound, then closed without unlinking, as a crashed process would leave it.
   {
-    std::ofstream stale(path);
-    stale << "stale";
+    int stale = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    ASSERT_GE(stale, 0) << "the test must create a socket for the stale file";
+    sockaddr_un addr = make_addr(path);
+    ASSERT_EQ(bind(stale, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)), 0)
+      << "the test must bind the stale socket at the path";
+    close(stale);
   }
+  ASSERT_TRUE(fs::exists(path)) << "precondition: the stale socket file is still on disk";
   hf::control_server_t server;
   std::string error;
   ASSERT_TRUE(server.start(path, [](pid_t) {
     return hf::control_reply_t {hf::reply_kind_e::refused, "fresh", 0, 0};
   },
                            &error))
-    << "start must replace a stale file at the socket path, error: " << error;
+    << "start must replace a stale socket file at the path, error: " << error;
   auto line = talk(path, "handoff\n");
   ASSERT_TRUE(line.has_value()) << "the replaced socket must accept connections";
   EXPECT_EQ(*line, "refused fresh\n") << "the server behind the replaced path must answer the handoff verb";
+}
+
+TEST_F(HandoffControlTest, ServerRefusesToReplaceRegularFile) {
+  temp_dir_t tmp;
+  fs::path path = hf::control_socket_path(tmp.path, 4242);
+  fs::create_directories(path.parent_path());
+  {
+    std::ofstream other(path);
+    other << "keep me";
+  }
+  hf::control_server_t server;
+  std::string error;
+  bool ok = server.start(path, [](pid_t) {
+    return hf::control_reply_t {hf::reply_kind_e::refused, "x", 0, 0};
+  },
+                         &error);
+  EXPECT_FALSE(ok) << "start must fail when a regular file (not a stale socket) sits at the path";
+  EXPECT_FALSE(error.empty()) << "a failed start must write a reason to the error string";
+  ASSERT_TRUE(fs::is_regular_file(path)) << "the regular file at the path must not be removed";
+  std::ifstream in(path);
+  std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  EXPECT_EQ(content, "keep me") << "the regular file's content must be left untouched";
 }
 
 TEST_F(HandoffControlTest, ServerWritesHandlerReply) {
