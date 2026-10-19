@@ -8,7 +8,9 @@
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <charconv>
+#include <chrono>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -25,6 +27,7 @@
 #include <boost/filesystem.hpp>
 #include <lizardbyte/common/env.h>
 #include <nlohmann/json.hpp>
+#include <openssl/crypto.h>
 #include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_https.hpp>
 
@@ -37,6 +40,7 @@
 #endif
 
 // local includes
+#include "auth_rate_limit.h"
 #include "config.h"
 #include "confighttp.h"
 #include "crypto.h"
@@ -588,6 +592,76 @@ namespace confighttp {
   }
 
   /**
+   * @brief Process-wide failed-login limiter used by `authenticate()`.
+   * @return The shared limiter instance.
+   */
+  auth_rate_limiter_t &get_auth_rate_limiter() {
+    static auth_rate_limiter_t limiter;
+    return limiter;
+  }
+
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Whether the failed-login rate limit is enforced. Test builds start with it disabled.
+   */
+  std::atomic<bool> auth_rate_limit_enabled {false};
+#endif
+
+  /**
+   * @brief Check whether the failed-login rate limit is enforced.
+   * @return True in production builds, and in test builds once the test hook has enabled it.
+   */
+  bool is_auth_rate_limit_enabled() {
+#ifdef SUNSHINE_TESTS
+    return auth_rate_limit_enabled.load();
+#else
+    return true;
+#endif
+  }
+
+  /**
+   * @brief Split a Basic `Authorization` header value into username and password.
+   * @param raw_auth The `Authorization` header value.
+   * @return Username and password, or an empty optional when the scheme is not Basic, the base64 payload has no
+   *         colon, or the password is empty.
+   */
+  std::optional<std::pair<std::string, std::string>> parse_basic_credentials(std::string_view raw_auth) {
+    constexpr auto basic_prefix = "Basic "sv;
+    if (!boost::istarts_with(raw_auth, basic_prefix)) {
+      return std::nullopt;
+    }
+
+    const auto auth_data = SimpleWeb::Crypto::Base64::decode(std::string(raw_auth.substr(basic_prefix.size())));
+    const auto index = auth_data.find(':');
+    if (index == std::string::npos || index + 1 == auth_data.size()) {
+      return std::nullopt;
+    }
+
+    return std::pair {auth_data.substr(0, index), auth_data.substr(index + 1)};
+  }
+
+  /**
+   * @brief Send a 429 Too Many Requests response for a source that is locked out.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   */
+  void send_too_many_requests(const resp_https_t &response, [[maybe_unused]] const req_https_t &request) {
+    constexpr auto code = SimpleWeb::StatusCode::client_error_too_many_requests;
+
+    nlohmann::json tree;
+    tree["status_code"] = code;
+    tree["status"] = false;
+    tree["error"] = "Too many failed login attempts";
+
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "application/json");
+    headers.emplace("X-Frame-Options", "DENY");
+    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+
+    response->write(code, tree.dump(), headers);
+  }
+
+  /**
    * @brief Authenticate the user.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -608,6 +682,13 @@ namespace confighttp {
       return false;
     }
 
+    const auto now = std::chrono::steady_clock::now();
+    const bool rate_limited = is_auth_rate_limit_enabled();
+    if (rate_limited && get_auth_rate_limiter().blocked(address, now)) {
+      send_too_many_requests(response, request);
+      return false;
+    }
+
     auto fg = util::fail_guard([&]() {
       send_unauthorized(response, request);
     });
@@ -617,24 +698,41 @@ namespace confighttp {
       return false;
     }
 
-    const auto &rawAuth = auth->second;
-    auto authData = SimpleWeb::Crypto::Base64::decode(rawAuth.substr("Basic "sv.length()));
+    bool valid = false;
+    if (const auto credentials = parse_basic_credentials(auth->second)) {
+      const auto &[username, password] = *credentials;
+      const auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
 
-    const auto index = static_cast<int>(authData.find(':'));
-    if (index >= authData.size() - 1) {
-      return false;
+      // Evaluate both checks without short-circuiting, and compare the password hash in constant time
+      const bool username_matches = boost::iequals(username, config::sunshine.username);
+      const bool password_matches = hash.size() == config::sunshine.password.size() &&
+                                    CRYPTO_memcmp(hash.data(), config::sunshine.password.data(), hash.size()) == 0;
+      valid = username_matches && password_matches;
     }
 
-    const auto username = authData.substr(0, index);
-    const auto password = authData.substr(index + 1);
-
-    if (const auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string(); !boost::iequals(username, config::sunshine.username) || hash != config::sunshine.password) {
+    if (!valid) {
+      if (rate_limited && get_auth_rate_limiter().on_failure(address, now)) {
+        BOOST_LOG(warning) << "Web UI: ["sv << address << "] -- too many failed login attempts; requests from this address are refused until the window expires"sv;
+      }
       return false;
     }
 
     fg.disable();
     return true;
   }
+
+#ifdef SUNSHINE_TESTS
+  namespace testing {
+    /**
+     * @brief Enable or disable the failed-login rate limit and clear the tracked sources.
+     * @param enabled True to enforce the failed-login rate limit, false to skip it.
+     */
+    void set_auth_rate_limit_enabled(bool enabled) {
+      auth_rate_limit_enabled = enabled;
+      get_auth_rate_limiter().clear();
+    }
+  }  // namespace testing
+#endif
 
   /**
    * @brief Send a 404 Not Found response.
@@ -716,11 +814,8 @@ namespace confighttp {
   std::string get_client_id(const req_https_t &request) {
     // Try to use the authenticated username as client ID
     if (const auto auth = request->header.find("authorization"); !config::sunshine.username.empty() && auth != request->header.end()) {
-      if (const auto &rawAuth = auth->second; rawAuth.rfind("Basic "sv, 0) == 0) {
-        auto authData = SimpleWeb::Crypto::Base64::decode(rawAuth.substr("Basic "sv.length()));
-        if (const auto index = static_cast<int>(authData.find(':')); index < authData.size() - 1) {
-          return authData.substr(0, index);  // Return username
-        }
+      if (const auto credentials = parse_basic_credentials(auth->second)) {
+        return credentials->first;  // Return username
       }
     }
 
@@ -832,24 +927,16 @@ namespace confighttp {
     // A browser-like request arrived with an Origin/Referer that doesn't match an allowed origin.
     // Require a CSRF token.
     const std::string_view blocked_origin = (origin_it != request->header.end()) ? origin_it->second : referer_it->second;
-    // Extract token from X-CSRF-Token header
+    // The token is accepted only from the X-CSRF-Token header; a token in the query string is ignored
     const auto header_it = request->header.find("X-CSRF-Token");
     if (header_it == request->header.end()) {
-      // Also check query parameters as fallback
-      auto query_params = request->parse_query_string();
-      const auto query_it = query_params.find("csrf_token");
-      if (query_it == query_params.end()) {
-        auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request from origin: "sv << blocked_origin;
-        BOOST_LOG(error) << "Web UI: To allow this origin, add it to the 'csrf_allowed_origins' option in your Sunshine configuration"sv;
-        bad_request(response, request, "Missing CSRF token");
-        return false;
-      }
-
-      return validate_stored_csrf_token(response, request, client_id, query_it->second);
+      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+      BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request from origin: "sv << blocked_origin;
+      BOOST_LOG(error) << "Web UI: To allow this origin, add it to the 'csrf_allowed_origins' option in your Sunshine configuration"sv;
+      bad_request(response, request, "Missing CSRF token");
+      return false;
     }
 
-    // Validate token from header
     return validate_stored_csrf_token(response, request, client_id, header_it->second);
   }
 
@@ -1440,7 +1527,7 @@ namespace confighttp {
    * @brief Log one session close request made through the API.
    * @param id Session id as logged; for `bad-id` and `csrf-rejected`, the sanitised path id.
    * @param source Normalized address of the client that made the request.
-   * @param result `closed`, `not-found`, `csrf-rejected` or `bad-id`.
+   * @param result `closed`, `already-stopping`, `not-found`, `csrf-rejected` or `bad-id`.
    */
   void log_session_close(const std::string &id, const std::string &source, std::string_view result) {
     BOOST_LOG(info) << "Session close requested via API: id="sv << id << ", user="sv << config::sunshine.username << ", source="sv << source << ", result="sv << result;
@@ -1475,9 +1562,10 @@ namespace confighttp {
   /**
    * @brief Close one streaming session through the normal stop path.
    *
-   * Requires admin authentication and, for cross-origin requests, a valid CSRF token. Every request that passes
-   * authentication is logged at Info with the admin user, the client address and the result (`closed`,
-   * `not-found`, `csrf-rejected` or `bad-id`). The log line never contains credentials or the CSRF token.
+   * Requires admin authentication and, for cross-origin requests, a valid CSRF token in the `X-CSRF-Token` header.
+   * Every request that passes authentication is logged at Info with the admin user, the client address and the
+   * result (`closed`, `already-stopping`, `not-found`, `csrf-rejected` or `bad-id`). A session that is already
+   * stopping gets 200 like a session this request stopped. The log line never contains credentials or the CSRF token.
    *
    * @api_examples{/api/sessions/1/close| POST| null}
    */
@@ -1505,12 +1593,13 @@ namespace confighttp {
       return;
     }
 
-    const bool closed = rtsp_stream::request_session_close(session_id);
-    log_session_close(std::to_string(session_id), source, closed ? "closed"sv : "not-found"sv);
-    if (!closed) {
+    const auto result = rtsp_stream::request_session_close(session_id);
+    if (result == rtsp_stream::close_result_e::not_found) {
+      log_session_close(std::to_string(session_id), source, "not-found"sv);
       not_found(response, request, "Session not found");
       return;
     }
+    log_session_close(std::to_string(session_id), source, result == rtsp_stream::close_result_e::closed ? "closed"sv : "already-stopping"sv);
 
     nlohmann::json output_tree;
     output_tree["status"] = true;
