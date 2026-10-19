@@ -50,12 +50,17 @@ namespace handoff::protocol {
   };
 
   /**
-   * @brief Encoder capability flags that `/serverinfo` reports.
+   * @brief Encoder probe results that `/serverinfo` uses (`video::active_hevc_mode`, `video::active_av1_mode`,
+   * `video::last_encoder_probe_supported_yuv444_for_codec`). Wire members: `hevc_mode` and `av1_mode` (integers 0 to 5,
+   * the range of the `hevc_mode`/`av1_mode` settings, where 4 and 5 are the 4:4:4 variants), `yuv444_h264`,
+   * `yuv444_hevc` and `yuv444_av1` (booleans).
    */
   struct probe_results_t {
-    int hevc_mode {0};  ///< HEVC mode as reported by `/serverinfo` (0 to 3).
-    int av1_mode {0};  ///< AV1 mode as reported by `/serverinfo` (0 to 3).
-    bool yuv444 {false};  ///< 4:4:4 support.
+    int hevc_mode {0};  ///< `video::active_hevc_mode` after the probe (0 to 5).
+    int av1_mode {0};  ///< `video::active_av1_mode` after the probe (0 to 5).
+    bool yuv444_h264 {false};  ///< `last_encoder_probe_supported_yuv444_for_codec[0]`.
+    bool yuv444_hevc {false};  ///< `last_encoder_probe_supported_yuv444_for_codec[1]`.
+    bool yuv444_av1 {false};  ///< `last_encoder_probe_supported_yuv444_for_codec[2]`.
 
     /**
      * @brief Compare two result sets field by field.
