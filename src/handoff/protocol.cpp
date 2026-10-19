@@ -349,7 +349,7 @@ namespace handoff::protocol {
      * @return `true` when every member is present and valid; `launch_env` entries must be two-string arrays.
      */
     bool read(const json &object, app_snapshot_t &out) {
-      if (!object.is_object() || !int_field(object, "app_id", std::numeric_limits<int>::min(), std::numeric_limits<int>::max(), out.app_id) || !field(object, "name", out.name) || !field(object, "applied_prep", out.applied_prep) || !field(object, "digest", out.digest)) {
+      if (!object.is_object() || !int_field(object, "app_id", std::numeric_limits<int>::min(), std::numeric_limits<int>::max(), out.app_id) || !field(object, "name", out.name) || !field(object, "applied_prep", out.applied_prep) || !field(object, "digest", out.digest) || !is_lower_hex_sha256(out.digest)) {
         return false;
       }
       const json *env = find_member(object, "launch_env");
