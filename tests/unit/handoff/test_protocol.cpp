@@ -232,7 +232,9 @@ TEST(HandoffProtocolTest, RoundTripEmptyOptionalMessagesOfEveryType) {
   close_reply.result = "closed";
   messages.emplace_back(close_reply);
 
-  messages.emplace_back(proto::close_cert_request_t {});
+  proto::close_cert_request_t close_cert_empty;
+  close_cert_empty.cert_sha256 = kCertHash;
+  messages.emplace_back(close_cert_empty);
   messages.emplace_back(proto::close_cert_reply_t {});
   messages.emplace_back(proto::end_all_t {});
   messages.emplace_back(proto::ended_t {});
