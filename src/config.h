@@ -426,8 +426,9 @@ namespace config {
    * implementation must use its own strict parser. `int_f` and `parse_config_integer` in `config.cpp` accept hex and
    * must not be reused for these keys. Values are never clamped. Quoted numbers (`"3600"`) are "other characters".
    * Note: the config-file parser drops a `key =` line with an empty value before options are applied (upstream
-   * behaviour, unchanged), so an empty value in the file means the default; an empty value that reaches
-   * `apply_config` directly (for example in a test) is invalid as above. Parse errors are logged even when
+   * behaviour, unchanged), so an empty value means the default. `apply_config_for_test` parses its text the same
+   * way, so this holds there too. The strict parser treats empty text as invalid only if it is ever handed an
+   * empty string by another path. Parse errors are logged even when
    * `drain_handoff` is `disabled`.
    *
    * Validation runs in `apply_config` after `port` is set, against the configured `port`, through
