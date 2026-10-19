@@ -1,0 +1,28 @@
+# Drain handoff: optional systemd drop-in for Sunshine (opt-in).
+#
+# This file is an example and is not active where the package installs it. To turn the feature on:
+#
+# 1. Set "drain_handoff = enabled" in the Sunshine configuration.
+# 2. Copy this file to the drop-in directory of the unit:
+#      ~/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d/drain-handoff.conf   (user unit)
+#    A system unit needs the same file in its own drop-in directory, with the RuntimeDirectory line
+#    below uncommented.
+# 3. Run "systemctl --user daemon-reload", then "systemctl --user restart app-dev.lizardbyte.app.Sunshine.service"
+#    once, so the unit runs as Type=notify.
+#
+# After that, "systemctl --user reload app-dev.lizardbyte.app.Sunshine.service" runs the handoff (ExecReload).
+# The helper exits 0 only when the switch happened and the new process is active; see docs/drain-handoff.md.
+#
+# With this drop-in, Sunshine sends READY=1 also when the feature is disabled. Without it, a unit that
+# is Type=simple refuses every handoff. Needs systemd 254 or newer.
+
+[Service]
+# Only the main process may send READY=1 or MAINPID, so launched apps and commands cannot.
+Type=notify
+NotifyAccess=main
+# Runs the handoff: the new process takes over, and this unit's main process drains.
+ExecReload=@SUNSHINE_EXECUTABLE_PATH@ --drain-handoff $MAINPID
+# Time allowed for a draining process to stop.
+TimeoutStopSec=30
+# System units only (uncomment):
+# RuntimeDirectory=sunshine
