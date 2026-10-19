@@ -12,6 +12,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <poll.h>
 #include <sstream>
 #include <sys/eventfd.h>
@@ -38,6 +40,7 @@ namespace handoff {
 
     constexpr std::size_t max_request_bytes = 256;  ///< Longest request line, newline included.
     constexpr std::size_t max_reply_bytes = 4096;  ///< Longest reply line the helper accepts, newline included.
+    constexpr std::size_t max_reason_bytes = 1000;  ///< Longest reason in a reply line; the rest is cut.
     constexpr std::chrono::milliseconds server_io_timeout {2000};  ///< Server read and write bound per connection.
 
     /**
@@ -290,45 +293,6 @@ namespace handoff {
     }
 
     /**
-     * @brief Server thread body: accept and serve one connection at a time until the wake fd is signalled.
-     *
-     * @param listen_fd Listening socket.
-     * @param wake_fd Eventfd written by `stop()`.
-     * @param handler Verb handler.
-     */
-    void serve_loop(int listen_fd, int wake_fd, control_server_t::handler_t handler) {
-      while (true) {
-        pollfd fds[2] = {{listen_fd, POLLIN, 0}, {wake_fd, POLLIN, 0}};
-        if (::poll(fds, 2, -1) < 0) {
-          if (errno == EINTR) {
-            continue;
-          }
-          BOOST_LOG(error) << "Drain handoff: control socket poll failed: " << std::strerror(errno);
-          return;
-        }
-
-        if (fds[1].revents != 0) {
-          return;
-        }
-
-        if (fds[0].revents != 0) {
-          const int client = ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
-          if (client < 0) {
-            if (errno != EINTR && errno != EAGAIN && errno != ECONNABORTED) {
-              BOOST_LOG(error) << "Drain handoff: control socket accept failed: " << std::strerror(errno);
-              // Back off so a persistent error (for example out of descriptors) does not spin the thread.
-              std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            continue;
-          }
-
-          fd_guard_t guard(client);
-          serve_connection(client, handler);
-        }
-      }
-    }
-
-    /**
      * @brief Parse a positive decimal process id.
      *
      * @param text Text to parse.
@@ -362,6 +326,194 @@ namespace handoff {
       }
       return "refused";
     }
+
+    /**
+     * @brief Identity of a socket file: device and inode.
+     */
+    using file_id_t = std::pair<dev_t, ino_t>;
+
+    std::mutex bound_mutex;  ///< Guards `bound_ids`.
+    std::map<const control_server_t *, file_id_t> bound_ids;  ///< Socket file each server bound, by server.
+
+    /**
+     * @brief Record the socket file a server bound (the header has no member for it).
+     *
+     * @param server Server.
+     * @param id Device and inode of the socket file; `std::nullopt` forgets the entry.
+     */
+    void set_bound_id(const control_server_t *server, std::optional<file_id_t> id) {
+      std::lock_guard lock(bound_mutex);
+      if (id) {
+        bound_ids[server] = *id;
+      } else {
+        bound_ids.erase(server);
+      }
+    }
+
+    /**
+     * @brief The socket file a server bound.
+     *
+     * @param server Server.
+     * @return Device and inode, or `std::nullopt` when none is recorded.
+     */
+    std::optional<file_id_t> get_bound_id(const control_server_t *server) {
+      std::lock_guard lock(bound_mutex);
+      const auto it = bound_ids.find(server);
+      return it == bound_ids.end() ? std::nullopt : std::optional<file_id_t> {it->second};
+    }
+
+    /**
+     * @brief Make a directory and its missing parents; created directories get mode 0700.
+     *
+     * @param dir Directory.
+     * @param error Receives a one-line reason on failure.
+     * @return `true` when `dir` exists as a directory afterwards.
+     */
+    bool make_directories_0700(const fs::path &dir, std::string &error) {
+      if (dir.empty() || dir == dir.root_path()) {
+        return true;
+      }
+      struct stat st {};
+      if (::stat(dir.c_str(), &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+          error = "a parent of the control directory is not a directory";
+          return false;
+        }
+        return true;
+      }
+      if (errno != ENOENT) {
+        error = std::string("cannot inspect the control directory path: ") + std::strerror(errno);
+        return false;
+      }
+      if (!make_directories_0700(dir.parent_path(), error)) {
+        return false;
+      }
+      if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) {
+        error = std::string("cannot create the control directory: ") + std::strerror(errno);
+        return false;
+      }
+      return true;
+    }
+
+    /**
+     * @brief Create the control directory if needed and check and fix it: it must be a real directory (not a
+     * symlink) owned by the effective user, and gets mode 0700.
+     *
+     * @param dir Control directory.
+     * @param error Receives a one-line reason on failure.
+     * @return `true` when the directory is safe to use.
+     */
+    bool prepare_control_directory(const fs::path &dir, std::string &error) {
+      if (!make_directories_0700(dir.parent_path(), error)) {
+        return false;
+      }
+      if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) {
+        error = std::string("cannot create the control directory: ") + std::strerror(errno);
+        return false;
+      }
+
+      // O_NOFOLLOW makes a symlink fail here; the checks and the chmod then act on the opened directory itself.
+      fd_guard_t fd(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+      if (fd.get() < 0) {
+        error = std::string("the control directory is not a real directory: ") + std::strerror(errno);
+        return false;
+      }
+      struct stat st {};
+      if (::fstat(fd.get(), &st) != 0) {
+        error = std::string("cannot inspect the control directory: ") + std::strerror(errno);
+        return false;
+      }
+      if (!S_ISDIR(st.st_mode) || st.st_uid != ::geteuid()) {
+        error = "the control directory is not owned by the current user";
+        return false;
+      }
+      if (::fchmod(fd.get(), 0700) != 0) {
+        error = std::string("cannot set the control directory mode: ") + std::strerror(errno);
+        return false;
+      }
+      return true;
+    }
+
+    /**
+     * @brief Bind and listen on a socket path, replacing a stale socket file.
+     *
+     * The listening socket is non-blocking: the server thread accepts only after `poll()` and under the server lock.
+     *
+     * @param path Socket path.
+     * @param listen_fd Receives the listening fd on success.
+     * @param id Receives device and inode of the new socket file on success.
+     * @param error Receives a one-line reason on failure.
+     * @return `true` on success.
+     */
+    bool bind_listener(const fs::path &path, int &listen_fd, file_id_t &id, std::string &error) {
+      if (!prepare_control_directory(path.parent_path().empty() ? fs::path(".") : path.parent_path(), error)) {
+        return false;
+      }
+
+      // Replace a stale socket left by a previous run; never remove anything else.
+      struct stat st {};
+      if (::lstat(path.c_str(), &st) == 0) {
+        if (!S_ISSOCK(st.st_mode)) {
+          error = "the socket path exists and is not a socket";
+          return false;
+        }
+        if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+          error = std::string("cannot remove the stale socket: ") + std::strerror(errno);
+          return false;
+        }
+      } else if (errno != ENOENT) {
+        error = std::string("cannot inspect the socket path: ") + std::strerror(errno);
+        return false;
+      }
+
+      sockaddr_un addr {};
+      if (!make_address(path, addr)) {
+        error = "socket path too long";
+        return false;
+      }
+
+      fd_guard_t listener(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+      if (listener.get() < 0) {
+        error = std::string("socket: ") + std::strerror(errno);
+        return false;
+      }
+
+      // The socket file is created inside the 0700 control directory and made 0600 right after bind. The process
+      // umask is not touched: it is process-wide and would race other threads.
+      if (::bind(listener.get(), reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0) {
+        error = std::string("bind: ") + std::strerror(errno);
+        return false;
+      }
+      // From here the file is ours; record its identity first so that a failure can unlink exactly it.
+      if (::lstat(path.c_str(), &st) != 0) {
+        error = std::string("cannot inspect the new socket: ") + std::strerror(errno);
+        return false;
+      }
+      id = {st.st_dev, st.st_ino};
+      if (::chmod(path.c_str(), 0600) != 0 || ::listen(listener.get(), 8) != 0) {
+        error = std::string("listen or chmod: ") + std::strerror(errno);
+        ::unlink(path.c_str());
+        return false;
+      }
+
+      listen_fd = listener.release();
+      return true;
+    }
+
+    /**
+     * @brief Increment an eventfd so that a thread polling it wakes.
+     *
+     * @param fd Eventfd; negative values are ignored.
+     */
+    void signal_wake(int fd) {
+      if (fd < 0) {
+        return;
+      }
+      const std::uint64_t one = 1;
+      if (::write(fd, &one, sizeof(one)) < 0) {
+        BOOST_LOG(error) << "Drain handoff: cannot wake the control socket thread: " << std::strerror(errno);
+      }
+    }
   }  // namespace
 
   fs::path control_socket_path(const fs::path &runtime_dir, pid_t pid) {
@@ -373,8 +525,10 @@ namespace handoff {
       return "committed " + std::to_string(reply.new_pid) + " " + std::to_string(reply.new_start_time) + "\n";
     }
 
-    std::string text = reply.reason;
+    // One line, and short enough for the helper's reply limit.
+    std::string text = reply.reason.substr(0, max_reason_bytes);
     std::replace(text.begin(), text.end(), '\n', ' ');
+    std::replace(text.begin(), text.end(), '\r', ' ');
     const std::string keyword(kind_name(reply.kind));
     return text.empty() ? keyword + "\n" : keyword + " " + text + "\n";
   }
@@ -467,16 +621,17 @@ namespace handoff {
         std::ostringstream content;
         content << in.rdbuf();
         const auto instance = parse_instance(content.str());
-        if (instance && instance->role == role_e::draining) {
-          err = "a drain is in progress";
+        // A process in handover_failed or kill_pending keeps role draining, so the state is checked first.
+        if (instance && instance->handoff == state_e::kill_pending) {
+          err = "kill pending";
           return helper_exit_e::refused;
         }
         if (instance && instance->handoff == state_e::handover_failed) {
           err = "handover failing";
           return helper_exit_e::refused;
         }
-        if (instance && instance->handoff == state_e::kill_pending) {
-          err = "kill pending";
+        if (instance && instance->role == role_e::draining) {
+          err = "a drain is in progress";
           return helper_exit_e::refused;
         }
       }
@@ -551,96 +706,208 @@ namespace handoff {
       return false;
     };
 
-    if (_listen_fd >= 0) {
+    std::lock_guard lock(_mutex);
+    if (_thread.joinable() || _listen_fd >= 0) {
       return fail("already started");
     }
 
-    // The control directory is private to the user: created or fixed to mode 0700.
-    const auto dir = path.parent_path();
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    if (ec) {
-      return fail("cannot create the control directory: " + ec.message());
+    std::string reason;
+    int listen_fd = -1;
+    file_id_t id {};
+    if (!bind_listener(path, listen_fd, id, reason)) {
+      return fail(reason);
     }
-    if (::chmod(dir.c_str(), 0700) != 0) {
-      return fail(std::string("cannot set the control directory mode: ") + std::strerror(errno));
-    }
+    fd_guard_t listener(listen_fd);
 
-    // Replace a stale socket left by a previous run; never remove anything else.
-    struct stat st {};
-    if (::lstat(path.c_str(), &st) == 0) {
-      if (!S_ISSOCK(st.st_mode)) {
-        return fail("the socket path exists and is not a socket");
-      }
-      ::unlink(path.c_str());
-    } else if (errno != ENOENT) {
-      return fail(std::string("cannot inspect the socket path: ") + std::strerror(errno));
+    // A previous run that stopped on its own thread may have left its wake fd open; it is replaced here.
+    if (_wake_fd >= 0) {
+      ::close(_wake_fd);
+      _wake_fd = -1;
     }
-
-    sockaddr_un addr {};
-    if (!make_address(path, addr)) {
-      return fail("socket path too long");
-    }
-
-    fd_guard_t listener(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
-    if (listener.get() < 0) {
-      return fail(std::string("socket: ") + std::strerror(errno));
-    }
-
-    // The socket file is created inside the 0700 control directory and made 0600 right after bind. The process
-    // umask is not touched: it is process-wide and would race other threads.
-    if (::bind(listener.get(), reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0) {
-      return fail(std::string("bind: ") + std::strerror(errno));
-    }
-    if (::chmod(path.c_str(), 0600) != 0 || ::listen(listener.get(), 8) != 0) {
-      const auto message = std::string("listen or chmod: ") + std::strerror(errno);
-      ::unlink(path.c_str());
-      return fail(message);
-    }
-
-    fd_guard_t wake(::eventfd(0, EFD_CLOEXEC));
+    fd_guard_t wake(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
     if (wake.get() < 0) {
       const auto message = std::string("eventfd: ") + std::strerror(errno);
       ::unlink(path.c_str());
       return fail(message);
     }
 
+    _path = path;
+    _handler = std::move(handler);
+    _stopped = false;
+    const int wake_fd = wake.get();
+
     try {
-      _thread = std::thread(serve_loop, listener.get(), wake.get(), std::move(handler));
+      // The thread polls a snapshot of the listen fd, taken under the lock for every poll. close_listener() closes
+      // the fd under the lock and wakes the thread; the thread re-checks under the lock, immediately before
+      // accept(), that the snapshot is still the current listen fd. The listener is non-blocking, so accept() under
+      // the lock never blocks. Hence the thread never accepts on a closed or reused fd number. A stale snapshot
+      // can at worst make poll() report a spurious event, which the re-check discards.
+      _thread = std::thread([this, wake_fd]() {
+        while (true) {
+          int snapshot = -1;
+          {
+            std::lock_guard guard(_mutex);
+            if (_stopped) {
+              return;
+            }
+            snapshot = _listen_fd;
+          }
+
+          // A negative fd is ignored by poll(): while no listener is open only the wake fd is polled.
+          pollfd fds[2] = {{snapshot, POLLIN, 0}, {wake_fd, POLLIN, 0}};
+          if (::poll(fds, 2, -1) < 0) {
+            if (errno == EINTR) {
+              continue;
+            }
+            BOOST_LOG(error) << "Drain handoff: control socket poll failed: " << std::strerror(errno);
+            return;
+          }
+
+          if (fds[1].revents != 0) {
+            // Reset the counter; the loop top then re-reads _stopped and the listen fd.
+            std::uint64_t counter = 0;
+            if (::read(wake_fd, &counter, sizeof(counter)) < 0 && errno != EAGAIN && errno != EINTR) {
+              BOOST_LOG(error) << "Drain handoff: cannot read the control socket wake fd: " << std::strerror(errno);
+              std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            continue;
+          }
+          if (snapshot < 0 || fds[0].revents == 0) {
+            continue;
+          }
+
+          int client = -1;
+          int accept_errno = 0;
+          handler_t current_handler;
+          {
+            std::lock_guard guard(_mutex);
+            if (_stopped) {
+              return;
+            }
+            if (_listen_fd != snapshot) {
+              continue;  // closed or replaced while polling
+            }
+            client = ::accept4(snapshot, nullptr, nullptr, SOCK_CLOEXEC);
+            accept_errno = errno;
+            current_handler = _handler;
+          }
+
+          if (client < 0) {
+            if (accept_errno != EINTR && accept_errno != EAGAIN && accept_errno != ECONNABORTED) {
+              BOOST_LOG(error) << "Drain handoff: control socket accept failed: " << std::strerror(accept_errno);
+            }
+            if ((fds[0].revents & (POLLERR | POLLHUP)) != 0 || (accept_errno != EINTR && accept_errno != EAGAIN && accept_errno != ECONNABORTED)) {
+              // Back off so a persistent error (for example out of descriptors) does not spin the thread.
+              std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            continue;
+          }
+
+          // Served without the lock: the handler may call close_listener(), reopen_listener() or stop().
+          fd_guard_t client_guard(client);
+          serve_connection(client, current_handler);
+        }
+      });
     } catch (const std::system_error &e) {
       ::unlink(path.c_str());
       return fail(std::string("cannot start the server thread: ") + e.what());
     }
 
-    // The thread now uses these descriptors; stop() closes them.
-    _path = path;
     _listen_fd = listener.release();
     _wake_fd = wake.release();
+    set_bound_id(this, id);
     BOOST_LOG(info) << "Drain handoff: control socket listening";
     return true;
   }
 
-  void control_server_t::stop() {
-    if (_thread.joinable()) {
-      const std::uint64_t one = 1;
-      if (::write(_wake_fd, &one, sizeof(one)) < 0) {
-        BOOST_LOG(error) << "Drain handoff: cannot wake the control socket thread: " << std::strerror(errno);
-      }
-      _thread.join();
+  void control_server_t::close_listener() {
+    std::lock_guard lock(_mutex);
+    if (_listen_fd < 0) {
+      return;
     }
 
-    if (_listen_fd >= 0) {
-      ::close(_listen_fd);
-      _listen_fd = -1;
-      ::unlink(_path.c_str());
+    // Unlink only the socket this server bound: the path may have been replaced by another process since.
+    const auto id = get_bound_id(this);
+    struct stat st {};
+    if (id && ::lstat(_path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) && st.st_dev == id->first && st.st_ino == id->second) {
+      if (::unlink(_path.c_str()) != 0 && errno != ENOENT) {
+        BOOST_LOG(warning) << "Drain handoff: cannot remove the control socket: " << std::strerror(errno);
+      }
     }
-    if (_wake_fd >= 0) {
-      ::close(_wake_fd);
-      _wake_fd = -1;
+    set_bound_id(this, std::nullopt);
+
+    ::close(_listen_fd);
+    _listen_fd = -1;
+    signal_wake(_wake_fd);
+    BOOST_LOG(info) << "Drain handoff: control socket closed";
+  }
+
+  bool control_server_t::reopen_listener(std::string *error_out) {
+    const auto fail = [error_out](const std::string &message) {
+      if (error_out) {
+        *error_out = message;
+      }
+      BOOST_LOG(error) << "Drain handoff: control socket: " << message;
+      return false;
+    };
+
+    std::lock_guard lock(_mutex);
+    if (_stopped || !_thread.joinable()) {
+      return fail("the control server is not running");
+    }
+    if (_listen_fd >= 0) {
+      return true;
+    }
+
+    std::string reason;
+    int listen_fd = -1;
+    file_id_t id {};
+    if (!bind_listener(_path, listen_fd, id, reason)) {
+      return fail(reason);
+    }
+
+    _listen_fd = listen_fd;
+    set_bound_id(this, id);
+    signal_wake(_wake_fd);  // the thread polls the new listener once a running handler has returned
+    BOOST_LOG(info) << "Drain handoff: control socket listening again";
+    return true;
+  }
+
+  void control_server_t::stop() {
+    {
+      std::lock_guard lock(_mutex);
+      _stopped = true;
+    }
+    close_listener();
+
+    std::thread joinable;
+    {
+      std::lock_guard lock(_mutex);
+      signal_wake(_wake_fd);
+      // On the server thread (called from the handler) the thread cannot join itself: it exits after the handler
+      // returns, and a later stop() or the destructor on another thread joins it.
+      if (_thread.joinable() && _thread.get_id() != std::this_thread::get_id()) {
+        joinable = std::move(_thread);
+      }
+    }
+
+    if (joinable.joinable()) {
+      joinable.join();  // never under the lock: the thread takes it
+      std::lock_guard lock(_mutex);
+      if (_wake_fd >= 0) {
+        ::close(_wake_fd);
+        _wake_fd = -1;
+      }
     }
   }
 
   control_server_t::~control_server_t() {
     stop();
+    set_bound_id(this, std::nullopt);
+    std::lock_guard lock(_mutex);
+    if (_wake_fd >= 0 && !_thread.joinable()) {
+      ::close(_wake_fd);
+      _wake_fd = -1;
+    }
   }
 }  // namespace handoff
