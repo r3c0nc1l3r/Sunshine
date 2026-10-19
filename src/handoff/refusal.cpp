@@ -431,7 +431,12 @@ namespace handoff {
       std::replace(reason.begin(), reason.end(), '\r', ' ');
       std::replace(reason.begin(), reason.end(), '\n', ' ');
       if (reason.size() > app_reason_cap) {
-        reason.resize(app_reason_cap);
+        // Back up while the first cut-off byte is a UTF-8 continuation byte, so no multi-byte sequence is split.
+        std::size_t cut = app_reason_cap;
+        while (cut > 0 && (static_cast<unsigned char>(reason[cut]) & 0xC0) == 0x80) {
+          --cut;
+        }
+        reason.resize(cut);
       }
       return reason;
     }
