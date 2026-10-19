@@ -68,7 +68,8 @@ namespace handoff {
    *
    * Rejects (first failing rule wins, in this order): a deadline outside 1 to 86400; a ready timeout below 1; a
    * rollback window below 1; a cooldown shorter than the rollback window; a deadline shorter than the rollback
-   * window; an offset of 0; any UDP port of either base outside 1024-65535; any UDP port of either base equal to a
+   * window; an offset of 0; any UDP port of either base outside 1024-65535 (checked for every port of both bases
+   * before the next rule; computed in 64-bit, so a huge offset cannot overflow); any UDP port of either base equal to a
    * TCP port; the two bases sharing a UDP port.
    *
    * @param settings Options to check.
