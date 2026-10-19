@@ -25,6 +25,9 @@ namespace handoff {
   public:
     /**
      * @brief Called on the worker thread for each message that is not an answered `PING`, in arrival order.
+     *
+     * The handler owns an attached fd. If it throws, the worker logs the exception and closes the attached fd, so a
+     * handler must not throw after it has closed or adopted that fd.
      */
     using message_handler_t = std::function<void(received_t)>;
 
