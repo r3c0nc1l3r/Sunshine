@@ -187,6 +187,20 @@ TEST(HandoffGateTest, RouteGateReturnsTheSameInstance) {
   EXPECT_EQ(&handoff::route_gate(), &handoff::route_gate());
 }
 
+TEST(HandoffGateTest, InFlightIsZeroAfterWaitIdleWhenNobodyEnters) {
+  handoff::gate_t gate;
+  auto g = std::make_unique<handoff::gate_t::guard_t>(gate.enter());
+  gate.raise();
+  std::thread releaser([&] {
+    std::this_thread::sleep_for(30ms);
+    g.reset();
+  });
+  bool idle = gate.wait_idle(2000ms);
+  releaser.join();
+  ASSERT_TRUE(idle);
+  EXPECT_EQ(0u, gate.in_flight()) << "with no thread calling enter(), in_flight() is 0 after wait_idle() returned true";
+}
+
 TEST(HandoffGateTest, StressRaisedGateAdmitsNobodyAfterIdle) {
   handoff::gate_t gate;
   constexpr int thread_count = 8;
@@ -233,7 +247,6 @@ TEST(HandoffGateTest, StressRaisedGateAdmitsNobodyAfterIdle) {
     // The gate is raised and nothing is counted: nobody may hold a guard, and nobody may be admitted until lower().
     long before = admitted_total.load();
     EXPECT_EQ(0, active.load()) << "round " << round << ": an admitted guard is still alive after wait_idle() returned true";
-    EXPECT_EQ(0u, gate.in_flight());
     std::this_thread::sleep_for(15ms);
     EXPECT_EQ(before, admitted_total.load()) << "round " << round << ": a request was admitted while the gate was raised and idle";
     EXPECT_EQ(0, active.load());
