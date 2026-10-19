@@ -111,15 +111,19 @@ protected:
   void SetUp() override {
     original_port_ = config::sunshine.port;
     original_options_ = config::drain_handoff;
+    original_file_apps_ = config::stream.file_apps;
     config::drain_handoff = handoff::settings_t {};
+    // apply_config copies a default apps.json when file_apps does not exist; point it at a file that does.
+    config::stream.file_apps = SUNSHINE_SOURCE_DIR "/tests/unit/test_config_handoff.cpp";
   }
 
   /**
-   * @brief Restore the port and the drain-handoff options.
+   * @brief Restore the port, the drain-handoff options and the apps file path.
    */
   void TearDown() override {
     config::sunshine.port = original_port_;
     config::drain_handoff = original_options_;
+    config::stream.file_apps = original_file_apps_;
   }
 
   /**
@@ -133,6 +137,7 @@ protected:
 
   std::uint16_t original_port_ {};  ///< Port restored after each test.
   handoff::settings_t original_options_;  ///< Options restored after each test.
+  std::string original_file_apps_;  ///< Apps file path restored after each test.
 };
 
 /**
