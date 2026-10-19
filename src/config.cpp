@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <charconv>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -23,6 +24,7 @@
 #include "config.h"
 #include "entry_handler.h"
 #include "file_handler.h"
+#include "handoff/hooks.h"
 #include "logging.h"
 #include "nvhttp.h"
 #include "platform/common.h"
@@ -1596,6 +1598,104 @@ namespace config {
     }
   }
 
+  /// Drain-handoff options; declared with its documentation in `config.h`.
+  handoff::settings_t drain_handoff;
+
+  /**
+   * @brief Parse a strict decimal integer for the drain-handoff options.
+   *
+   * Accepts an optional leading `-` followed by one or more decimal digits whose value fits in `int`. Everything else
+   * (empty text, hex, spaces, quotes, other characters, out-of-range values) is rejected. Deliberately not
+   * `parse_config_integer`, which accepts hexadecimal.
+   *
+   * @param value Raw configuration value.
+   * @return The value, or `std::nullopt` when the text is not a valid decimal integer.
+   */
+  std::optional<int> parse_strict_decimal_int(std::string_view value) {
+    int result {};
+    const char *first = value.data();
+    const char *last = value.data() + value.size();
+    if (value.empty()) {
+      return std::nullopt;
+    }
+
+    auto [ptr, ec] = std::from_chars(first, last, result, 10);
+    if (ec != std::errc {} || ptr != last) {
+      return std::nullopt;
+    }
+    return result;
+  }
+
+  /**
+   * @brief Consume one drain-handoff integer option, logging an Error when its text is not a valid integer.
+   *
+   * @param vars Parsed configuration entries; the key is erased when present.
+   * @param name Configuration key to consume.
+   * @param input Destination field, updated only when the value is valid; otherwise it keeps its value.
+   * @param ok Cleared to `false` when the key is present and invalid.
+   */
+  void drain_int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, int &input, bool &ok) {
+    auto it = vars.find(name);
+    if (it == std::end(vars)) {
+      return;
+    }
+
+    const auto parsed = parse_strict_decimal_int(it->second);
+    vars.erase(it);
+    if (!parsed) {
+      BOOST_LOG(error) << "config: '" << name << "' must be a decimal integer that fits in a 32-bit int; drain handoff is disabled";
+      ok = false;
+      return;
+    }
+    input = *parsed;
+  }
+
+  /**
+   * @brief Apply the `drain_handoff*` options (see `config::drain_handoff` in `config.h`).
+   *
+   * Runs after `port` is set. Invalid text logs one Error per key and disables the feature; the valid fields keep
+   * their parsed values. When the feature stays enabled, `handoff::hooks::config_refusal` checks the options against
+   * the port and any refusal logs one Error and disables the feature.
+   *
+   * @param vars Parsed configuration entries; consumed keys are erased.
+   * @param port Configured `port`.
+   */
+  void apply_drain_handoff(std::unordered_map<std::string, std::string> &vars, int port) {
+    auto &drain = drain_handoff;
+    bool ok = true;
+
+    if (auto it = vars.find("drain_handoff"s); it != std::end(vars)) {
+      const std::string value = std::move(it->second);
+      vars.erase(it);
+      if (value == "enabled"sv) {
+        drain.enabled = true;
+      } else if (value == "disabled"sv) {
+        drain.enabled = false;
+      } else {
+        BOOST_LOG(error) << "config: 'drain_handoff' must be 'enabled' or 'disabled'; drain handoff is disabled";
+        ok = false;
+      }
+    }
+
+    drain_int_f(vars, "drain_handoff_udp_offset"s, drain.udp_offset, ok);
+    drain_int_f(vars, "drain_handoff_deadline"s, drain.deadline_s, ok);
+    drain_int_f(vars, "drain_handoff_ready_timeout"s, drain.ready_timeout_s, ok);
+    drain_int_f(vars, "drain_handoff_rollback_window"s, drain.rollback_window_s, ok);
+    drain_int_f(vars, "drain_handoff_cooldown"s, drain.cooldown_s, ok);
+    string_f(vars, "drain_handoff_binary"s, drain.binary);
+
+    if (!ok) {
+      drain.enabled = false;
+    }
+
+    if (drain.enabled) {
+      if (const std::string refusal = handoff::hooks::config_refusal(drain, port); !refusal.empty()) {
+        BOOST_LOG(error) << "config: " << refusal << "; drain handoff is disabled";
+        drain.enabled = false;
+      }
+    }
+  }
+
   /**
    * @brief Apply parsed configuration entries to the global runtime configuration.
    *
@@ -1856,6 +1956,8 @@ namespace config {
     int port = sunshine.port;
     int_between_f(vars, "port"s, port, {1024 + nvhttp::PORT_HTTPS, 65535 - rtsp_stream::RTSP_SETUP_PORT});
     sunshine.port = (std::uint16_t) port;
+
+    apply_drain_handoff(vars, port);
 
     // Now that we have the port, add web UI port-specific origins to CSRF allowed list
     // Web UI runs on port + 1 (PORT_HTTPS offset is 1 for confighttp)

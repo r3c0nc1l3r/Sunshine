@@ -6,9 +6,28 @@
   // local includes
   #include "hooks.h"
 
+  // local includes
+  #include "mdns_holder.h"
+  #include "settings.h"
   #include "src/config.h"
+  #include "src/video.h"
 
 namespace handoff::hooks {
+  namespace {
+    /**
+     * @brief Handle returned by `mdns_start`; destroying it stops the holder's publisher.
+     */
+    class mdns_stop_guard_t: public platf::deinit_t {
+    public:
+      /**
+       * @brief Stop publishing through the holder.
+       */
+      ~mdns_stop_guard_t() override {
+        mdns_holder().stop();
+      }
+    };
+  }  // namespace
+
   bool enabled() {
     return runtime().enabled();
   }
@@ -106,6 +125,32 @@ namespace handoff::hooks {
 
   shutdown_reason_e shutdown_reason() {
     return runtime().shutdown_reason();
+  }
+
+  std::string config_refusal(const settings_t &settings, int port) {
+    if (!settings.enabled) {
+      return {};
+    }
+    return handoff::validate(settings, port);
+  }
+
+  std::string enable_refusal(const enable_context_t &context, bool privileged_execution) {
+    if (!config::drain_handoff.enabled) {
+      return {};
+    }
+    if (privileged_execution) {
+      return "drain handoff is not available with privileged execution (its environment sanitising drops the SUNSHINE_HANDOFF_* variables)";
+    }
+    return handoff::check_enable(context);
+  }
+
+  std::unique_ptr<platf::deinit_t> mdns_start(bool arm_rename_checks) {
+    mdns_holder().start(arm_rename_checks);
+    return std::make_unique<mdns_stop_guard_t>();
+  }
+
+  bool startup_probe_skipped() {
+    return started_by_handoff() && video::handoff_probe_override().has_value();
   }
 }  // namespace handoff::hooks
 #endif
