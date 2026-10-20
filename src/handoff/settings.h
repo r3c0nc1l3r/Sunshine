@@ -24,6 +24,8 @@ namespace handoff {
     int rollback_window_s {60};  ///< `drain_handoff_rollback_window`, seconds.
     int cooldown_s {120};  ///< `drain_handoff_cooldown`, seconds.
     std::string binary;  ///< `drain_handoff_binary`; empty means the path Sunshine was started from.
+    bool control_socket {false};  ///< `control_socket`: `enabled` or `disabled`; serve the control socket for the
+                                  ///< `close-app` verb without the drain handoff (see `control_socket_mode()`).
   };
 
   /**

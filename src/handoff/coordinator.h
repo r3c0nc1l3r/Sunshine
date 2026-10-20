@@ -885,8 +885,9 @@ namespace handoff {
     control_reply_t handle(pid_t peer_pid);
 
     /**
-     * @brief Start the control server on `path` with `handler()`. Both a normal start and the new side's `on_main()`
-     * (`sunshine_new_ops_t`'s `start_control_server`) use it.
+     * @brief Start the control server on `path` with `{handler(), close-app}`: `handler()` serves `handoff`, and
+     * `[](pid_t peer) { return close_app(peer); }` (`close_app.h`) serves `close-app`. Both a normal start and the new
+     * side's `on_main()` (`sunshine_new_ops_t`'s `start_control_server`) use it.
      *
      * Called only when the feature is enabled (`runtime().enabled()`), never in a handoff-started process before
      * `MAIN`. In a normal start `main` calls it after `open_instance_file()` and before `READY=1` (`entry.h`). The path is
