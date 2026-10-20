@@ -167,35 +167,33 @@ namespace proc {
   bool is_launch_env_name(std::string_view name);
 
   /**
-   * @brief The base environment for the app digest: the entries of the process environment plus the `apps.json`
-   * `env` section, without the launch variables (names for which `is_launch_env_name` is true), without
-   * `SUNSHINE_UDP_BASE` and `SUNSHINE_GENERATION` (restart variables) and without names starting with
-   * `SUNSHINE_HANDOFF_`. Both processes compute the digest from this, so values that differ only by process or launch
-   * do not break adoption. The result is sorted by name (byte-wise).
+   * @brief The entries of an environment, without the names that the app digest excludes: the launch variables
+   * (names for which `is_launch_env_name` is true), `SUNSHINE_UDP_BASE` and `SUNSHINE_GENERATION` (restart variables),
+   * and names starting with `SUNSHINE_HANDOFF_`. The result is sorted by name (byte-wise).
    *
-   * Both processes must compute the digest from an environment that has not changed since `proc::parse` built it, apart
-   * from the stripped names: `execute()` adds only launch variables, which are stripped. Any other later change to
-   * `_env` (or a differing process environment between the two processes) makes the digests differ and the adoption
-   * fail, safely.
+   * The app digest no longer uses this: `digest_input` takes the `apps.json` `env` section instead, because the
+   * process environment differs between a systemd-started process and one spawned by the handoff (issue #47).
    *
-   * @param env The `proc_t` environment.
+   * @param env The environment to filter.
    * @return Name and value pairs.
    */
   std::vector<std::pair<std::string, std::string>> base_env_for_digest(const boost::process::v1::environment &env);
 
 #ifdef __linux__
   /**
-   * @brief The digest inputs of one app in an environment.
+   * @brief The digest inputs of one app and the `apps.json` `env` section.
    *
    * `prep` is `app.prep_cmds` mapped to (`do_cmd`, `undo_cmd`, `elevated`) in order (the list is already merged with
    * the global commands when the apps are loaded); `working_dir` and `output` are the app's; `exit_timeout_s` is
-   * `app.exit_timeout` in seconds; `base_env` is `base_env_for_digest(env)`.
+   * `app.exit_timeout` in seconds. `base_env` is `apps_env` without the names that `base_env_for_digest` excludes
+   * (the launch variables, `SUNSHINE_UDP_BASE`, `SUNSHINE_GENERATION` and `SUNSHINE_HANDOFF_*`), sorted by name. The
+   * process environment is not part of the digest.
    *
    * @param app App.
-   * @param env The `proc_t` environment.
+   * @param apps_env The top-level `apps.json` `env` section as written (`proc_t::apps_env_section()`).
    * @return Digest inputs for `handoff::app_digest()`.
    */
-  handoff::app_digest_input_t digest_input(const ctx_t &app, const boost::process::v1::environment &env);
+  handoff::app_digest_input_t digest_input(const ctx_t &app, const std::vector<std::pair<std::string, std::string>> &apps_env);
 
   /**
    * @brief An adoption that was checked and prepared but not installed. Plain data; movable and copyable.
@@ -221,13 +219,16 @@ namespace proc {
      *
      * @param env Environment used when launching processes.
      * @param apps Application launch contexts.
+     * @param apps_env The top-level `apps.json` `env` section as written, sorted by name (see `apps_env_section()`).
      */
     proc_t(
       boost::process::v1::environment &&env,
-      std::vector<ctx_t> &&apps
+      std::vector<ctx_t> &&apps,
+      std::vector<std::pair<std::string, std::string>> &&apps_env = {}
     ):
         _env(std::move(env)),
-        _apps(std::move(apps)) {
+        _apps(std::move(apps)),
+        _apps_env(std::move(apps_env)) {
     }
 
     /**
@@ -384,9 +385,31 @@ namespace proc {
     void swap_app_list(std::vector<ctx_t> &&apps);
 
     /**
-     * @brief The environment's base entries for the digest, from this object's environment.
+     * @brief Replace the application list and the `apps.json` `env` section together, both from one parse.
      *
-     * @return `proc::base_env_for_digest(_env)`. Same caller rule as `snapshot()` (no concurrent `execute()`).
+     * Same rules as the one-argument overload. The production reloads use this one, so the list and the section that
+     * the `GO` digest uses always come from the same `apps.json` parse.
+     *
+     * @param apps The new application list.
+     * @param apps_env The `env` section of the same parse (`apps_env_section()` of the parsed object).
+     */
+    void swap_app_list(std::vector<ctx_t> &&apps, std::vector<std::pair<std::string, std::string>> apps_env);
+
+    /**
+     * @brief The top-level `apps.json` `env` section of this object, as written.
+     *
+     * Names and raw values (`$(VAR)` not expanded), sorted by name (byte-wise). Filled by `proc::parse`; empty when the
+     * file has no `env` section or the object was built without one. The process environment is not included.
+     *
+     * @return The section entries.
+     */
+    const std::vector<std::pair<std::string, std::string>> &apps_env_section() const;
+
+    /**
+     * @brief The environment's base entries for the digest: `apps_env_section()` without the names that
+     * `base_env_for_digest` excludes, sorted by name.
+     *
+     * @return The entries `digest_input` uses as `base_env`. Same caller rule as `snapshot()`.
      */
     std::vector<std::pair<std::string, std::string>> digest_base_env() const;
 
@@ -399,7 +422,7 @@ namespace proc {
      *
      * @return `std::nullopt` when no app is recorded (atomic app id 0 or below). Otherwise `app_snapshot_t{app_id = the atomic app
      *         id, name = _app.name, applied_prep = the atomic applied count, digest = handoff::app_digest(digest_input(_app,
-     *         _env)), launch_env = the entries of _env for which is_launch_env_name is true, sorted by name}`.
+     *         apps_env_section())), launch_env = the entries of _env for which is_launch_env_name is true, sorted by name}`.
      */
     std::optional<handoff::protocol::app_snapshot_t> snapshot() const;
 
@@ -411,10 +434,11 @@ namespace proc {
      * - `go.app` is empty: success with a plan whose `has_app` is `false`.
      * - this object already records a running app: "this process already runs an app".
      * - the snapshot's digest is empty, or the computed digest is empty: "invalid app snapshot".
-     * - `_apps` has no entry with `id == std::to_string(app_id)` and `name == snapshot.name`, or its
-     *   `digest_input` digest differs from the snapshot's (compared as given, lowercase hex), or the applied count is
-     *   larger than that entry's `prep_cmds.size()`: "app or prep commands changed while an app runs; cancel the app
-     *   first". This is the reason the old process logs and the helper reports.
+     * - `_apps` has no entry with `id == std::to_string(app_id)` and `name == snapshot.name`: "app not found in this
+     *   process's app list (id or name changed); cancel the app first".
+     * - the entry's `digest_input(entry, apps_env_section())` digest differs from the snapshot's (compared as given,
+     *   lowercase hex), or the applied count is larger than that entry's `prep_cmds.size()`: "app or prep commands
+     *   changed while an app runs; cancel the app first". This is the reason the old process logs and the helper reports.
      *
      * @param go The `GO` message.
      * @param reason Receives the failure reason; cleared on success.
@@ -469,6 +493,7 @@ namespace proc {
 
     boost::process::v1::environment _env;
     std::vector<ctx_t> _apps;
+    std::vector<std::pair<std::string, std::string>> _apps_env;  ///< The `apps.json` `env` section as written, sorted by name.
     ctx_t _app;
     std::chrono::steady_clock::time_point _app_launch_time;
 

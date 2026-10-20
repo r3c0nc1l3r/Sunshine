@@ -102,7 +102,7 @@ namespace handoff {
       if (!apps) {
         return "apps.json: parse failed";
       }
-      proc::proc.swap_app_list(std::move(apps->get_apps()));
+      proc::proc.swap_app_list(std::move(apps->get_apps()), apps->apps_env_section());
       return {};
     }
 

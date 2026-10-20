@@ -143,11 +143,9 @@ TEST(ProcessBaseEnvTest, ValuesAreKept) {
   EXPECT_EQ(base[1].second, "");
 }
 
-TEST(ProcessBaseEnvTest, DigestBaseEnvMatchesFreeFunction) {
+TEST(ProcessBaseEnvTest, DigestBaseEnvIgnoresProcessEnvironment) {
   proc::proc_t proc(make_env({{"B", "2"}, {"A", "1"}, {"SUNSHINE_APP_ID", "9"}, {"SUNSHINE_HANDOFF_X", "y"}}), {});
-  const auto expected = proc::base_env_for_digest(make_env({{"B", "2"}, {"A", "1"}, {"SUNSHINE_APP_ID", "9"}, {"SUNSHINE_HANDOFF_X", "y"}}));
-  EXPECT_EQ(proc.digest_base_env(), expected) << "digest_base_env() must equal base_env_for_digest(its environment)";
-  EXPECT_EQ(proc.digest_base_env().size(), 2u);
+  EXPECT_TRUE(proc.digest_base_env().empty()) << "the process environment is not part of the digest; only the apps.json env section is";
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -670,8 +668,8 @@ TEST_F(ProcessAdoptionTest, DigestInputMapsAppFields) {
   auto app = make_prep_app(md);
   app.output = "null";
   app.exit_timeout = std::chrono::seconds {7};
-  const auto env = make_env({{"B", "2"}, {"A", "1"}, {"SUNSHINE_APP_ID", "1"}});
-  const auto in = proc::digest_input(app, env);
+  const env_list_t apps_env {{"A", "1"}, {"B", "2"}, {"SUNSHINE_APP_ID", "1"}};
+  const auto in = proc::digest_input(app, apps_env);
   ASSERT_EQ(in.prep.size(), 3u);
   EXPECT_EQ(in.prep[0].do_cmd, md.cmd("D1"));
   EXPECT_EQ(in.prep[0].undo_cmd, md.cmd("U1"));
@@ -680,13 +678,14 @@ TEST_F(ProcessAdoptionTest, DigestInputMapsAppFields) {
   EXPECT_EQ(in.working_dir, app.working_dir);
   EXPECT_EQ(in.output, "null");
   EXPECT_EQ(in.exit_timeout_s, 7);
-  EXPECT_EQ(in.base_env, proc::base_env_for_digest(env));
+  const env_list_t expected_base {{"A", "1"}, {"B", "2"}};
+  EXPECT_EQ(in.base_env, expected_base) << "base_env is the apps.json env section minus the launch and handoff names";
 }
 
 TEST_F(ProcessAdoptionTest, DigestInputKeepsElevatedFlag) {
   auto app = make_app("1", "a");
   app.prep_cmds.emplace_back(std::string("d"), std::string("u"), true);
-  const auto in = proc::digest_input(app, make_env({}));
+  const auto in = proc::digest_input(app, {});
   ASSERT_EQ(in.prep.size(), 1u);
   EXPECT_TRUE(in.prep[0].elevated);
 }
@@ -716,8 +715,8 @@ TEST_F(ProcessAdoptionTest, SnapshotDescribesRunningApp) {
     << "digest must be lowercase hex";
   const env_list_t expected_launch {{"SUNSHINE_APP_ID", "4"}, {"SUNSHINE_CLIENT_WIDTH", "1920"}};
   EXPECT_EQ(snap->launch_env, expected_launch) << "launch_env: only launch names, sorted by name";
-  EXPECT_EQ(snap->digest, handoff::app_digest(proc::digest_input(app, make_env({{"KEEP", "1"}, {"SUNSHINE_UDP_BASE", "9"}, {"SUNSHINE_CLIENT_WIDTH", "1920"}, {"SUNSHINE_APP_ID", "4"}, {"AAA_NOT_LAUNCH", "x"}}))))
-    << "digest is app_digest(digest_input(app, env))";
+  EXPECT_EQ(snap->digest, handoff::app_digest(proc::digest_input(app, proc.apps_env_section())))
+    << "digest is app_digest(digest_input(app, the apps.json env section)); the process environment is not part of it";
 }
 
 TEST_F(ProcessAdoptionTest, SnapshotDigestIgnoresLaunchVariables) {
@@ -730,14 +729,14 @@ TEST_F(ProcessAdoptionTest, SnapshotDigestIgnoresLaunchVariables) {
   EXPECT_EQ(a.snapshot()->digest, b.snapshot()->digest) << "launch and handoff variables must not change the digest";
 }
 
-TEST_F(ProcessAdoptionTest, SnapshotDigestChangesWithEnvironment) {
+TEST_F(ProcessAdoptionTest, SnapshotDigestIgnoresProcessEnvironment) {
   marker_dir_t md;
   const auto app = make_prep_app(md);
   proc::proc_t a(make_env({{"KEEP", "1"}}), {app});
   proc::proc_t b(make_env({{"KEEP", "2"}}), {app});
   a.set_running_for_test(app, 1, true, 0, 1);
   b.set_running_for_test(app, 1, true, 0, 1);
-  EXPECT_NE(a.snapshot()->digest, b.snapshot()->digest) << "a differing base environment value must change the digest";
+  EXPECT_EQ(a.snapshot()->digest, b.snapshot()->digest) << "a differing process environment value must not change the digest (#47)";
 }
 
 TEST_F(ProcessAdoptionTest, RoundTripAdoptsAndTerminateRunsRemainingUndoOnce) {
@@ -893,7 +892,8 @@ TEST_F(ProcessAdoptionTest, EmptyDigestWinsOverMissingApp) {
 
 namespace {
   constexpr const char *changed_reason = "app or prep commands changed while an app runs; cancel the app first";
-}
+  constexpr const char *not_found_reason = "app not found in this process's app list (id or name changed); cancel the app first";  ///< Reason for an id or name lookup failure.
+}  // namespace
 
 TEST_F(ProcessAdoptionTest, MissingAppIsRefused) {
   marker_dir_t md;
@@ -905,7 +905,7 @@ TEST_F(ProcessAdoptionTest, MissingAppIsRefused) {
   go.app = old_proc.snapshot();
   std::string reason;
   EXPECT_FALSE(new_proc.prepare_adoption(go, reason).has_value());
-  EXPECT_EQ(reason, changed_reason);
+  EXPECT_EQ(reason, not_found_reason);
 }
 
 TEST_F(ProcessAdoptionTest, OtherIdIsRefused) {
@@ -918,7 +918,7 @@ TEST_F(ProcessAdoptionTest, OtherIdIsRefused) {
   go.app = old_proc.snapshot();
   std::string reason;
   EXPECT_FALSE(new_proc.prepare_adoption(go, reason).has_value());
-  EXPECT_EQ(reason, changed_reason) << "the id is compared as std::to_string(app_id)";
+  EXPECT_EQ(reason, not_found_reason) << "the id is compared as std::to_string(app_id)";
 }
 
 TEST_F(ProcessAdoptionTest, OtherNameIsRefused) {
@@ -931,7 +931,7 @@ TEST_F(ProcessAdoptionTest, OtherNameIsRefused) {
   go.app = old_proc.snapshot();
   std::string reason;
   EXPECT_FALSE(new_proc.prepare_adoption(go, reason).has_value());
-  EXPECT_EQ(reason, changed_reason);
+  EXPECT_EQ(reason, not_found_reason);
 }
 
 TEST_F(ProcessAdoptionTest, ChangedPrepCommandIsRefused) {
@@ -974,9 +974,10 @@ TEST_F(ProcessAdoptionTest, ChangedWorkingDirOutputTimeoutAreRefused) {
 TEST_F(ProcessAdoptionTest, ChangedEnvironmentIsRefused) {
   marker_dir_t md;
   const auto app = make_prep_app(md);
-  proc::proc_t old_proc(make_env({{"KEEP", "1"}}), {app});
+  // A changed apps.json env section is refused; the process environment alone is not part of the digest (#47).
+  proc::proc_t old_proc(make_env({}), {app}, {{"KEEP", "1"}});
   old_proc.set_running_for_test(app, 1, true, 0, 1);
-  proc::proc_t new_proc(make_env({{"KEEP", "other"}}), {app});
+  proc::proc_t new_proc(make_env({}), {app}, {{"KEEP", "other"}});
   handoff::protocol::go_t go;
   go.app = old_proc.snapshot();
   std::string reason;

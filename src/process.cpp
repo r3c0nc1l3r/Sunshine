@@ -476,12 +476,23 @@ namespace proc {
     return name.starts_with("SUNSHINE_APP_"sv) || name.starts_with("SUNSHINE_CLIENT_"sv);
   }
 
+  /**
+   * @brief Whether the app digest leaves a name out of its environment part.
+   *
+   * @param name Environment variable name.
+   * @return `true` for the launch variables, `SUNSHINE_UDP_BASE`, `SUNSHINE_GENERATION` and names starting with
+   * `SUNSHINE_HANDOFF_`.
+   */
+  static bool is_digest_excluded_env_name(std::string_view name) {
+    return is_launch_env_name(name) || name == "SUNSHINE_UDP_BASE"sv || name == "SUNSHINE_GENERATION"sv || name.starts_with("SUNSHINE_HANDOFF_"sv);
+  }
+
   std::vector<std::pair<std::string, std::string>> base_env_for_digest(const boost::process::v1::environment &env) {
     std::vector<std::pair<std::string, std::string>> result;
 
     for (const auto &entry : env) {
       std::string name = entry.get_name();
-      if (is_launch_env_name(name) || name == "SUNSHINE_UDP_BASE"sv || name == "SUNSHINE_GENERATION"sv || name.starts_with("SUNSHINE_HANDOFF_"sv)) {
+      if (is_digest_excluded_env_name(name)) {
         continue;
       }
       result.emplace_back(std::move(name), entry.to_string());
@@ -494,8 +505,19 @@ namespace proc {
     return result;
   }
 
+  const std::vector<std::pair<std::string, std::string>> &proc_t::apps_env_section() const {
+    return _apps_env;
+  }
+
   std::vector<std::pair<std::string, std::string>> proc_t::digest_base_env() const {
-    return base_env_for_digest(_env);
+    std::vector<std::pair<std::string, std::string>> result;
+    result.reserve(_apps_env.size());
+    for (const auto &entry : _apps_env) {
+      if (!is_digest_excluded_env_name(entry.first)) {
+        result.push_back(entry);
+      }
+    }
+    return result;
   }
 
   bool proc_t::adoptable(std::string *why, const group_probe_t &probe) const {
@@ -568,8 +590,13 @@ namespace proc {
     _apps = std::move(apps);
   }
 
+  void proc_t::swap_app_list(std::vector<ctx_t> &&apps, std::vector<std::pair<std::string, std::string>> apps_env) {
+    _apps = std::move(apps);
+    _apps_env = std::move(apps_env);
+  }
+
 #ifdef __linux__
-  handoff::app_digest_input_t digest_input(const ctx_t &app, const boost::process::v1::environment &env) {
+  handoff::app_digest_input_t digest_input(const ctx_t &app, const std::vector<std::pair<std::string, std::string>> &apps_env) {
     handoff::app_digest_input_t input;
     input.prep.reserve(app.prep_cmds.size());
     for (const auto &cmd : app.prep_cmds) {
@@ -578,7 +605,12 @@ namespace proc {
     input.working_dir = app.working_dir;
     input.output = app.output;
     input.exit_timeout_s = static_cast<std::int64_t>(app.exit_timeout.count());
-    input.base_env = base_env_for_digest(env);
+    // apps_env is already sorted by name; the filter keeps that order
+    for (const auto &entry : apps_env) {
+      if (!is_digest_excluded_env_name(entry.first)) {
+        input.base_env.push_back(entry);
+      }
+    }
     return input;
   }
 
@@ -592,7 +624,7 @@ namespace proc {
     snap.app_id = id;
     snap.name = _app.name;
     snap.applied_prep = _live.applied.load();
-    snap.digest = handoff::app_digest(digest_input(_app, _env));
+    snap.digest = handoff::app_digest(digest_input(_app, _apps_env));
     for (const auto &entry : _env) {
       std::string name = entry.get_name();
       if (is_launch_env_name(name)) {
@@ -631,11 +663,11 @@ namespace proc {
       return candidate.id == id_text && candidate.name == snap.name;
     });
     if (iter == _apps.end()) {
-      reason = changed;
+      reason = "app not found in this process's app list (id or name changed); cancel the app first"sv;
       return std::nullopt;
     }
 
-    std::string own_digest = handoff::app_digest(digest_input(*iter, _env));
+    std::string own_digest = handoff::app_digest(digest_input(*iter, _apps_env));
     if (own_digest.empty()) {
       reason = "invalid app snapshot";
       return std::nullopt;
@@ -981,10 +1013,18 @@ namespace proc {
       auto &env_vars = tree.get_child("env"s);
 
       auto this_env = boost::this_process::environment();
+      std::vector<std::pair<std::string, std::string>> apps_env;
 
       for (auto &[name, val] : env_vars) {
-        this_env[name] = parse_env_val(this_env, val.get_value<std::string>());
+        auto raw = val.get_value<std::string>();
+        apps_env.emplace_back(name, raw);
+        this_env[name] = parse_env_val(this_env, raw);
       }
+
+      // Byte-wise sort by name, so the digest does not depend on the order of the file
+      std::stable_sort(apps_env.begin(), apps_env.end(), [](const auto &a, const auto &b) {
+        return a.first < b.first;
+      });
 
       std::set<std::string> ids;
       std::vector<proc::ctx_t> apps;
@@ -1093,7 +1133,8 @@ namespace proc {
 
       return proc::proc_t {
         std::move(this_env),
-        std::move(apps)
+        std::move(apps),
+        std::move(apps_env)
       };
     } catch (std::exception &e) {
       BOOST_LOG(error) << e.what();
