@@ -1,6 +1,10 @@
 # shellcheck shell=bash
 
 do_setcap() {
+  if [ -e usr/share/sunshine/setcap-disabled ]; then
+    echo "sunshine: setcap skipped (package built with _setcap=false)"
+    return 0
+  fi
   setcap cap_sys_admin,cap_sys_nice+p "$(readlink -f usr/bin/sunshine)"
 }
 

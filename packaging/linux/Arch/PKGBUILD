@@ -5,6 +5,7 @@
 : "${_run_unit_tests:=false}"  # if set to true; unit tests will be executed post build; useful in CI
 : "${_support_headless_testing:=false}"
 : "${_use_cuda:=detect}" # nvenc
+: "${_setcap:=true}"  # if set to false; the install script does not setcap the binary (no KMS capture)
 
 : "${_commit:=@GITHUB_COMMIT@}"
 
@@ -247,4 +248,9 @@ check() {
 package() {
     export MAKEFLAGS="${MAKEFLAGS:--j$(nproc)}"
     DESTDIR="$pkgdir" cmake --install build
+    if [[ "${_setcap}" == "false" ]]; then
+        install -dm755 "$pkgdir/usr/share/sunshine"
+        printf '%s\n' '# This package was built with _setcap=false: the install script does not setcap /usr/bin/sunshine.' > "$pkgdir/usr/share/sunshine/setcap-disabled"
+        chmod 0644 "$pkgdir/usr/share/sunshine/setcap-disabled"
+    fi
 }
