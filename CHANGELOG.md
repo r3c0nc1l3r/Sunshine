@@ -21,6 +21,10 @@ https://github.com/LizardByte/Sunshine/releases.
   `draining`, `handover_failed` or `kill_pending`). The draining process's sessions are listed after this process's
   own, and `POST /api/sessions/<id>/close` closes them too; the audit line is written by the active process.
 - Stop reasons `drain-deadline` and `stop` in the `Session ended` line.
+- Arch package option `_setcap` (default `true`). A package built with `_setcap=false` installs the marker
+  `/usr/share/sunshine/setcap-disabled`, and its install script then skips the `setcap` of the binary: no KMS capture,
+  but the drain handoff, which refuses to run with file capabilities, can be enabled. `build_arch_pkg.sh` has a
+  matching `--no-setcap` flag and a `setcap` line in `BUILDINFO.txt` (#46).
 
 ### Changed
 - Whenever `NOTIFY_SOCKET` is set, Sunshine sends `READY=1` once its servers run, also when the drain handoff is
