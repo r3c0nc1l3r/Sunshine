@@ -11,7 +11,9 @@ https://github.com/LizardByte/Sunshine/releases.
   keeps its running sessions until they end or `drain_handoff_deadline` passes, then exits; new clients reach the new
   process. A switch that fails rolls back to the old process. New options `drain_handoff`, `drain_handoff_udp_offset`,
   `drain_handoff_deadline`, `drain_handoff_ready_timeout`, `drain_handoff_rollback_window`, `drain_handoff_cooldown`
-  and `drain_handoff_binary`. Needs systemd 254 or newer. See `docs/drain-handoff.md` (#28-#37).
+  and `drain_handoff_binary`. Needs systemd 254 or newer. A running placebo app (no command) is handed over when its
+  `apps.json` entry, prep commands and `env` section are unchanged; the process environment is not compared (#47).
+  See `docs/drain-handoff.md` (#28-#37).
 - Example systemd drop-in `drain-handoff.conf` (`Type=notify`, `NotifyAccess=main`, the `ExecReload` line,
   `TimeoutStopSec=30`), installed in the `systemd` directory of the Sunshine assets. It is not active until copied into
   the unit's drop-in directory; the shipped unit is unchanged.
