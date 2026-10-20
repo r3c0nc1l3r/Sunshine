@@ -427,8 +427,8 @@ exits would refuse every later reload and `/api/restart`.
   `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock`. Without either, the feature is refused at startup with an Error. It is
   also refused at startup, with an Error, when Sunshine runs with privileged execution, whose environment sanitising
   would drop the `SUNSHINE_HANDOFF_*` variables. File capabilities (for example the Arch package's `setcap` for KMS
-  capture) cause privileged execution; the Arch package can be built with `_setcap=false` to skip that setcap, at the
-  cost of KMS capture.
+  capture) cause privileged execution; the Arch package can be built with `_setcap=false` (`build_arch_pkg.sh
+  --no-setcap`) to skip that setcap, at the cost of KMS capture.
 - Mode 0600; the active process checks the connecting peer with `SO_PEERCRED` (same uid) and logs the peer pid.
 - The trust boundary is the uid: any process of the same user is trusted, as it could already reload or signal the
   service. Apps launched through Sunshine cannot trigger a handoff while they run (the refusal rule above).
