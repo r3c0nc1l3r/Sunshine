@@ -974,9 +974,10 @@ TEST_F(ProcessAdoptionTest, ChangedWorkingDirOutputTimeoutAreRefused) {
 TEST_F(ProcessAdoptionTest, ChangedEnvironmentIsRefused) {
   marker_dir_t md;
   const auto app = make_prep_app(md);
-  proc::proc_t old_proc(make_env({{"KEEP", "1"}}), {app});
+  // A changed apps.json env section is refused; the process environment alone is not part of the digest (#47).
+  proc::proc_t old_proc(make_env({}), {app}, {{"KEEP", "1"}});
   old_proc.set_running_for_test(app, 1, true, 0, 1);
-  proc::proc_t new_proc(make_env({{"KEEP", "other"}}), {app});
+  proc::proc_t new_proc(make_env({}), {app}, {{"KEEP", "other"}});
   handoff::protocol::go_t go;
   go.app = old_proc.snapshot();
   std::string reason;
