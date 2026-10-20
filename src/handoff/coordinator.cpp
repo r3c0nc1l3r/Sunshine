@@ -872,7 +872,7 @@ namespace handoff {
         BOOST_LOG(error) << "Drain handoff: the app list could not be reloaded after the rollback"sv;
         return false;
       }
-      proc::proc.swap_app_list(std::move(parsed->get_apps()));
+      proc::proc.swap_app_list(std::move(parsed->get_apps()), parsed->apps_env_section());
       return true;
     });
 

@@ -892,7 +892,8 @@ TEST_F(ProcessAdoptionTest, EmptyDigestWinsOverMissingApp) {
 
 namespace {
   constexpr const char *changed_reason = "app or prep commands changed while an app runs; cancel the app first";
-}
+  constexpr const char *not_found_reason = "app not found in this process's app list (id or name changed); cancel the app first";  ///< Reason for an id or name lookup failure.
+}  // namespace
 
 TEST_F(ProcessAdoptionTest, MissingAppIsRefused) {
   marker_dir_t md;
@@ -904,7 +905,7 @@ TEST_F(ProcessAdoptionTest, MissingAppIsRefused) {
   go.app = old_proc.snapshot();
   std::string reason;
   EXPECT_FALSE(new_proc.prepare_adoption(go, reason).has_value());
-  EXPECT_EQ(reason, changed_reason);
+  EXPECT_EQ(reason, not_found_reason);
 }
 
 TEST_F(ProcessAdoptionTest, OtherIdIsRefused) {
@@ -917,7 +918,7 @@ TEST_F(ProcessAdoptionTest, OtherIdIsRefused) {
   go.app = old_proc.snapshot();
   std::string reason;
   EXPECT_FALSE(new_proc.prepare_adoption(go, reason).has_value());
-  EXPECT_EQ(reason, changed_reason) << "the id is compared as std::to_string(app_id)";
+  EXPECT_EQ(reason, not_found_reason) << "the id is compared as std::to_string(app_id)";
 }
 
 TEST_F(ProcessAdoptionTest, OtherNameIsRefused) {
@@ -930,7 +931,7 @@ TEST_F(ProcessAdoptionTest, OtherNameIsRefused) {
   go.app = old_proc.snapshot();
   std::string reason;
   EXPECT_FALSE(new_proc.prepare_adoption(go, reason).has_value());
-  EXPECT_EQ(reason, changed_reason);
+  EXPECT_EQ(reason, not_found_reason);
 }
 
 TEST_F(ProcessAdoptionTest, ChangedPrepCommandIsRefused) {

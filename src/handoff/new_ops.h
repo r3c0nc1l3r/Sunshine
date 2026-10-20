@@ -168,8 +168,9 @@ namespace handoff {
     /**
      * @brief Check the snapshot against the reloaded app list and keep the prepared plan inside the seam. Default:
      * `proc::proc.prepare_adoption(go, reason)`; the plan is kept by the production closure until `install_adoption`.
-     * Returns `""` on success or the reason (the spec's "app or prep commands changed while an app runs; cancel the
-     * app first" for a mismatch).
+     * Returns `""` on success or the reason: "app not found in this process's app list (id or name changed); cancel the
+     * app first" when the id or name is missing, the spec's "app or prep commands changed while an app runs; cancel the
+     * app first" for a digest mismatch.
      */
     std::function<std::string(const protocol::go_t &)> prepare_adoption;
 

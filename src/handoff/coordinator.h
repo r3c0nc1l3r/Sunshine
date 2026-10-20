@@ -474,7 +474,7 @@ namespace handoff {
    *   dropped an app.
    * - `reload_after_rollback()`: in this order, `nvhttp::reload_state()` (any status but success counts as failure),
    *   `http::reload_user_creds(config::sunshine.credentials_file)` (non-zero is a failure), then `proc::parse(
-   *   config::stream.file_apps)` and, on a value, `proc::proc.swap_app_list(...)` with its list (never `proc::refresh`).
+   *   config::stream.file_apps)` and, on a value, `proc::proc.swap_app_list(...)` with its list and its `env` section (never `proc::refresh`).
    *   A failure of one step is logged as an Error and the next steps still run; the result is `false` when any step
    *   failed. The 503 gate is up and the in-flight counters are zero when it runs (the old side guarantees it).
    * - `enter_drain_mode()`: (1) `runtime().transition(mode_e::normal, mode_e::draining)` (an Error log when it is refused;

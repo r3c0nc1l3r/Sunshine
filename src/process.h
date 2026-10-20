@@ -385,6 +385,17 @@ namespace proc {
     void swap_app_list(std::vector<ctx_t> &&apps);
 
     /**
+     * @brief Replace the application list and the `apps.json` `env` section together, both from one parse.
+     *
+     * Same rules as the one-argument overload. The production reloads use this one, so the list and the section that
+     * the `GO` digest uses always come from the same `apps.json` parse.
+     *
+     * @param apps The new application list.
+     * @param apps_env The `env` section of the same parse (`apps_env_section()` of the parsed object).
+     */
+    void swap_app_list(std::vector<ctx_t> &&apps, std::vector<std::pair<std::string, std::string>> apps_env);
+
+    /**
      * @brief The top-level `apps.json` `env` section of this object, as written.
      *
      * Names and raw values (`$(VAR)` not expanded), sorted by name (byte-wise). Filled by `proc::parse`; empty when the

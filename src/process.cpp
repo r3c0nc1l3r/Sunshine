@@ -590,6 +590,11 @@ namespace proc {
     _apps = std::move(apps);
   }
 
+  void proc_t::swap_app_list(std::vector<ctx_t> &&apps, std::vector<std::pair<std::string, std::string>> apps_env) {
+    _apps = std::move(apps);
+    _apps_env = std::move(apps_env);
+  }
+
 #ifdef __linux__
   handoff::app_digest_input_t digest_input(const ctx_t &app, const std::vector<std::pair<std::string, std::string>> &apps_env) {
     handoff::app_digest_input_t input;
@@ -1017,7 +1022,7 @@ namespace proc {
       }
 
       // Byte-wise sort by name, so the digest does not depend on the order of the file
-      std::sort(apps_env.begin(), apps_env.end(), [](const auto &a, const auto &b) {
+      std::stable_sort(apps_env.begin(), apps_env.end(), [](const auto &a, const auto &b) {
         return a.first < b.first;
       });
 
