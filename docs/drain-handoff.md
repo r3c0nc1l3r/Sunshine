@@ -497,9 +497,12 @@ app: it has no process, and it is never executed again. The last session's end l
   left in its group is handed off [C11].
 - The snapshot in `GO` (step 5) describes the old process's running placebo app, or none: the app id and name, the
   number of applied prep commands (`_app_prep_it - _app_prep_begin`), a digest of its merged prep list (each entry's
-  `do`, `undo` and `elevated`), of the app's `working-dir`, `output` and `exit-timeout`, and of the base environment the
-  commands run with (the process environment plus the `apps.json` `env` section [C35], without `SUNSHINE_HANDOFF_*`).
-  The digest is computed over an ordered, length-prefixed encoding, so `("a","bc")` and `("ab","c")` differ. The
+  `do`, `undo` and `elevated`), of the app's `working-dir`, `output` and `exit-timeout`, and of the `apps.json` top-level
+  `env` section as written (names and raw values; the process environment is not part of the digest, because a process
+  started by systemd and one spawned by the handoff do not see the same environment). The names excluded from the section
+  are the launch variables (`SUNSHINE_APP_*`, `SUNSHINE_CLIENT_*`), `SUNSHINE_UDP_BASE`, `SUNSHINE_GENERATION` and
+  `SUNSHINE_HANDOFF_*`. The commands themselves still run with the process environment plus the `apps.json` `env` section
+  [C35]. The digest is computed over an ordered, length-prefixed encoding, so `("a","bc")` and `("ab","c")` differ. The
   snapshot also carries, as data and not in the digest, the launch environment the commands ran with (the `SUNSHINE_*`
   variables set by `execute` [C18]), which the new process uses for the `undo` commands. It is taken after the gate is
   up and the in-flight requests have finished, so no launch or cancel can change it afterwards.
