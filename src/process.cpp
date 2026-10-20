@@ -1005,17 +1005,15 @@ namespace proc {
       pt::read_json(file_name, tree);
 
       auto &apps_node = tree.get_child("apps"s);
-      auto env_vars_opt = tree.get_child_optional("env"s);
+      auto &env_vars = tree.get_child("env"s);
 
       auto this_env = boost::this_process::environment();
       std::vector<std::pair<std::string, std::string>> apps_env;
 
-      if (env_vars_opt) {
-        for (auto &[name, val] : *env_vars_opt) {
-          auto raw = val.get_value<std::string>();
-          apps_env.emplace_back(name, raw);
-          this_env[name] = parse_env_val(this_env, raw);
-        }
+      for (auto &[name, val] : env_vars) {
+        auto raw = val.get_value<std::string>();
+        apps_env.emplace_back(name, raw);
+        this_env[name] = parse_env_val(this_env, raw);
       }
 
       // Byte-wise sort by name, so the digest does not depend on the order of the file
