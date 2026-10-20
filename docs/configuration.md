@@ -2297,6 +2297,8 @@ The drain handoff options control upgrading or restarting Sunshine while clients
         <td colspan="2">
             Turns the drain handoff feature on or off. Set to <code>enabled</code> to allow a new Sunshine process to
             take over new sessions while existing sessions finish on the old process.
+            It is refused when Sunshine runs with privileged execution, for example from file capabilities set by
+            <code>setcap</code> for KMS capture.
             @note{Applies to Linux only.}
         </td>
     </tr>

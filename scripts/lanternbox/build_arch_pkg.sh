@@ -6,7 +6,7 @@
 #
 # Usage:
 #   build_arch_pkg.sh --commit <sha> --base-version <upstream-version> --release <n> --out <dir>
-#                     [--clone-url <url>] [--cuda] [--no-tests] [--jobs <n>]
+#                     [--clone-url <url>] [--cuda] [--no-tests] [--no-setcap] [--jobs <n>]
 #
 #   --commit        Commit to build (7-40 hex digits). It must be pushed to the clone URL.
 #   --base-version  Upstream nightly version the fork is based on, e.g. 2026.914.233613.
@@ -18,6 +18,8 @@
 #                   https://github.com/r3c0nc1l3r/Sunshine.git
 #   --cuda          Build with CUDA (installs the cuda package in the container).
 #   --no-tests      Skip the unit tests (no Xvfb, no coverage).
+#   --no-setcap     Build with _setcap=false: the package does not setcap the binary, so the
+#                   drain handoff is allowed, but KMS capture is not available.
 #   --jobs          Parallel build jobs, 1-8 (default 8). Also the container CPU limit.
 #
 # Runs on an Arch build host with docker. The host itself only runs docker; all
@@ -32,7 +34,7 @@ DEFAULT_CLONE_URL="https://github.com/r3c0nc1l3r/Sunshine.git"
 usage() {
   cat >&2 <<'USAGE'
 Usage: build_arch_pkg.sh --commit <sha> --base-version <upstream-version> --release <n> --out <dir>
-                         [--clone-url <url>] [--cuda] [--no-tests] [--jobs <n>]
+                         [--clone-url <url>] [--cuda] [--no-tests] [--no-setcap] [--jobs <n>]
 USAGE
 }
 
@@ -48,6 +50,7 @@ OUT=""
 CLONE_URL="$DEFAULT_CLONE_URL"
 CUDA=false
 TESTS=true
+SETCAP=true
 JOBS=8
 
 while [[ $# -gt 0 ]]; do
@@ -83,6 +86,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-tests)
       TESTS=false
+      shift
+      ;;
+    --no-setcap)
+      SETCAP=false
       shift
       ;;
     --jobs)
@@ -195,6 +202,7 @@ fi
 log "Build package with makepkg"
 sudo -H -u builder env \
   _use_cuda="$CUDA" \
+  _setcap="$SETCAP" \
   _run_unit_tests="$TESTS" \
   _support_headless_testing="$TESTS" \
   DISPLAY=:1 \
@@ -225,6 +233,7 @@ fi
   echo "pkgver: ${PKGVER}"
   echo "package: ${built[*]}"
   echo "cuda: $([[ "$CUDA" == true ]] && echo on || echo off)"
+  echo "setcap: $([[ "$SETCAP" == true ]] && echo on || echo off)"
   echo "tests: $([[ "$TESTS" == true ]] && echo on || echo off)"
   echo "built_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > /out/BUILDINFO.txt
@@ -233,7 +242,7 @@ outputs+=(BUILDINFO.txt)
 (cd /out && sha256sum -- "${outputs[@]}" > SHA256SUMS && chown "$HOST_UID:$HOST_GID" -- "${outputs[@]}" SHA256SUMS)
 INNER_EOF
 
-echo "Building ${BASE_VERSION}.${RELEASE} from ${COMMIT} (cuda ${CUDA}, tests ${TESTS}, jobs ${JOBS})"
+echo "Building ${BASE_VERSION}.${RELEASE} from ${COMMIT} (cuda ${CUDA}, setcap ${SETCAP}, tests ${TESTS}, jobs ${JOBS})"
 
 docker run --rm \
   --cpus "$JOBS" \
@@ -243,6 +252,7 @@ docker run --rm \
   -e RELEASE="$RELEASE" \
   -e CLONE_URL="$CLONE_URL" \
   -e CUDA="$CUDA" \
+  -e SETCAP="$SETCAP" \
   -e TESTS="$TESTS" \
   -e JOBS="$JOBS" \
   -e HOST_UID="$HOST_UID" \
