@@ -463,7 +463,8 @@ exits would refuse every later reload and `/api/restart`.
   `closed none`; 1 refused (a drain or rollback window, or the gate), worth a bounded retry; 5 usage, timeout or
   unparsable reply, worth a bounded retry; 6 unsupported (`refused unknown verb` from an older binary, or no socket and
   no instance file), final. A caller re-reads `$MAINPID` before each attempt, because the main PID moves at the
-  handover.
+  handover. Packages that include the verb install the marker file `<assets dir>/features/close-app` (for example
+  `/usr/share/sunshine/features/close-app`), so a deployment can check for the feature without running the binary.
 
 ## Shared resources while two processes run
 ### GPU

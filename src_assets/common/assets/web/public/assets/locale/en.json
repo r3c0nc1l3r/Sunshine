@@ -242,6 +242,8 @@
     "ds4_back_as_touchpad_click_desc": "When using PlayStation-style gamepad emulation, map Back/Select to Touchpad Click",
     "virtualhid_randomize_mac": "Randomize virtual controller MAC",
     "virtualhid_randomize_mac_desc": "Use a random MAC address for PlayStation-style virtual controllers instead of one based on the controller index. This avoids mixing per-controller settings when controllers are swapped on the client.",
+    "control_socket": "Control Socket",
+    "control_socket_desc": "Serve the local control socket for the close-app verb (sunshine --close-app) without the drain handoff. Linux only. Off by default.",
     "drain_handoff": "Drain Handoff",
     "drain_handoff_binary": "Drain Handoff Binary",
     "drain_handoff_binary_desc": "Path of the Sunshine binary to start for the new process during a drain handoff. Leave empty to use the path Sunshine was started from.",
