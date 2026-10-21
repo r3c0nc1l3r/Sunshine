@@ -890,11 +890,11 @@ namespace handoff {
     return exit_code_for(reply->kind);
   }
 
-  bool control_server_t::start(const fs::path &path, handler_t handler, std::string *error_out) {
+  bool control_server_t::start(const std::filesystem::path &path, handler_t handler, std::string *error_out) {
     return start(path, handlers_t {std::move(handler), {}}, error_out);
   }
 
-  bool control_server_t::start(const fs::path &path, handlers_t handlers, std::string *error_out) {
+  bool control_server_t::start(const std::filesystem::path &path, handlers_t handlers, std::string *error_out) {
     const auto fail = [error_out](const std::string &message) {
       if (error_out) {
         *error_out = message;
