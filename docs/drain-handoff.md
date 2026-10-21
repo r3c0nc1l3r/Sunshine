@@ -445,7 +445,8 @@ exits would refuse every later reload and `/api/restart`.
   budget and the action "close app"), without the web credentials: the `SO_PEERCRED` uid check above is the
   authentication. It is meant for a local helper of the same user (for example a session-hold service that closes the
   app when the client is gone). It runs synchronously on the socket's thread; a `handoff` request waits in the backlog
-  meanwhile (at most the terminate gate's budget plus the app's undo commands and exit timeout).
+  meanwhile (at most the terminate gate's budget plus the app's undo commands and exit timeout). The app's own exit
+  timeout counts too: the helper gives up after its 60 s reply bound, while the server finishes the close.
 - Replies: `closed app` when an app was running and was closed, `closed none` when none was running (the call is
   idempotent), `refused previous process still holds the app` when the terminate gate refused (the HTTP API's 503
   case; retry later), and `refused internal error` as for `handoff`.

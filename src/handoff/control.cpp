@@ -238,11 +238,14 @@ namespace handoff {
       return true;
     }
 
+#ifdef SUNSHINE_TESTS
     /**
-     * @brief Test seam: the peer uid to report instead of `SO_PEERCRED`'s, or empty. Read once per connection.
+     * @brief Test seam: the peer uid to report instead of `SO_PEERCRED`'s, or empty. Read once per connection. It exists
+     * only in test builds, so a production build always takes the uid from `SO_PEERCRED`.
      */
     std::mutex peer_uid_override_mutex;  ///< Guards `peer_uid_override`.
-    std::optional<uid_t> peer_uid_override;  ///< Uid reported by the server for every connection; empty in production.
+    std::optional<uid_t> peer_uid_override;  ///< Uid reported by the server for every connection; empty when unset.
+#endif
 
     /**
      * @brief Answer the verb of one request line, running the handler of that verb.
@@ -297,12 +300,16 @@ namespace handoff {
         return;
       }
 
+#ifdef SUNSHINE_TESTS
       std::optional<uid_t> override_uid;
       {
         std::lock_guard lock(peer_uid_override_mutex);
         override_uid = peer_uid_override;
       }
       const uid_t peer_uid = override_uid ? *override_uid : cred.uid;
+#else
+      const uid_t peer_uid = cred.uid;
+#endif
       if (peer_uid != ::geteuid()) {
         BOOST_LOG(warning) << "Drain handoff: refused control connection from another user (pid " << cred.pid << ")";
         write_all(fd, encode_reply(control_reply_t {reply_kind_e::refused, "peer uid"}), server_io_timeout);
@@ -594,10 +601,12 @@ namespace handoff {
     return control_socket_mode_e::none;
   }
 
+#ifdef SUNSHINE_TESTS
   void set_peer_uid_override_for_tests(std::optional<uid_t> uid) {
     std::lock_guard lock(peer_uid_override_mutex);
     peer_uid_override = uid;
   }
+#endif
 
   /**
    * @brief Path of the control socket of process `pid` under the runtime directory.
