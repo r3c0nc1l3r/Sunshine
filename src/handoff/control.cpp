@@ -1020,7 +1020,7 @@ namespace handoff {
     _wake_fd = wake.release();
     _bound_dev = id.first;
     _bound_ino = id.second;
-    BOOST_LOG(info) << "Drain handoff: control socket listening";
+    BOOST_LOG(info) << "Control socket listening";
     return true;
   }
 
@@ -1074,7 +1074,7 @@ namespace handoff {
     _bound_dev = id.first;
     _bound_ino = id.second;
     signal_wake(_wake_fd);  // the thread polls the new listener once a running handler has returned
-    BOOST_LOG(info) << "Drain handoff: control socket listening again";
+    BOOST_LOG(info) << "Control socket listening again";
     return true;
   }
 
