@@ -432,12 +432,40 @@ exits would refuse every later reload and `/api/restart`.
 - Mode 0600; the active process checks the connecting peer with `SO_PEERCRED` (same uid) and logs the peer pid.
 - The trust boundary is the uid: any process of the same user is trusted, as it could already reload or signal the
   service. Apps launched through Sunshine cannot trigger a handoff while they run (the refusal rule above).
-- It accepts exactly one verb (handoff) with no arguments, once per cooldown. Only the active process has a control
-  socket; a draining process has none (the old process closes it at the switch).
+- It accepts two verbs, each a single line with no arguments: `handoff` (once per cooldown) and `close-app` (below).
+  Anything else is answered `refused unknown verb`. Only the active process has a control socket; a draining process
+  has none (the old process closes it at the switch).
 - The helper connects to the socket of `$MAINPID`. Until the handover (step 7) the main PID is the old, draining
   process, which has no socket; the helper then reads that pid's instance file and fails with "a drain is in progress"
   (or "handover failing" in the `handover_failed` state, "kill pending" in the `kill_pending` state; exit 1). After the
   handover the new process is the main PID and its socket answers (refusing while a draining instance exists).
+
+### The `close-app` verb and the `control_socket` option
+- `close-app` closes the running app the way `POST /api/apps/close` does on Linux (`terminate_app` with the request
+  budget and the action "close app"), without the web credentials: the `SO_PEERCRED` uid check above is the
+  authentication. It is meant for a local helper of the same user (for example a session-hold service that closes the
+  app when the client is gone). It runs synchronously on the socket's thread; a `handoff` request waits in the backlog
+  meanwhile (at most the terminate gate's budget plus the app's undo commands and exit timeout). The app's own exit
+  timeout counts too: the helper gives up after its 60 s reply bound, while the server finishes the close.
+- Replies: `closed app` when an app was running and was closed, `closed none` when none was running (the call is
+  idempotent), `refused previous process still holds the app` when the terminate gate refused (the HTTP API's 503
+  case; retry later), and `refused internal error` as for `handoff`.
+- Log lines (Info, pids only): `Control: close app requested by pid <pid>`, then `Control: close app done (app)` or
+  `Control: close app done (none)`; a refusal is a Warning, `Control: close app refused: previous process still holds
+  the app`.
+- `control_socket = enabled` (default `disabled`) serves the control socket without the drain handoff, for
+  `close-app` only; `handoff` is then refused with `drain handoff is disabled`. `drain_handoff = enabled` implies the
+  control socket with both verbs. The control socket does not need an exec or the `SUNSHINE_HANDOFF_*` variables, so
+  it is served under privileged execution too (for example with the package's file capabilities), where the drain
+  handoff itself is refused. With both options off there is no control socket and no `control` directory.
+- The helper is `sunshine --close-app <MAINPID>`. It runs like the `--drain-handoff` helper (no config, no log file,
+  outcome on stderr), waits at most 60 s for the reply (`SUNSHINE_CLOSE_APP_REPLY_TIMEOUT`, seconds), and does not
+  wait for a role. With no socket it reads the instance file like `--drain-handoff`. Exit codes: 0 `closed app` or
+  `closed none`; 1 refused (a drain or rollback window, or the gate), worth a bounded retry; 5 usage, timeout or
+  unparsable reply, worth a bounded retry; 6 unsupported (`refused unknown verb` from an older binary, or no socket and
+  no instance file), final. A caller re-reads `$MAINPID` before each attempt, because the main PID moves at the
+  handover. Packages that include the verb install the marker file `<assets dir>/features/close-app` (for example
+  `/usr/share/sunshine/features/close-app`), so a deployment can check for the feature without running the binary.
 
 ## Shared resources while two processes run
 ### GPU

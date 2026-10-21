@@ -25,7 +25,7 @@
  * | 6 | right after step 5, when `handoff::runtime().enabled()` | `handoff::entry::open_instance_file()` (role `pending` in H, `active` in N), then `handoff::session_notifier().start()`. |
  * | 7 | `task_pool.start(1)` and the signal handlers | In the SIGTERM lambda the first statement is `handoff::hooks::on_sigterm()` (before `force_shutdown` is armed and before `shutdown_event->raise`). The SIGINT lambda is unchanged. `main` does not scrub or unset `NOTIFY_SOCKET` anywhere (the refusal gatherer reads it at call time). |
  * | 8 | after the signal handlers | `handoff_process` (section 6) is constructed here, before `proc_deinit_guard` (destruction order, section 7). Starts the shutdown watcher. |
- * | 8b | when `runtime().enabled()`, right after step 8 (so `handoff_process` is declared first and destroyed last, section 7) and before any `READY=1` can be sent (step 15 on) | N only (an H process starts it in `on_main()`): construct `std::optional<handoff::coordinator_t> coordinator` and `control_server_t control` as section 7 orders them (both `std::optional`, emplaced only when the feature is enabled; every later `coordinator` call in this table is guarded by `has_value()`), then `handoff::set_new_ops_coordinator(&*coordinator)` (`new_ops.h`) and `coordinator->start_control(control_socket_path(runtime_dir, getpid()).string())`. The path is `$RUNTIME_DIRECTORY/control/<pid>.sock` when `RUNTIME_DIRECTORY` is set (system unit, `RuntimeDirectory=sunshine`), else `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock` (user unit). In H the same `coordinator_t` is constructed here, but `start_control` is called by `sunshine_new_ops_t`'s `start_control_server` in `on_main()`. |
+ * | 8b | when `runtime().enabled()`, right after step 8 (so `handoff_process` is declared first and destroyed last, section 7) and before any `READY=1` can be sent (step 15 on) | N only (an H process starts it in `on_main()`): construct `std::optional<handoff::coordinator_t> coordinator` and `control_server_t control` as section 7 orders them (both `std::optional`, emplaced only when the feature is enabled; every later `coordinator` call in this table is guarded by `has_value()`), then `handoff::set_new_ops_coordinator(&*coordinator)` (`new_ops.h`) and `coordinator->start_control(control_socket_path(runtime_dir, getpid()).string())`. The path is `$RUNTIME_DIRECTORY/control/<pid>.sock` when `RUNTIME_DIRECTORY` is set (system unit, `RuntimeDirectory=sunshine`), else `$XDG_RUNTIME_DIR/sunshine/control/<pid>.sock` (user unit). In H the same `coordinator_t` is constructed here, but `start_control` is called by `sunshine_new_ops_t`'s `start_control_server` in `on_main()`. Otherwise, when `control_socket_mode(false, settings.control_socket)` is `close_app_only` (`control.h`; this includes privileged execution, where the drain handoff was refused), N constructs a standalone `std::optional<handoff::control_server_t>` and starts it on the same path with `{{}, close-app}` (`handoff` refused with `drain handoff is disabled`, `close-app` served by `close_app()`); it is stopped at step 18 where `stop_control()` would run. With `none`, no socket and no `control` directory are created. |
  * | 9 | `proc::refresh`, `platf::init`, `proc::init`, `reed_solomon_init`, `input::init` | unchanged; declare `handoff::entry::device_release_t input_deinit_guard {input::init()};` (section 7). |
  * | 10 H | after the gamepad probe | `handoff_process.start_new_side(...)` (section 4): the new-side thread starts and exchanges `HELLO`. |
  * | 11 | the startup encoder probe | In H first `handoff_process.new_ops()->wait_probe_decision(<hello timeout> + 2 s)` (it returns early on a shutdown request; a timeout lets the probe run). Then, in both modes, the probe is wrapped: `if (!handoff::hooks::startup_probe_skipped()) { if (video::probe_encoders()) { ...the existing Error... } }`. So the accepted override is installed before `main` reaches this gate, or the probe runs. In N the `if` is the only change. |
@@ -53,6 +53,14 @@
  * `run_helper(args, env, err)` with `args` = `argv[2...]`, writes `err` and one newline to stderr when `err` is not
  * empty, writes nothing to stdout, and returns `static_cast<int>(code)`. It reads no other environment variable and
  * leaves `NOTIFY_SOCKET` alone.
+ *
+ * The `--close-app <MAINPID>` helper is dispatched by the same `maybe_run_helper`, at the same point, with the same
+ * rules (no config, no log file, no threads, nothing on stdout), when `argv[1]` equals `--close-app` exactly. It builds
+ * `helper_env_t` the same way, except that `reply_timeout` is 60 s, overridden by `SUNSHINE_CLOSE_APP_REPLY_TIMEOUT`
+ * when it is a positive decimal integer of seconds (1 to 86400); an invalid value is ignored and one line "ignoring
+ * invalid SUNSHINE_CLOSE_APP_REPLY_TIMEOUT" goes to stderr. With no runtime directory it writes the same line as above
+ * and returns 5. Otherwise it calls `run_close_app_helper(args, env, err)` (`control.h`) and writes `err` and one
+ * newline to stderr when `err` is not empty (so "closed app" or "closed none" on success).
  *
  * ## 3. Early start and the startup policy
  *
@@ -270,6 +278,11 @@ namespace handoff::entry {
      */
     std::function<helper_exit_e(const std::vector<std::string> &, const helper_env_t &, std::string &)> run;
 
+    /**
+     * @brief `run_close_app_helper`. Default: `handoff::run_close_app_helper` (`control.h`).
+     */
+    std::function<helper_exit_e(const std::vector<std::string> &, const helper_env_t &, std::string &)> run_close_app;
+
     std::function<void(const std::string &)> write_err;  ///< Writes one line to stderr (the newline is added by the writer). Default: `std::cerr`.
   };
 
@@ -283,12 +296,23 @@ namespace handoff::entry {
   int run_drain_handoff_cli(const std::vector<std::string> &args, const cli_env_t &env);
 
   /**
-   * @brief Dispatch `--drain-handoff <MAINPID>`: the first statement of `main()`.
+   * @brief The `--close-app` dispatch with injected environment (section 2 of the file comment, after `argv[1]`
+   * matched `--close-app`). It calls `env.run_close_app`, never `env.run`.
+   *
+   * @param args The arguments after `--close-app`.
+   * @param env Environment and effects.
+   * @return The process exit code (`helper_exit_e` as an int; 5 for "no runtime directory").
+   */
+  int run_close_app_cli(const std::vector<std::string> &args, const cli_env_t &env);
+
+  /**
+   * @brief Dispatch `--drain-handoff <MAINPID>` and `--close-app <MAINPID>`: the first statement of `main()`.
    *
    * @param argc `main`'s `argc`.
    * @param argv `main`'s `argv`.
-   * @return The exit code when `argc >= 2` and `argv[1]` is exactly `--drain-handoff` (it runs the helper with the
-   *         production `cli_env_t` and `args = argv[2...]`); `std::nullopt` otherwise, with no side effect.
+   * @return The exit code when `argc >= 2` and `argv[1]` is exactly `--drain-handoff` or `--close-app` (it runs that
+   *         helper with the production `cli_env_t` and `args = argv[2...]`); `std::nullopt` otherwise, with no side
+   *         effect.
    */
   std::optional<int> maybe_run_helper(int argc, char **argv);
 

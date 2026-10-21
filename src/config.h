@@ -419,6 +419,10 @@ namespace config {
    * - `drain_handoff_cooldown` (`cooldown_s`): integer seconds, default `120`, at least the rollback window.
    * - `drain_handoff_binary` (`binary`): string path, default empty (the path Sunshine was started from). Any text is
    *   stored as given and is not checked here; a bad path fails the handoff at spawn time.
+   * - `control_socket` (`control_socket`): `enabled` or `disabled`, case-sensitive, default `disabled`. Any other text:
+   *   one Error naming the key, and the field stays `false`; it does not turn the drain handoff off and is not part of
+   *   `handoff::validate`. It is read whatever `drain_handoff` says. `main.cpp` passes it to
+   *   `handoff::control_socket_mode()` (`control.h`) with `runtime().enabled()`.
    *
    * Integer keys: "decimal integer" means an optional leading `-` followed by one or more digits that fits in `int`
    * (-2147483648 to 2147483647). Empty text, hex (`0x...`), text with spaces or other characters, and an out-of-range

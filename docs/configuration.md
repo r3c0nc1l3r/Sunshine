@@ -2316,6 +2316,33 @@ The drain handoff options control upgrading or restarting Sunshine while clients
     </tr>
 </table>
 
+### control_socket
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Turns on the control socket for the <code>close-app</code> verb without the drain handoff. The verb closes
+            the running app like the web API does. Access is limited to the Sunshine user by the socket's peer
+            credential check. <code>drain_handoff = enabled</code> also serves the socket, with both verbs.
+            It is served under privileged execution too, where the drain handoff itself is refused.
+            @note{Applies to Linux only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            control_socket = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### drain_handoff_udp_offset
 
 <table>

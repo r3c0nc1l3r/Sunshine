@@ -30,6 +30,7 @@
 #include <vector>
 
 // local includes
+#include "close_app.h"
 #include "coordinator.h"
 #include "drain.h"
 #include "gate.h"
@@ -1849,7 +1850,10 @@ namespace handoff {
       return true;
     }
     std::string open_error;
-    if (!_control.start(path, handler(), &open_error)) {
+    const control_server_t::handlers_t handlers {handler(), [](pid_t peer) {
+                                                   return close_app(peer);
+                                                 }};
+    if (!_control.start(path, handlers, &open_error)) {
       BOOST_LOG(error) << "Drain handoff: the control socket could not be opened: "sv << open_error;
       return false;
     }

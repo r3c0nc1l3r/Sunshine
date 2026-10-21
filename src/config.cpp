@@ -1654,6 +1654,30 @@ namespace config {
   }
 
   /**
+   * @brief Apply the `control_socket` option (see `config::drain_handoff` in `config.h`).
+   *
+   * Independent of `drain_handoff` and its validation. Only `enabled` and `disabled` (case-sensitive) are accepted; any
+   * other text logs one Error naming the key and leaves the field `false`.
+   *
+   * @param vars Parsed configuration entries; the consumed key is erased.
+   */
+  void apply_control_socket(std::unordered_map<std::string, std::string> &vars) {
+    auto &control = drain_handoff.control_socket;
+    if (auto it = vars.find("control_socket"s); it != std::end(vars)) {
+      const std::string value = std::move(it->second);
+      vars.erase(it);
+      if (value == "enabled"sv) {
+        control = true;
+      } else if (value == "disabled"sv) {
+        control = false;
+      } else {
+        BOOST_LOG(error) << "config: 'control_socket' must be 'enabled' or 'disabled'; the control socket option is disabled";
+        control = false;
+      }
+    }
+  }
+
+  /**
    * @brief Apply the `drain_handoff*` options (see `config::drain_handoff` in `config.h`).
    *
    * Runs after `port` is set. Invalid text logs one Error per key and disables the feature; the valid fields keep
@@ -1961,6 +1985,7 @@ namespace config {
     sunshine.port = (std::uint16_t) port;
 
     apply_drain_handoff(vars, port);
+    apply_control_socket(vars);
 
     // Now that we have the port, add web UI port-specific origins to CSRF allowed list
     // Web UI runs on port + 1 (PORT_HTTPS offset is 1 for confighttp)

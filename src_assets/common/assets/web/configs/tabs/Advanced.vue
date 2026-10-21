@@ -125,6 +125,14 @@ const config = ref(props.config)
                 default="false"
       ></Checkbox>
 
+      <!-- Control socket: serves the close-app verb without the drain handoff (off by default) -->
+      <Checkbox class="mb-3"
+                id="control_socket"
+                locale-prefix="config"
+                v-model="config.control_socket"
+                default="false"
+      ></Checkbox>
+
       <!-- Drain handoff UDP port offset -->
       <div class="mb-3">
         <label for="drain_handoff_udp_offset" class="form-label">{{ $t('config.drain_handoff_udp_offset') }}</label>

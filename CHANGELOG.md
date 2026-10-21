@@ -25,6 +25,12 @@ https://github.com/LizardByte/Sunshine/releases.
   `/usr/share/sunshine/setcap-disabled`, and its install script then skips the `setcap` of the binary: no KMS capture,
   but the drain handoff, which refuses to run with file capabilities, can be enabled. `build_arch_pkg.sh` has a
   matching `--no-setcap` flag and a `setcap` line in `BUILDINFO.txt` (#46).
+- Control socket verb `close-app` (Linux): closes the running app like `POST /api/apps/close`, for a local helper of
+  the same user; the socket's `SO_PEERCRED` uid check is the authentication, so no web credentials are needed. Replies
+  `closed app` or `closed none`. Helper `sunshine --close-app <MAINPID>` (exit 0 closed, 1 refused, 5 error, 6
+  unsupported). New opt-in option `control_socket` (default `disabled`) serves the socket for `close-app` only, also
+  with file capabilities, where the drain handoff is refused; `drain_handoff = enabled` implies it. Packages install
+  the marker `<assets dir>/features/close-app` (#49).
 
 ### Changed
 - Whenever `NOTIFY_SOCKET` is set, Sunshine sends `READY=1` once its servers run, also when the drain handoff is

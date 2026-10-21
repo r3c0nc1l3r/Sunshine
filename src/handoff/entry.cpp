@@ -118,8 +118,56 @@ namespace handoff::entry {
     return static_cast<int>(code);
   }
 
+  int run_close_app_cli(const std::vector<std::string> &args, const cli_env_t &env) {
+    const auto write_err = [&env](const std::string &line) {
+      if (env.write_err) {
+        env.write_err(line);
+      } else {
+        std::cerr << line << '\n';
+      }
+    };
+
+    helper_env_t helper_env;
+    helper_env.reply_timeout = std::chrono::seconds {60};
+    const auto runtime_directory = read_env(env.getenv, "RUNTIME_DIRECTORY");
+    const auto xdg_runtime_dir = read_env(env.getenv, "XDG_RUNTIME_DIR");
+    if (const auto dir = runtime_dir(runtime_directory, xdg_runtime_dir)) {
+      helper_env.runtime_dir = *dir;
+    }
+
+    if (env.getenv && env.getenv("SUNSHINE_CLOSE_APP_REPLY_TIMEOUT") != nullptr) {
+      if (const auto seconds = parse_reply_timeout(read_env(env.getenv, "SUNSHINE_CLOSE_APP_REPLY_TIMEOUT"))) {
+        helper_env.reply_timeout = std::chrono::seconds {*seconds};
+      } else {
+        write_err("ignoring invalid SUNSHINE_CLOSE_APP_REPLY_TIMEOUT");
+      }
+    }
+
+    if (helper_env.runtime_dir.empty()) {
+      write_err("no runtime directory (RUNTIME_DIRECTORY and XDG_RUNTIME_DIR are not set)");
+      return static_cast<int>(helper_exit_e::error);
+    }
+
+    std::string err;
+    helper_exit_e code {};
+    if (env.run_close_app) {
+      code = env.run_close_app(args, helper_env, err);
+    } else {
+      code = run_close_app_helper(args, helper_env, err);
+    }
+    if (!err.empty()) {
+      write_err(err);
+    }
+    return static_cast<int>(code);
+  }
+
   std::optional<int> maybe_run_helper(int argc, char **argv) {
-    if (argc < 2 || argv[1] == nullptr || std::strcmp(argv[1], "--drain-handoff") != 0) {
+    if (argc < 2 || argv[1] == nullptr) {
+      return std::nullopt;
+    }
+    const bool drain_handoff = std::strcmp(argv[1], "--drain-handoff") == 0;
+    const bool close_app = std::strcmp(argv[1], "--close-app") == 0;
+    if (!drain_handoff && !close_app) {
       return std::nullopt;
     }
 
@@ -132,6 +180,9 @@ namespace handoff::entry {
     env.getenv = [](const char *name) {
       return std::getenv(name);
     };
+    if (close_app) {
+      return run_close_app_cli(args, env);
+    }
     return run_drain_handoff_cli(args, env);
   }
 

@@ -48,6 +48,7 @@
 #include "video.h"
 
 #ifdef __linux__
+  #include "handoff/close_app.h"
   #include "handoff/control.h"
   #include "handoff/coordinator.h"
   #include "handoff/drain.h"
@@ -505,6 +506,26 @@ int main(int argc, char *argv[]) {
   auto coordinator_hook_guard = util::fail_guard([]() {
     handoff::set_new_ops_coordinator(nullptr);
   });
+
+  // Without the drain handoff, `control_socket = enabled` serves the `close-app` verb alone (`control.h`). Nothing is
+  // created with mode `none`. A start failure is logged by `control_server_t::start()`; Sunshine keeps running.
+  std::optional<handoff::control_server_t> close_app_control;
+  if (!handoff::runtime().enabled() && handoff::control_socket_mode(false, config::drain_handoff.control_socket) == handoff::control_socket_mode_e::close_app_only) {
+    const char *runtime_directory = std::getenv("RUNTIME_DIRECTORY");
+    const char *xdg_runtime_dir = std::getenv("XDG_RUNTIME_DIR");
+    if (const auto dir = handoff::runtime_dir(runtime_directory ? runtime_directory : "", xdg_runtime_dir ? xdg_runtime_dir : "")) {
+      handoff::control_server_t::handlers_t handlers;
+      handlers.close_app = [](pid_t peer) {
+        return handoff::close_app(peer);
+      };
+      close_app_control.emplace();
+      if (!close_app_control->start(handoff::control_socket_path(*dir, getpid()), std::move(handlers), nullptr)) {
+        close_app_control.reset();
+      }
+    } else {
+      BOOST_LOG(error) << "control_socket is enabled, but no runtime directory is set; the close-app verb is not served";
+    }
+  }
 #endif
 
   proc::refresh(config::stream.file_apps);
@@ -694,6 +715,9 @@ int main(int argc, char *argv[]) {
     handoff::set_new_ops_coordinator(nullptr);
     coordinator->stop_control();
     coordinator->join_attempt();
+  }
+  if (close_app_control) {
+    close_app_control->stop();
   }
   handoff::listeners().clear(handoff::listener_e::rtsp);
 #endif

@@ -330,6 +330,8 @@ list(APPEND PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/handoff/instance_file.cpp"
         "${CMAKE_SOURCE_DIR}/src/handoff/instance_file.h"
         "${CMAKE_SOURCE_DIR}/src/handoff/control.cpp"
+        "${CMAKE_SOURCE_DIR}/src/handoff/close_app.cpp"
+        "${CMAKE_SOURCE_DIR}/src/handoff/close_app.h"
         "${CMAKE_SOURCE_DIR}/src/handoff/control.h"
         "${CMAKE_SOURCE_DIR}/src/handoff/sd_notify.cpp"
         "${CMAKE_SOURCE_DIR}/src/handoff/sd_notify.h"

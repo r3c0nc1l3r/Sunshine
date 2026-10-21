@@ -238,13 +238,61 @@ namespace handoff {
       return true;
     }
 
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief Test seam: the peer uid to report instead of `SO_PEERCRED`'s, or empty. Read once per connection. It exists
+     * only in test builds, so a production build always takes the uid from `SO_PEERCRED`.
+     */
+    std::mutex peer_uid_override_mutex;  ///< Guards `peer_uid_override`.
+    std::optional<uid_t> peer_uid_override;  ///< Uid reported by the server for every connection; empty when unset.
+#endif
+
+    /**
+     * @brief Answer the verb of one request line, running the handler of that verb.
+     *
+     * `handoff` with an empty handler is refused with `drain handoff is disabled`; `close-app` with an empty handler and
+     * any other line are refused with `unknown verb`. A handler that throws is answered `refused internal error`.
+     *
+     * @param line The request line, newline included.
+     * @param peer_pid Peer pid from `SO_PEERCRED`, passed to the handler.
+     * @param handlers Verb handlers.
+     * @return The encoded reply line.
+     */
+    std::string dispatch_verb(const std::string &line, pid_t peer_pid, const control_server_t::handlers_t &handlers) {
+      const auto refuse = [](const std::string &reason) {
+        return encode_reply(control_reply_t {reply_kind_e::refused, reason});
+      };
+      const auto run = [&](const control_server_t::handler_t &handler, std::string_view verb) {
+        try {
+          return encode_reply(handler(peer_pid));
+        } catch (...) {
+          BOOST_LOG(error) << "Drain handoff: handler failed for the " << verb << " verb";
+          return refuse("internal error");
+        }
+      };
+
+      if (line == std::string(handoff_verb) + "\n") {
+        if (!handlers.handoff) {
+          return refuse("drain handoff is disabled");
+        }
+        return run(handlers.handoff, handoff_verb);
+      }
+      if (line == std::string(close_app_verb) + "\n") {
+        if (!handlers.close_app) {
+          return refuse("unknown verb");
+        }
+        return run(handlers.close_app, close_app_verb);
+      }
+      return refuse("unknown verb");
+    }
+
     /**
      * @brief Handle one accepted connection on the server thread.
      *
      * @param fd Accepted socket; the caller closes it.
-     * @param handler Verb handler.
+     * @param handlers Verb handlers.
      */
-    void serve_connection(int fd, const control_server_t::handler_t &handler) {
+    void serve_connection(int fd, const control_server_t::handlers_t &handlers) {
       ucred cred {};
       socklen_t cred_len = sizeof(cred);
       if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0) {
@@ -252,7 +300,17 @@ namespace handoff {
         return;
       }
 
-      if (cred.uid != ::geteuid()) {
+#ifdef SUNSHINE_TESTS
+      std::optional<uid_t> override_uid;
+      {
+        std::lock_guard lock(peer_uid_override_mutex);
+        override_uid = peer_uid_override;
+      }
+      const uid_t peer_uid = override_uid ? *override_uid : cred.uid;
+#else
+      const uid_t peer_uid = cred.uid;
+#endif
+      if (peer_uid != ::geteuid()) {
         BOOST_LOG(warning) << "Drain handoff: refused control connection from another user (pid " << cred.pid << ")";
         write_all(fd, encode_reply(control_reply_t {reply_kind_e::refused, "peer uid"}), server_io_timeout);
         return;
@@ -263,16 +321,7 @@ namespace handoff {
       std::string reply;
       switch (line.status) {
         case line_result_t::status_e::line:
-          if (line.text != std::string(handoff_verb) + "\n") {
-            reply = encode_reply(control_reply_t {reply_kind_e::refused, "unknown verb"});
-            break;
-          }
-          try {
-            reply = encode_reply(handler(cred.pid));
-          } catch (...) {
-            BOOST_LOG(error) << "Drain handoff: handler failed for the handoff verb";
-            reply = encode_reply(control_reply_t {reply_kind_e::refused, "internal error"});
-          }
+          reply = dispatch_verb(line.text, cred.pid, handlers);
           break;
 
         case line_result_t::status_e::too_long:
@@ -321,6 +370,8 @@ namespace handoff {
           return "kill_pending";
         case reply_kind_e::committed:
           return "committed";
+        case reply_kind_e::closed:
+          return "closed";
       }
       return "refused";
     }
@@ -329,6 +380,60 @@ namespace handoff {
      * @brief Identity of a socket file: device and inode.
      */
     using file_id_t = std::pair<dev_t, ino_t>;
+
+    /**
+     * @brief Why a pid has no control socket, read from its instance file.
+     *
+     * A process in `handover_failed` or `kill_pending` keeps role `draining`, so the state is checked first.
+     *
+     * @param runtime_dir Runtime directory.
+     * @param pid Process id.
+     * @return `kill pending`, `handover failing` or `a drain is in progress`; `std::nullopt` when the file gives none of
+     *         them (missing, not a regular file, too large, unreadable or not an instance file).
+     */
+    std::optional<std::string> missing_socket_reason(const fs::path &runtime_dir, pid_t pid) {
+      // Open without following a symlink and without blocking on a FIFO; only a regular file is read.
+      const auto file_path = runtime_dir / "instances" / (std::to_string(pid) + ".json");
+      fd_guard_t file(::open(file_path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
+      struct stat file_st {};
+      if (file.get() < 0 || ::fstat(file.get(), &file_st) != 0 || !S_ISREG(file_st.st_mode) || static_cast<std::size_t>(file_st.st_size) > max_instance_file_bytes) {
+        return std::nullopt;
+      }
+
+      // A file larger than the cap counts as unreadable.
+      std::string content;
+      char buffer[4096];
+      bool ok = true;
+      while (true) {
+        const auto n = ::read(file.get(), buffer, sizeof(buffer));
+        if (n < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          ok = false;
+          break;
+        }
+        if (n == 0) {
+          break;
+        }
+        content.append(buffer, static_cast<std::size_t>(n));
+        if (content.size() > max_instance_file_bytes) {
+          ok = false;
+          break;
+        }
+      }
+      const auto instance = ok ? parse_instance(content) : std::nullopt;
+      if (instance && instance->handoff == state_e::kill_pending) {
+        return std::string("kill pending");
+      }
+      if (instance && instance->handoff == state_e::handover_failed) {
+        return std::string("handover failing");
+      }
+      if (instance && instance->role == role_e::draining) {
+        return std::string("a drain is in progress");
+      }
+      return std::nullopt;
+    }
 
     /**
      * @brief Make a directory and its missing parents; created directories get mode 0700.
@@ -486,6 +591,23 @@ namespace handoff {
     }
   }  // namespace
 
+  control_socket_mode_e control_socket_mode(bool handoff_enabled, bool control_socket) {
+    if (handoff_enabled) {
+      return control_socket_mode_e::handoff;
+    }
+    if (control_socket) {
+      return control_socket_mode_e::close_app_only;
+    }
+    return control_socket_mode_e::none;
+  }
+
+#ifdef SUNSHINE_TESTS
+  void set_peer_uid_override_for_tests(std::optional<uid_t> uid) {
+    std::lock_guard lock(peer_uid_override_mutex);
+    peer_uid_override = uid;
+  }
+#endif
+
   /**
    * @brief Path of the control socket of process `pid` under the runtime directory.
    *
@@ -500,6 +622,9 @@ namespace handoff {
   std::string encode_reply(const control_reply_t &reply) {
     if (reply.kind == reply_kind_e::committed) {
       return "committed " + std::to_string(reply.new_pid) + " " + std::to_string(reply.new_start_time) + "\n";
+    }
+    if (reply.kind == reply_kind_e::closed) {
+      return reply.closed_app ? "closed app\n" : "closed none\n";
     }
 
     // One line, and short enough for the helper's reply limit.
@@ -541,6 +666,13 @@ namespace handoff {
       return reply;
     }
 
+    if (text == "closed app" || text == "closed none") {
+      control_reply_t reply;
+      reply.kind = reply_kind_e::closed;
+      reply.closed_app = text == "closed app";
+      return reply;
+    }
+
     const std::pair<std::string_view, reply_kind_e> reasons[] = {
       {"refused", reply_kind_e::refused},
       {"failed", reply_kind_e::failed},
@@ -567,6 +699,8 @@ namespace handoff {
         return helper_exit_e::kill_pending;
       case reply_kind_e::committed:
         return helper_exit_e::switched;
+      case reply_kind_e::closed:
+        return helper_exit_e::switched;  ///< `closed` is exit 0, the same code as `switched`.
     }
     return helper_exit_e::error;
   }
@@ -593,47 +727,9 @@ namespace handoff {
     // (the process closed it between the stat() and the connect()).
     const auto socket_path = control_socket_path(env.runtime_dir, *pid);
     const auto explain_missing_socket = [&]() {
-      // Open without following a symlink and without blocking on a FIFO; only a regular file is read.
-      const auto file_path = env.runtime_dir / "instances" / (std::to_string(*pid) + ".json");
-      fd_guard_t file(::open(file_path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
-      struct stat file_st {};
-      if (file.get() >= 0 && ::fstat(file.get(), &file_st) == 0 && S_ISREG(file_st.st_mode) && static_cast<std::size_t>(file_st.st_size) <= max_instance_file_bytes) {
-        // A file larger than the cap counts as unreadable.
-        std::string content;
-        char buffer[4096];
-        bool ok = true;
-        while (true) {
-          const auto n = ::read(file.get(), buffer, sizeof(buffer));
-          if (n < 0) {
-            if (errno == EINTR) {
-              continue;
-            }
-            ok = false;
-            break;
-          }
-          if (n == 0) {
-            break;
-          }
-          content.append(buffer, static_cast<std::size_t>(n));
-          if (content.size() > max_instance_file_bytes) {
-            ok = false;
-            break;
-          }
-        }
-        const auto instance = ok ? parse_instance(content) : std::nullopt;
-        // A process in handover_failed or kill_pending keeps role draining, so the state is checked first.
-        if (instance && instance->handoff == state_e::kill_pending) {
-          err = "kill pending";
-          return helper_exit_e::refused;
-        }
-        if (instance && instance->handoff == state_e::handover_failed) {
-          err = "handover failing";
-          return helper_exit_e::refused;
-        }
-        if (instance && instance->role == role_e::draining) {
-          err = "a drain is in progress";
-          return helper_exit_e::refused;
-        }
+      if (const auto reason = missing_socket_reason(env.runtime_dir, *pid)) {
+        err = *reason;
+        return helper_exit_e::refused;
       }
       err = no_socket;
       return helper_exit_e::refused;
@@ -701,7 +797,104 @@ namespace handoff {
     return helper_exit_e::unconfirmed;
   }
 
-  bool control_server_t::start(const fs::path &path, handler_t handler, std::string *error_out) {
+  helper_exit_e run_close_app_helper(const std::vector<std::string> &args, const helper_env_t &env, std::string &err) {
+    if (args.size() != 1) {
+      err = "usage: --close-app <MAINPID>";
+      return helper_exit_e::error;
+    }
+    const auto pid = parse_pid(args.front());
+    if (!pid) {
+      err = "invalid MAINPID, expected a positive decimal pid";
+      return helper_exit_e::error;
+    }
+
+    constexpr auto no_socket = "no control socket (feature disabled?)";
+    const auto no_socket_result = [&]() {
+      err = no_socket;
+      return helper_exit_e::unsupported;
+    };
+    if (env.runtime_dir.empty()) {
+      return no_socket_result();
+    }
+
+    // Without a socket, the instance file says whether a drain explains it; otherwise the verb is not served here.
+    const auto socket_path = control_socket_path(env.runtime_dir, *pid);
+    const auto missing_socket = [&]() {
+      if (const auto reason = missing_socket_reason(env.runtime_dir, *pid)) {
+        err = *reason;
+        return helper_exit_e::refused;
+      }
+      return no_socket_result();
+    };
+
+    struct stat st {};
+    if (::stat(socket_path.c_str(), &st) != 0 && errno == ENOENT) {
+      return missing_socket();
+    }
+
+    fd_guard_t guard(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (guard.get() < 0) {
+      err = std::string("socket: ") + std::strerror(errno);
+      return helper_exit_e::error;
+    }
+
+    const auto connect_tv = to_timeval(env.connect_timeout);
+    ::setsockopt(guard.get(), SOL_SOCKET, SO_SNDTIMEO, &connect_tv, sizeof(connect_tv));
+
+    sockaddr_un addr {};
+    if (!make_address(socket_path, addr)) {
+      err = "control socket path too long";
+      return helper_exit_e::error;
+    }
+    if (::connect(guard.get(), reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0) {
+      if (errno == ENOENT || errno == ECONNREFUSED) {
+        return missing_socket();
+      }
+      err = std::string("connect: ") + std::strerror(errno);
+      return helper_exit_e::error;
+    }
+
+    if (!write_all(guard.get(), std::string(close_app_verb) + "\n", env.connect_timeout)) {
+      err = "sending the request failed or timed out";
+      return helper_exit_e::error;
+    }
+
+    const auto line = read_line(guard.get(), env.reply_timeout, max_reply_bytes);
+    if (line.status != line_result_t::status_e::line) {
+      err = "no reply from the active process";
+      return helper_exit_e::error;
+    }
+    const auto reply = parse_reply(line.text);
+    if (!reply) {
+      err = "unparsable reply from the active process";
+      return helper_exit_e::error;
+    }
+
+    if (reply->kind == reply_kind_e::closed) {
+      err = reply->closed_app ? "closed app" : "closed none";
+      return helper_exit_e::switched;
+    }
+    if (reply->kind == reply_kind_e::committed) {
+      err = "unexpected reply from the active process";
+      return helper_exit_e::error;
+    }
+
+    err = std::string(kind_name(reply->kind));
+    if (!reply->reason.empty()) {
+      err += ": " + reply->reason;
+    }
+    // An older binary does not know the verb: final, not a retry.
+    if (reply->kind == reply_kind_e::refused && reply->reason == "unknown verb") {
+      return helper_exit_e::unsupported;
+    }
+    return exit_code_for(reply->kind);
+  }
+
+  bool control_server_t::start(const std::filesystem::path &path, handler_t handler, std::string *error_out) {
+    return start(path, handlers_t {std::move(handler), {}}, error_out);
+  }
+
+  bool control_server_t::start(const std::filesystem::path &path, handlers_t handlers, std::string *error_out) {
     const auto fail = [error_out](const std::string &message) {
       if (error_out) {
         *error_out = message;
@@ -736,7 +929,7 @@ namespace handoff {
     }
 
     _path = path;
-    _handler = std::move(handler);
+    _handlers = std::move(handlers);
     _stopped = false;
     const int wake_fd = wake.get();
 
@@ -783,7 +976,7 @@ namespace handoff {
 
             int client = -1;
             int accept_errno = 0;
-            handler_t current_handler;
+            handlers_t current_handlers;
             {
               std::lock_guard guard(_mutex);
               if (_stopped) {
@@ -794,7 +987,7 @@ namespace handoff {
               }
               client = ::accept4(snapshot, nullptr, nullptr, SOCK_CLOEXEC);
               accept_errno = errno;
-              current_handler = _handler;
+              current_handlers = _handlers;
             }
 
             if (client < 0) {
@@ -810,7 +1003,7 @@ namespace handoff {
 
             // Served without the lock: the handler may call close_listener(), reopen_listener() or stop().
             fd_guard_t client_guard(client);
-            serve_connection(client, current_handler);
+            serve_connection(client, current_handlers);
           } catch (...) {
             // Never let an exception end the thread (std::terminate); the fd guards have closed the connection.
             BOOST_LOG(error) << "Drain handoff: control socket thread caught an exception";
@@ -827,7 +1020,7 @@ namespace handoff {
     _wake_fd = wake.release();
     _bound_dev = id.first;
     _bound_ino = id.second;
-    BOOST_LOG(info) << "Drain handoff: control socket listening";
+    BOOST_LOG(info) << "Control socket listening";
     return true;
   }
 
@@ -881,7 +1074,7 @@ namespace handoff {
     _bound_dev = id.first;
     _bound_ino = id.second;
     signal_wake(_wake_fd);  // the thread polls the new listener once a running handler has returned
-    BOOST_LOG(info) << "Drain handoff: control socket listening again";
+    BOOST_LOG(info) << "Control socket listening again";
     return true;
   }
 
