@@ -189,16 +189,19 @@ namespace handoff {
    */
   helper_exit_e run_close_app_helper(const std::vector<std::string> &args, const helper_env_t &env, std::string &err);
 
+#ifdef SUNSHINE_TESTS
   /**
    * @brief Test-only: make the control server see `uid` as the peer uid of every connection instead of the one from
    * `SO_PEERCRED` (the peer pid still comes from `SO_PEERCRED`), or restore the real value with `std::nullopt`.
    *
    * Unit tests cannot connect as another user; this seam lets them pin the uid check. It is process-wide, read once
-   * per connection, and has no effect unless set.
+   * per connection, and has no effect unless set. It exists only in test builds (`SUNSHINE_TESTS`), so the production
+   * binary has no way to bypass the uid check.
    *
    * @param uid Uid to report, or `std::nullopt`.
    */
   void set_peer_uid_override_for_tests(std::optional<uid_t> uid);
+#endif
 
   /**
    * @brief The active process's control socket server.
