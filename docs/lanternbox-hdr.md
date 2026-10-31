@@ -3,8 +3,10 @@
 This integration adds opt-in capture negotiation, metadata, a separate VAAPI/OpenGL
 RGB10-to-P010 converter, HDR-only shaders and HEVC HDR SEI. It is implemented but
 has passed a remote release build, Doxygen and eight blind metadata tests.
-GPU tests compile but skip without an explicitly selected test render node;
-GPU/client qualification below remains required. This must not yet be described
+The three isolated GPU tests passed on an explicitly selected test render node.
+A bounded real-capture test also encoded and software-decoded the synthetic HDR
+patches as HEVC Main10/BT.2020/PQ with matching static metadata. Broader GPU
+coverage and client presentation qualification below remain required. This must not yet be described
 as accepted end-to-end HDR streaming.
 
 Use `capture = wlr` and the VAAPI encoder with an HDR10 Lanternbox compositor
@@ -78,3 +80,23 @@ packing/range, metadata in the bitstream and default SDR pixel parity need
 remote GPU qualification and independent blind tests. Real-client HDR display,
 nested compositor color handling and end-to-end presentation remain separate
 acceptance gates. Source inspection and formatting do not establish these.
+
+
+## Synthetic qualification scope
+
+Three opt-in GPU checks passed for both ranges, P010 packing, grayscale precision
+and unsupported formats. `HdrCaptureEncode.SyntheticWaylandHevcMain10` also passed
+on a single-output synthetic setup. It checks the HDR control metadata and
+writes an IDR only after a software decoder confirms the four known test patches,
+avoiding a false pass from the encoder’s blank startup image. The resulting
+1920×1080 stream was Main 10, `yuv420p10le`, full-range BT.2020 NCL/ST2084 with
+BT.2020/D65 mastering metadata, 0.005-nit black and the configured 10000-nit peak.
+Unknown CLL/FALL remained zero in the control message and absent in the bitstream.
+The temporary packet must be removed at the end of the authorized test window.
+
+The test requires the opt-in capture and synthetic-only flags, an explicit render
+node, an explicit socket exposing one output, and a private QA output path. It
+rejects `WAYLAND_SOCKET`, strips child GoogleTest sharding variables and bounds
+the worker/decoder process group. The system software FFmpeg decoder is a test
+dependency; it is not a runtime dependency of the HDR conversion implementation.
+No Moonlight client or physical/XR presentation was accepted by this test.

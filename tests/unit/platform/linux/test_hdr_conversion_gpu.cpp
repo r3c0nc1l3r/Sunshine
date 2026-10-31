@@ -42,6 +42,7 @@ namespace {
     decltype(&gbm_bo_map) map = nullptr;
     decltype(&gbm_bo_unmap) unmap = nullptr;
     decltype(&gbm_bo_get_fd) fd = nullptr;
+    decltype(&gbm_bo_get_format) format = nullptr;
     decltype(&gbm_bo_get_stride) stride = nullptr;
     decltype(&gbm_bo_get_modifier) modifier = nullptr;
 
@@ -67,6 +68,7 @@ namespace {
       LOAD(map, gbm_bo_map);
       LOAD(unmap, gbm_bo_unmap);
       LOAD(fd, gbm_bo_get_fd);
+      LOAD(format, gbm_bo_get_format);
       LOAD(stride, gbm_bo_get_stride);
       LOAD(modifier, gbm_bo_get_modifier);
   #undef LOAD
@@ -147,12 +149,19 @@ namespace {
     }
 
     void source(uint32_t format, const std::function<uint32_t(int, int)> &pixel) {
-      bo = api.create_bo(gbm, width, height, format, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR | GBM_BO_USE_WRITE);
+      // GBM_BO_USE_WRITE is for gbm_bo_write, not gbm_bo_map, and can
+      // restrict allocation to buffers that are unavailable on render nodes.
+      bo = api.create_bo(gbm, width, height, format, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
       ASSERT_NE(bo, nullptr) << "Selected node cannot allocate the synthetic buffer";
+      ASSERT_EQ(api.format(bo), format) << "Synthetic buffer format differs from the requested format";
       uint32_t map_stride = 0;
       void *map_data = nullptr;
       auto *mapped = static_cast<uint8_t *>(api.map(bo, 0, 0, width, height, GBM_BO_TRANSFER_WRITE, &map_stride, &map_data));
-      ASSERT_NE(mapped, nullptr);
+      ASSERT_NE(mapped, nullptr) << "Cannot map the synthetic buffer for writing";
+      if (map_stride < width * sizeof(uint32_t)) {
+        api.unmap(bo, map_data);
+        FAIL() << "Synthetic buffer mapping has an insufficient row stride";
+      }
       for (int y = 0; y < height; ++y) {
         auto *row = reinterpret_cast<uint32_t *>(mapped + y * map_stride);
         for (int x = 0; x < width; ++x) {
