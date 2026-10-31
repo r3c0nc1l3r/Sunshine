@@ -291,6 +291,7 @@ namespace wl {
       return current_frame == &frames[0] ? &frames[1] : &frames[0];
     }
 
+    bool reject_rgb10 {false};  ///< Reject HDR RGB10 on a Lanternbox SDR session.
     std::uint32_t required_fourcc {0};  ///< HDR DMA-BUF format requirement; zero preserves generic SDR capture.
     status_e status;  ///< Current state of the active screencopy request.
     std::array<frame_t, 2> frames;  ///< Double-buffered frame descriptors.

@@ -6,6 +6,10 @@ https://github.com/LizardByte/Sunshine/releases.
 ## Unreleased
 
 ### Added
+- Experimental Lanternbox v2 per-session SDR/HDR negotiation: probes prepare without
+  switching the display, capture waits for producer readiness, and unavailable HDR
+  falls back to SDR encoding. Opposite simultaneous capture intents fail explicitly.
+  Compilation and SDR/HDR transition qualification are pending for this extension.
 - Opt-in Lanternbox HDR10 wlr contract negotiation and validated RGB10/PQ metadata on the capture connection,
   a separate checked VAAPI VRAM RGB10-to-P010 converter with high-precision shaders and HDR-only HEVC VAAPI SEI.
   The converter preserves already-PQ values, encoder YCbCr range and exact 10-bit packing, and rejects precision,

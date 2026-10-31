@@ -297,7 +297,7 @@ namespace wl {
 
       this->interface[WLR_EXPORT_DMABUF] = true;
     } else if (!std::strcmp(interface, lanternbox_capture_manager_v1_interface.name)) {
-      capture_manager.reset((lanternbox_capture_manager_v1 *) wl_registry_bind(registry, id, &lanternbox_capture_manager_v1_interface, 1));
+      capture_manager.reset((lanternbox_capture_manager_v1 *) wl_registry_bind(registry, id, &lanternbox_capture_manager_v1_interface, std::min(version, 2u)));
     } else if (!std::strcmp(interface, zwp_linux_dmabuf_v1_interface.name)) {
       BOOST_LOG(info) << "[wayland] Found interface: "sv << interface << '(' << id << ") version "sv << version;
       dmabuf_interface = (zwp_linux_dmabuf_v1 *) wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, std::min(version, 3u));
@@ -598,6 +598,13 @@ namespace wl {
 
     if (required_fourcc && (!dmabuf_info.supported || !dmabuf_interface || dmabuf_info.format != required_fourcc || shm_info.supported)) {
       BOOST_LOG(error) << "[wayland] Lanternbox HDR requires exclusively the contracted RGB10 DMA-BUF format"sv;
+      finish_request(frame);
+      status = ERROR;
+      return;
+    }
+
+    if (reject_rgb10 && dmabuf_info.supported && (dmabuf_info.format == DRM_FORMAT_ABGR2101010 || dmabuf_info.format == DRM_FORMAT_XBGR2101010 || dmabuf_info.format == DRM_FORMAT_ARGB2101010 || dmabuf_info.format == DRM_FORMAT_XRGB2101010 || dmabuf_info.format == DRM_FORMAT_RGBA1010102 || dmabuf_info.format == DRM_FORMAT_RGBX1010102 || dmabuf_info.format == DRM_FORMAT_BGRA1010102 || dmabuf_info.format == DRM_FORMAT_BGRX1010102)) {
+      BOOST_LOG(error) << "[wayland] Lanternbox SDR session received an RGB10 frame"sv;
       finish_request(frame);
       status = ERROR;
       return;
