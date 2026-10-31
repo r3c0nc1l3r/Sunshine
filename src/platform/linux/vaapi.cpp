@@ -61,6 +61,7 @@ extern "C" {
 #include "src/platform/common.h"
 #include "src/utility.h"
 #include "src/video.h"
+#include "vaapi.h"
 
 using namespace std::literals;
 
@@ -606,6 +607,194 @@ namespace va {
   };
 
   /**
+   * @brief Opt-in VRAM converter for contracted BT.2020/PQ RGB10 to P010 only.
+   */
+  class va_hdr10_t: public va_t {
+  public:
+    /**
+     * @brief Initialize a dedicated GL context without dithering 10-bit code values.
+     * @param in_width Source crop width.
+     * @param in_height Source crop height.
+     * @param render_device Owned render-node descriptor.
+     * @param offset_x Source crop X offset.
+     * @param offset_y Source crop Y offset.
+     * @return Zero on success, otherwise minus one.
+     */
+    int init(int in_width, int in_height, file_t &&render_device, int offset_x, int offset_y) {
+      if (in_width <= 0 || in_height <= 0 || offset_x < 0 || offset_y < 0 || va_t::init(in_width, in_height, std::move(render_device))) {
+        return -1;
+      }
+      this->offset_x = offset_x;
+      this->offset_y = offset_y;
+      // This is the encoder's own context; SDR contexts retain their default state.
+      gl::ctx.Disable(GL_DITHER);
+      return egl::hdr10_gl_ok() ? 0 : -1;
+    }
+
+    /**
+     * @brief Take frame ownership before validating and importing a P010 target.
+     * @param frame Owned FFmpeg frame, including on failure.
+     * @param hw_frames_ctx_buf Hardware context describing the target format.
+     * @return Zero on success, otherwise minus one.
+     */
+    int set_frame(AVFrame *frame, AVBufferRef *hw_frames_ctx_buf) override {
+      this->hwframe.reset(frame);
+      this->frame = frame;
+      ready = false;
+      // The caller released this frame: ownership must precede every validation failure.
+      if (!frame || !hw_frames_ctx_buf || !hw_frames_ctx_buf->data || !video::colorspace_is_hdr(colorspace) || colorspace.bit_depth != 10) {
+        return -1;
+      }
+      auto hw_frames_ctx = (AVHWFramesContext *) hw_frames_ctx_buf->data;
+      if (frame->format != AV_PIX_FMT_VAAPI || hw_frames_ctx->format != AV_PIX_FMT_VAAPI || hw_frames_ctx->sw_format != AV_PIX_FMT_P010 || frame->width < 2 || frame->height < 2 || (frame->width & 1) || (frame->height & 1)) {
+        BOOST_LOG(error) << "HDR conversion requires a P010 VAAPI frame"sv;
+        return -1;
+      }
+
+      if (!frame->buf[0]) {
+        if (av_hwframe_get_buffer(hw_frames_ctx_buf, frame, 0)) {
+          BOOST_LOG(error) << "Couldn't get hwframe for VAAPI"sv;
+          return -1;
+        }
+      }
+
+      va::DRMPRIMESurfaceDescriptor prime {};
+      va::VASurfaceID surface = (std::uintptr_t) frame->data[3];
+      auto status = vaExportSurfaceHandle(
+        this->va_display,
+        surface,
+        va::SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+        va::EXPORT_SURFACE_WRITE_ONLY | va::EXPORT_SURFACE_SEPARATE_LAYERS,
+        &prime
+      );
+      if (status) {
+        BOOST_LOG(error) << "Couldn't export va surface handle: ["sv << (int) surface << "]: "sv << vaErrorStr(status);
+
+        return -1;
+      }
+
+      // Keep track of file descriptors
+      std::array<file_t, egl::nv12_img_t::num_fds> fds;
+      for (int x = 0; x < std::min<std::uint32_t>(prime.num_objects, fds.size()); ++x) {
+        fds[x] = prime.objects[x].fd;
+      }
+
+      if (prime.fourcc != VA_FOURCC_P010 || prime.num_objects == 0 || prime.num_objects > fds.size() || prime.width != static_cast<std::uint32_t>(frame->width) || prime.height != static_cast<std::uint32_t>(frame->height)) {
+        BOOST_LOG(error) << "Invalid HDR P010 export descriptor"sv;
+        return -1;
+      }
+      if (prime.num_layers != 2) {
+        BOOST_LOG(error) << "Invalid layer count for VA surface: expected 2, got "sv << prime.num_layers;
+        return -1;
+      }
+
+      egl::surface_descriptor_t sds[2] = {};
+      for (int plane = 0; plane < 2; ++plane) {
+        auto &sd = sds[plane];
+        auto &layer = prime.layers[plane];
+
+        if (layer.num_planes == 0 || layer.num_planes > 4) {
+          return -1;
+        }
+        for (std::uint32_t x = 0; x < layer.num_planes; ++x) {
+          if (layer.object_index[x] >= prime.num_objects || layer.pitch[x] == 0) {
+            return -1;
+          }
+        }
+        sd.fourcc = layer.drm_format;
+
+        // UV plane is subsampled
+        sd.width = prime.width / (plane == 0 ? 1 : 2);
+        sd.height = prime.height / (plane == 0 ? 1 : 2);
+
+        // The modifier must be the same for all planes
+        sd.modifier = prime.objects[layer.object_index[0]].drm_format_modifier;
+
+        std::fill_n(sd.fds, 4, -1);
+        for (int x = 0; x < layer.num_planes; ++x) {
+          sd.fds[x] = prime.objects[layer.object_index[x]].fd;
+          sd.pitches[x] = layer.pitch[x];
+          sd.offsets[x] = layer.offset[x];
+        }
+      }
+
+      auto nv12_opt = egl::import_hdr10_target(display.get(), std::move(fds), sds[0], sds[1]);
+      if (!nv12_opt) {
+        return -1;
+      }
+
+      auto sws_opt = egl::sws_t::make_hdr10(width, height, frame->width, frame->height);
+      if (!sws_opt) {
+        return -1;
+      }
+
+      this->sws = std::move(*sws_opt);
+      this->nv12 = std::move(*nv12_opt);
+
+      ready = true;
+      apply_colorspace();
+      return ready ? 0 : -1;
+    }
+
+    /**
+     * @brief Bind BT.2020 NCL coefficients with the encoder's independent YCbCr range.
+     */
+    void apply_colorspace() override {
+      if (!ready || !video::colorspace_is_hdr(colorspace) || colorspace.bit_depth != 10) {
+        ready = false;
+        return;
+      }
+      sws.apply_colorspace(colorspace, false);
+      ready = egl::hdr10_gl_ok();
+    }
+
+    /**
+     * @brief Convert only RGB10 DMA-BUFs or RGB10 black encoder probes.
+     * @param img Captured image; RAM and external cursor images are rejected.
+     * @return Zero on success, otherwise minus one with no SDR fallback.
+     */
+    int convert(platf::img_t &img) override {
+      auto *descriptor = dynamic_cast<egl::img_descriptor_t *>(&img);
+      if (!ready || !descriptor || descriptor->data || !video::colorspace_is_hdr(colorspace) || colorspace.bit_depth != 10) {
+        return -1;
+      }
+      if (descriptor->sequence == 0) {
+        auto blank = egl::create_hdr10_blank(width, height);
+        if (!blank) {
+          return -1;
+        }
+        // The probe is local black, not a captured image with crop coordinates.
+        egl::img_descriptor_t probe {};
+        std::fill_n(probe.sd.fds, 4, -1);
+        probe.sd.width = width;
+        probe.sd.height = height;
+        return sws.convert_hdr10(probe, 0, 0, (*blank)->tex[0], nv12->buf, colorspace.full_range);
+      }
+      if (descriptor->sd.fourcc != 0x30334241 || descriptor->sd.fds[0] < 0) {
+        BOOST_LOG(error) << "HDR conversion requires ABGR2101010 DMA-BUF input"sv;
+        return -1;
+      }
+      if (!have_source || descriptor->sequence != sequence) {
+        auto imported = egl::import_hdr10_source(display.get(), descriptor->sd);
+        if (!imported) {
+          return -1;
+        }
+        rgb = std::move(*imported);
+        sequence = descriptor->sequence;
+        have_source = true;
+      }
+      return sws.convert_hdr10(*descriptor, offset_x, offset_y, rgb->tex[0], nv12->buf, colorspace.full_range);
+    }
+
+    bool ready = false;  ///< Target and colorspace setup succeeded.
+    bool have_source = false;  ///< An actual RGB10 DMA-BUF has been imported.
+    std::uint64_t sequence = 0;  ///< Sequence committed only after a successful import.
+    egl::rgb_t rgb;  ///< Source texture, destroyed before the base EGL context.
+    int offset_x = 0;  ///< Source crop X offset.
+    int offset_y = 0;  ///< Source crop Y offset.
+  };
+
+  /**
    * This is a private structure of FFmpeg, I need this to manually create
    * a VAAPI hardware context
    *
@@ -768,6 +957,37 @@ namespace va {
     }
 
     return true;
+  }
+
+  /**
+   * @brief Create the separate, fail-closed HDR10 VRAM encode device.
+   */
+  std::unique_ptr<platf::avcodec_encode_device_t> make_hdr10_encode_device(int width, int height, int offset_x, int offset_y) {
+    auto render_device = platf::resolve_render_device();
+    file_t file = ::open(render_device.c_str(), O_RDWR);  // NOSONAR(cpp:S1874): `_sopen_s` not available
+    if (file.el < 0) {
+      BOOST_LOG(error) << "Couldn't open HDR render device"sv;
+      return nullptr;
+    }
+    return make_hdr10_encode_device(width, height, std::move(file), offset_x, offset_y);
+  }
+
+  std::unique_ptr<platf::avcodec_encode_device_t> make_hdr10_encode_device(int width, int height, file_t &&card, int offset_x, int offset_y) {
+    if (card.el < 0) {
+      return nullptr;
+    }
+    auto device = std::make_unique<va_hdr10_t>();
+    if (device->init(width, height, std::move(card), offset_x, offset_y)) {
+      return nullptr;
+    }
+    return device;
+  }
+
+  int initialize_hdr10_hwdevice(platf::avcodec_encode_device_t &device, AVBufferRef **context) {
+    if (!context || *context || !dynamic_cast<va_hdr10_t *>(&device)) {
+      return -1;
+    }
+    return vaapi_init_avcodec_hardware_input_buffer(&device, context);
   }
 
   /**

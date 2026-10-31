@@ -2251,6 +2251,11 @@ namespace video {
         }
       }
 
+      // HDR10 needs mastering-display/content-light SEI; retain sei=0 for all SDR, including 10-bit SDR.
+      if (colorspace_is_hdr(colorspace) && video_format.name == "hevc_vaapi"sv) {
+        av_dict_set(&options, "sei", "hdr", 0);
+      }
+
       // Allow the encoding device a final opportunity to set/unset or override any options
       encode_device->init_codec_options(ctx.get(), &options);
 

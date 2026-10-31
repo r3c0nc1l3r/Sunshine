@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="lanternbox_capture_v1">
+  <copyright>Copyright 2026 lanternbox contributors. MIT license.</copyright>
+  <interface name="lanternbox_capture_manager_v1" version="1">
+    <description summary="explicit HDR capture agreement">
+      This global exists only in an HDR session. It never changes the color mode.
+      A capturer must negotiate on the SAME wl_display connection used for
+      wlr-screencopy, before requesting frames. Version 1 supports only HDR10
+      dmabuf capture; no shm or mixed SDR/HDR capture is supported.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="get_hdr10">
+      <description summary="opt this connection into HDR10 for this output">
+        Creates a contract. Wait for done and validate every field before making
+        screencopy requests. The contract remains immutable for its lifetime;
+        generation identifies color semantics, not output dimensions. Mode/size
+        changes still invalidate pending screencopy frames in the usual way.
+        Keep this object alive while capturing. Destroying the last contract for
+        an output revokes permission for subsequent capture requests.
+      </description>
+      <arg name="id" type="new_id" interface="lanternbox_capture_contract_v1"/>
+      <arg name="output" type="object" interface="wl_output"/>
+    </request>
+  </interface>
+  <interface name="lanternbox_capture_contract_v1" version="1">
+    <description summary="immutable HDR10 capture contract">
+      Events are sent once, ending with done, or failed alone. The output is
+      the wl_output supplied to get_hdr10. All fields must be validated before
+      capturing. RGB is full range and BT.2020/ST2084; there is no YCbCr matrix
+      implied by this RGB contract. Consumer YCbCr conversion must use BT.2020
+      non-constant luminance, with encoder range signaled separately.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <event name="format">
+      <description summary="pixel encoding">
+        Version 1: generation=1, fourcc=DRM_FORMAT_ABGR2101010 (0x30334241),
+        primaries=9 and transfer_function=16 (H.273 codes), full_range=1.
+        Packed little-endian pixel: R bits 0..9, G 10..19, B 20..29, A 30..31.
+        Alpha is always 3. RGB code values span 0..1023, PQ normalized to
+        10000 cd/m2 independently of the virtual display peak.
+      </description>
+      <arg name="generation" type="uint"/>
+      <arg name="fourcc" type="uint"/>
+      <arg name="primaries" type="uint"/>
+      <arg name="transfer_function" type="uint"/>
+      <arg name="full_range" type="uint"/>
+    </event>
+    <event name="luminance">
+      <description summary="luminance metadata">
+        reference_white and mastering_max are in cd/m2. mastering_min is in
+        0.0001 cd/m2. max_cll and max_fall are in cd/m2; zero means unknown,
+        never substitute the virtual display peak for unknown content metadata.
+      </description>
+      <arg name="reference_white" type="uint"/>
+      <arg name="mastering_min" type="uint"/>
+      <arg name="mastering_max" type="uint"/>
+      <arg name="max_cll" type="uint"/>
+      <arg name="max_fall" type="uint"/>
+    </event>
+    <event name="mastering_primaries">
+      <description summary="mastering chromaticities">
+        CIE 1931 xy coordinates in units of 0.00002 (ST2086 units, multiply
+        by 50000). Order is red, green, blue, white. Version 1 uses BT.2020 D65.
+      </description>
+      <arg name="red_x" type="uint"/><arg name="red_y" type="uint"/>
+      <arg name="green_x" type="uint"/><arg name="green_y" type="uint"/>
+      <arg name="blue_x" type="uint"/><arg name="blue_y" type="uint"/>
+      <arg name="white_x" type="uint"/><arg name="white_y" type="uint"/>
+    </event>
+    <event name="done"/>
+    <event name="failed"><arg name="reason" type="string"/></event>
+  </interface>
+</protocol>

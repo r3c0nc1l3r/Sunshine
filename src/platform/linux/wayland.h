@@ -12,9 +12,11 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef SUNSHINE_BUILD_WAYLAND
+  #include <lanternbox-capture-v1.h>
   #include <linux-dmabuf-unstable-v1.h>
   #include <wlr-screencopy-unstable-v1.h>
   #include <xdg-output-unstable-v1.h>
@@ -33,6 +35,12 @@ struct gbm_bo;
 struct gbm_device;
 
 namespace wl {
+  /**
+   * @brief Destroy the optional HDR capture manager with a translation-unit-stable deleter.
+   * @param manager Capture manager owned by a registry connection.
+   */
+  void destroy_capture_manager(lanternbox_capture_manager_v1 *manager);
+
   /**
    * @brief Determine whether wlroots capture should keep frames in VRAM for the requested memory type.
    *
@@ -172,6 +180,7 @@ namespace wl {
       WAITING,  ///< Waiting for a frame
       READY,  ///< Frame is ready
       REINIT,  ///< Reinitialize the frame
+      ERROR,  ///< Contracted HDR frame advertised an incompatible buffer.
     };
 
     dmabuf_t();
@@ -282,6 +291,7 @@ namespace wl {
       return current_frame == &frames[0] ? &frames[1] : &frames[0];
     }
 
+    std::uint32_t required_fourcc {0};  ///< HDR DMA-BUF format requirement; zero preserves generic SDR capture.
     status_e status;  ///< Current state of the active screencopy request.
     std::array<frame_t, 2> frames;  ///< Double-buffered frame descriptors.
     frame_t *current_frame;  ///< Frame descriptor currently being filled by the compositor.
@@ -387,7 +397,7 @@ namespace wl {
     void xdg_done(zxdg_output_v1 *) {}
 
     /**
-     * @brief Receive physical wl-output geometry metadata.
+     * @brief Record whether wl-output identifies a Lanternbox source.
      *
      * @param wl_output Wayland output.
      * @param x Horizontal coordinate reported by Wayland.
@@ -399,7 +409,9 @@ namespace wl {
      * @param model Monitor model string reported by Wayland.
      * @param transform Wayland output transform value.
      */
-    void wl_geometry(wl_output *wl_output, std::int32_t x, std::int32_t y, std::int32_t physical_width, std::int32_t physical_height, std::int32_t subpixel, const char *make, const char *model, std::int32_t transform) {}
+    void wl_geometry(wl_output *wl_output, std::int32_t x, std::int32_t y, std::int32_t physical_width, std::int32_t physical_height, std::int32_t subpixel, const char *make, const char *model, std::int32_t transform) {
+      lanternbox = make && std::string_view(make) == "lanternbox";
+    }
 
     /**
      * @brief Store the active pixel mode reported by wl-output.
@@ -427,6 +439,7 @@ namespace wl {
      */
     void wl_scale(wl_output *wl_output, std::int32_t factor) {}
 
+    bool lanternbox {false};  ///< Output make identifies Lanternbox; HDR still requires a validated contract.
     wl_output *output;  ///< Wayland output associated with this monitor.
     std::string name;  ///< xdg-output name used for display selection.
     std::string description;  ///< xdg-output description used for logs and UI.
@@ -501,6 +514,7 @@ namespace wl {
     std::map<std::uint32_t, std::vector<std::uint64_t>> supported_modifiers;  ///< DRM format modifiers grouped by format.
     zwlr_screencopy_manager_v1 *screencopy_manager {nullptr};  ///< WLR screencopy global used to request frames.
     zwp_linux_dmabuf_v1 *dmabuf_interface {nullptr};  ///< Linux DMA-BUF global used to allocate frame buffers.
+    util::safe_ptr<lanternbox_capture_manager_v1, destroy_capture_manager> capture_manager;  ///< Optional Lanternbox HDR manager on this registry connection.
     zxdg_output_manager_v1 *output_manager {nullptr};  ///< xdg-output global used to query monitor names and sizes.
 
   private:

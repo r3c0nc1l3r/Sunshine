@@ -5,6 +5,13 @@ https://github.com/LizardByte/Sunshine/releases.
 
 ## Unreleased
 
+### Added
+- Opt-in Lanternbox HDR10 wlr contract negotiation and validated RGB10/PQ metadata on the capture connection,
+  a separate checked VAAPI VRAM RGB10-to-P010 converter with high-precision shaders and HDR-only HEVC VAAPI SEI.
+  The converter preserves already-PQ values, encoder YCbCr range and exact 10-bit packing, and rejects precision,
+  import, render and fallback failures. Remote build and GPU/client qualification remain required; default SDR
+  shaders, factories, formats and encoder options are unchanged.
+
 ### Fixed
 - Portal capture: a portal helper that never opened a PipeWire remote no longer closes fd 0 when it is destroyed (for
   example at startup when the portal is unavailable). Its fd and D-Bus pointers now start unset (#39).

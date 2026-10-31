@@ -825,6 +825,139 @@ namespace egl {
     return rgb;
   }
 
+  /**
+   * @brief Check and consume GL errors for the strict HDR conversion path.
+   * @return True if no GL operation failed.
+   */
+  bool hdr10_gl_ok() {
+    bool ok = true;
+    for (auto err = gl::ctx.GetError(); err != GL_NO_ERROR; err = gl::ctx.GetError()) {
+      BOOST_LOG(error) << "HDR conversion GL error: "sv << util::hex(err).to_string_view();
+      ok = false;
+    }
+    return ok;
+  }
+
+  /**
+   * @brief Require exact UNORM channel precision on the currently bound texture.
+   * @param red Required red bits.
+   * @param green Required green bits, or zero for an unused channel.
+   * @param blue Required blue bits, or zero for an unused channel.
+   * @return True if the texture preserves the required precision.
+   */
+  static bool hdr10_texture_precision(int red, int green, int blue) {
+    const GLenum sizes[] {GL_TEXTURE_RED_SIZE, GL_TEXTURE_GREEN_SIZE, GL_TEXTURE_BLUE_SIZE};
+    const GLenum types[] {GL_TEXTURE_RED_TYPE, GL_TEXTURE_GREEN_TYPE, GL_TEXTURE_BLUE_TYPE};
+    const int bits[] {red, green, blue};
+    for (int i = 0; i < 3; ++i) {
+      if (!bits[i]) {
+        continue;
+      }
+      GLint size = 0;
+      GLint type = 0;
+      gl::ctx.GetTexLevelParameteriv(GL_TEXTURE_2D, 0, sizes[i], &size);
+      gl::ctx.GetTexLevelParameteriv(GL_TEXTURE_2D, 0, types[i], &type);
+      if (size != bits[i] || type != GL_UNSIGNED_NORMALIZED) {
+        BOOST_LOG(error) << "HDR conversion requires exact UNORM texture precision"sv;
+        return false;
+      }
+    }
+    return hdr10_gl_ok();
+  }
+
+  /**
+   * @brief Import full-range, already-PQ ABGR2101010 without an RGB8 fallback.
+   */
+  std::optional<rgb_t> import_hdr10_source(display_t::pointer display, const surface_descriptor_t &source) {
+    if (source.fourcc != fourcc_code('A', 'B', '3', '0') || source.fds[0] < 0) {
+      return std::nullopt;
+    }
+    auto attribs = surface_descriptor_to_egl_attribs(source);
+    rgb_t rgb {display, eglCreateImage(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs.data()), gl::tex_t::make(1)};
+    if (!rgb->xrgb8 || !gl::egl_image_target_texture_2d()) {
+      BOOST_LOG(error) << "Couldn't import HDR RGB10 source: "sv << util::hex(eglGetError()).to_string_view();
+      return std::nullopt;
+    }
+    gl::ctx.BindTexture(GL_TEXTURE_2D, rgb->tex[0]);
+    gl::egl_image_target_texture_2d()(GL_TEXTURE_2D, rgb->xrgb8);
+    if (!hdr10_texture_precision(10, 10, 10)) {
+      return std::nullopt;
+    }
+    // EGL's ABGR2101010 import exposes R, G, B in sampler .rgb order.
+    gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+    return rgb;
+  }
+
+  /**
+   * @brief Create a normalized RGB10 black encoder-probe image.
+   */
+  std::optional<rgb_t> create_hdr10_blank(int width, int height) {
+    rgb_t rgb {EGL_NO_DISPLAY, EGL_NO_IMAGE, gl::tex_t::make(1)};
+    gl::ctx.BindTexture(GL_TEXTURE_2D, rgb->tex[0]);
+    gl::ctx.TexStorage2D(GL_TEXTURE_2D, 1, GL_RGB10_A2, width, height);
+    if (!hdr10_texture_precision(10, 10, 10)) {
+      return std::nullopt;
+    }
+    auto fb = gl::frame_buf_t::make(1);
+    fb.bind(&rgb->tex[0], &rgb->tex[0] + 1);
+    GLenum attachment = GL_COLOR_ATTACHMENT0;
+    gl::ctx.DrawBuffers(1, &attachment);
+    if (gl::ctx.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+      return std::nullopt;
+    }
+    const GLfloat black[] {0.0f, 0.0f, 0.0f, 1.0f};
+    gl::ctx.ClearBufferfv(GL_COLOR, 0, black);
+    if (!hdr10_gl_ok()) {
+      return std::nullopt;
+    }
+    return rgb;
+  }
+
+  /**
+   * @brief Import P010's separate UNORM16 planes and require renderable attachments.
+   */
+  std::optional<nv12_t> import_hdr10_target(display_t::pointer display, std::array<file_t, nv12_img_t::num_fds> &&fds, const surface_descriptor_t &y, const surface_descriptor_t &uv) {
+    if (y.fourcc != fourcc_code('R', '1', '6', ' ') || uv.fourcc != fourcc_code('G', 'R', '3', '2')) {
+      BOOST_LOG(error) << "HDR conversion requires R16/GR1616 P010 planes"sv;
+      return std::nullopt;
+    }
+    auto y_attribs = surface_descriptor_to_egl_attribs(y);
+    auto uv_attribs = surface_descriptor_to_egl_attribs(uv);
+    nv12_t target {
+      display,
+      eglCreateImage(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, y_attribs.data()),
+      eglCreateImage(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, uv_attribs.data()),
+      gl::tex_t::make(2),
+      gl::frame_buf_t::make(2),
+      std::move(fds)
+    };
+    if (!target->r8 || !target->bg88 || !gl::egl_image_target_texture_2d()) {
+      BOOST_LOG(error) << "Couldn't import HDR P010 target: "sv << util::hex(eglGetError()).to_string_view();
+      return std::nullopt;
+    }
+    for (int plane = 0; plane < 2; ++plane) {
+      gl::ctx.BindTexture(GL_TEXTURE_2D, target->tex[plane]);
+      gl::egl_image_target_texture_2d()(GL_TEXTURE_2D, plane == 0 ? target->r8 : target->bg88);
+      if (!hdr10_texture_precision(16, plane == 0 ? 0 : 16, 0)) {
+        return std::nullopt;
+      }
+    }
+    target->buf.bind(std::begin(target->tex), std::end(target->tex));
+    for (int plane = 0; plane < 2; ++plane) {
+      gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, target->buf[plane]);
+      GLenum attachment = GL_COLOR_ATTACHMENT0 + plane;
+      gl::ctx.DrawBuffers(1, &attachment);
+      if (gl::ctx.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        BOOST_LOG(error) << "HDR P010 plane is not GL-renderable"sv;
+        return std::nullopt;
+      }
+    }
+    if (!hdr10_gl_ok()) {
+      return std::nullopt;
+    }
+    return target;
+  }
+
   // Constants for clear black color Y, U, V. U & V are same so:
   const float y_black[] = {0.0f, 0.0f, 0.0f, 0.0f};  ///< Y black.
   const float uv_black[] = {0.5f, 0.5f, 0.5f, 0.5f};  ///< Uv black.
@@ -1234,6 +1367,123 @@ namespace egl {
     return sws;
   }
 
+  /**
+   * @brief Build the separate already-PQ RGB10 to P010 shader pipeline.
+   */
+  std::optional<sws_t> sws_t::make_hdr10(int in_width, int in_height, int out_width, int out_height) {
+    if (in_width <= 0 || in_height <= 0 || out_width < 2 || out_height < 2 || (out_width & 1) || (out_height & 1)) {
+      return std::nullopt;
+    }
+    sws_t sws {};
+
+    sws.serial = std::numeric_limits<std::uint64_t>::max();
+
+    // Ensure aspect ratio is maintained
+    auto scalar = std::fminf(out_width / (float) in_width, out_height / (float) in_height);
+    auto out_width_f = in_width * scalar;
+    auto out_height_f = in_height * scalar;
+
+    // Keep image edges on the P010 chroma grid without changing the sampling filter.
+    sws.out_width = std::max(2, static_cast<int>(out_width_f) & ~1);
+    sws.out_height = std::max(2, static_cast<int>(out_height_f) & ~1);
+
+    sws.in_width = in_width;
+    sws.in_height = in_height;
+
+    sws.offsetX = ((out_width - sws.out_width) / 2) & ~1;
+    sws.offsetY = ((out_height - sws.out_height) / 2) & ~1;
+
+    auto width_i = 1.0f / sws.out_width;
+
+    {
+      constexpr std::array<const char *, 4> sources {{
+        SUNSHINE_SHADERS_DIR "/ConvertUV_HDR10.frag",
+        SUNSHINE_SHADERS_DIR "/ConvertUV_HDR10.vert",
+        SUNSHINE_SHADERS_DIR "/ConvertY_HDR10.frag",
+        SUNSHINE_SHADERS_DIR "/Scene_HDR10.vert",
+      }};
+
+      constexpr std::array<GLenum, 2> shader_type {{
+        GL_FRAGMENT_SHADER,
+        GL_VERTEX_SHADER,
+      }};
+
+      constexpr auto count = sources.size();
+      std::array<util::Either<gl::shader_t, std::string>, count> compiled_sources;
+
+      bool error_flag = false;
+      for (size_t x = 0; x < count; ++x) {
+        auto &compiled_source = compiled_sources[x];
+
+        compiled_source = gl::shader_t::compile(file_handler::read_file(sources[x]), shader_type[x % 2]);
+        if (!hdr10_gl_ok()) {
+          return std::nullopt;
+        }
+
+        if (compiled_source.has_right()) {
+          BOOST_LOG(error) << sources[x] << ": "sv << compiled_source.right();
+          error_flag = true;
+        }
+      }
+
+      if (error_flag) {
+        return std::nullopt;
+      }
+
+      auto program = gl::program_t::link(compiled_sources[1].left(), compiled_sources[0].left());
+      if (program.has_right()) {
+        BOOST_LOG(error) << "GL linker: "sv << program.right();
+        return std::nullopt;
+      }
+
+      // UV - shader
+      sws.program[1] = std::move(program.left());
+
+      program = gl::program_t::link(compiled_sources[3].left(), compiled_sources[2].left());
+      if (program.has_right()) {
+        BOOST_LOG(error) << "GL linker: "sv << program.right();
+        return std::nullopt;
+      }
+
+      // Y - shader
+      sws.program[0] = std::move(program.left());
+    }
+
+    auto loc_width_i = gl::ctx.GetUniformLocation(sws.program[1].handle(), "width_i");
+    if (loc_width_i < 0) {
+      BOOST_LOG(error) << "Couldn't find uniform [width_i]"sv;
+      return std::nullopt;
+    }
+
+    gl::ctx.UseProgram(sws.program[1].handle());
+    gl::ctx.Uniform1fv(loc_width_i, 1, &width_i);
+
+    auto color_p = video::color_vectors_from_colorspace({video::colorspace_e::bt2020, false, 10}, true);
+    std::array<std::pair<const char *, std::string_view>, 5> members {{
+      {"color_vec_y", util::view(color_p->color_vec_y)},
+      {"color_vec_u", util::view(color_p->color_vec_u)},
+      {"color_vec_v", util::view(color_p->color_vec_v)},
+      {"range_y", util::view(color_p->range_y)},
+      {"range_uv", util::view(color_p->range_uv)},
+    }};
+    auto matrix = sws.program[0].uniform("ColorMatrix", members.data(), members.size());
+    if (!matrix) {
+      return std::nullopt;
+    }
+    sws.color_matrix = std::move(*matrix);
+    for (int plane = 0; plane < 2; ++plane) {
+      sws.program[plane].bind(sws.color_matrix);
+    }
+    sws.tex = gl::tex_t::make(1);
+    gl::ctx.BindTexture(GL_TEXTURE_2D, sws.tex[0]);
+    gl::ctx.TexStorage2D(GL_TEXTURE_2D, 1, GL_RGB10_A2, in_width, in_height);
+    if (!hdr10_texture_precision(10, 10, 10)) {
+      return std::nullopt;
+    }
+
+    return sws;
+  }
+
   std::optional<sws_t> sws_t::make_yuv444(int in_width, int in_height, int out_width, int out_height, gl::tex_t &&tex) {
     sws_t sws;
 
@@ -1481,6 +1731,44 @@ namespace egl {
       gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
     }
     return 0;
+  }
+
+  /**
+   * @brief Convert RGB10 with the existing filtering and chroma footprint, clearing range-correct bars.
+   */
+  int sws_t::convert_hdr10(img_descriptor_t &img, int offset_x, int offset_y, GLuint texture, gl::frame_buf_t &fb, bool full_range) {
+    if (img.data || offset_x < 0 || offset_y < 0 || img.sd.width < in_width || img.sd.height < in_height || offset_x > img.sd.width - in_width || offset_y > img.sd.height - in_height) {
+      return -1;
+    }
+    loaded_texture = texture;
+    if (offset_x || offset_y || img.sd.width != in_width || img.sd.height != in_height) {
+      auto source_fb = gl::frame_buf_t::make(1);
+      source_fb.bind(&texture, &texture + 1);
+      if (gl::ctx.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        return -1;
+      }
+      source_fb.copy(0, tex[0], offset_x, offset_y, in_width, in_height);
+      loaded_texture = tex[0];
+    }
+    gl::ctx.BindTexture(GL_TEXTURE_2D, loaded_texture);
+    for (int plane = 0; plane < 2; ++plane) {
+      gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, fb[plane]);
+      GLenum attachment = GL_COLOR_ATTACHMENT0 + plane;
+      gl::ctx.DrawBuffers(1, &attachment);
+      if (gl::ctx.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        return -1;
+      }
+      const float black_code = plane == 0 ? (full_range ? 0.0f : 64.0f) : 512.0f;
+      const float black[] {black_code * (64.0f / 65535.0f), black_code * (64.0f / 65535.0f), 0.0f, 1.0f};
+      gl::ctx.ClearBufferfv(GL_COLOR, 0, black);
+      const int divisor = plane + 1;
+      gl::ctx.UseProgram(program[plane].handle());
+      gl::ctx.Viewport(offsetX / divisor, offsetY / divisor, out_width / divisor, out_height / divisor);
+      gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+    gl::ctx.Flush();
+    return hdr10_gl_ok() ? 0 : -1;
   }
 
   int sws_t::convert_nv12(gl::frame_buf_t &fb) {

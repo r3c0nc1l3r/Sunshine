@@ -7,6 +7,7 @@
 
 // local includes
 #include "cuda.h"
+#include "lanternbox_hdr.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/video.h"
@@ -97,6 +98,11 @@ namespace wl {
       }
       display.roundtrip();
 
+      if (interface.monitors.empty()) {
+        BOOST_LOG(error) << "[wlgrab] No Wayland output is available"sv;
+        return -1;
+      }
+
       auto monitor = interface.monitors[0].get();
 
       if (!display_name.empty()) {
@@ -120,6 +126,50 @@ namespace wl {
       }
 
       output = monitor->output;
+
+      if (config.dynamicRange > 0 && (interface.capture_manager || monitor->lanternbox)) {
+#ifndef SUNSHINE_BUILD_VAAPI
+        BOOST_LOG(error) << "[wlgrab] Lanternbox HDR requires a VAAPI-enabled build"sv;
+        return -1;
+#else
+        if (hwdevice_type != platf::mem_type_e::vaapi || config.dynamicRange != 1 || config.chromaSamplingType != 0 || (config.videoFormat != 1 && config.videoFormat != 2)) {
+          BOOST_LOG(error) << "[wlgrab] Lanternbox HDR requires VAAPI VRAM and 10-bit HEVC/AV1 4:2:0"sv;
+          return -1;
+        }
+        if (!interface.capture_manager || !interface.dmabuf_interface || wl_proxy_get_version((wl_proxy *) interface.screencopy_manager) < 3) {
+          BOOST_LOG(error) << "[wlgrab] Missing Lanternbox HDR contract manager, DMA-BUF or screencopy v3"sv;
+          return -1;
+        }
+
+        /**
+         * @brief Forward immutable contract events into the strict metadata collector.
+         * @details Static callbacks reference display-owned state that outlives all capture requests.
+         */
+        static const lanternbox_capture_contract_v1_listener listener {
+          .format = [](void *data, lanternbox_capture_contract_v1 *, uint32_t generation, uint32_t fourcc, uint32_t primaries, uint32_t transfer, uint32_t full_range) {
+            static_cast<hdr10_metadata_t *>(data)->format({generation, fourcc, primaries, transfer, full_range});
+          },
+          .luminance = [](void *data, lanternbox_capture_contract_v1 *, uint32_t white, uint32_t minimum, uint32_t maximum, uint32_t cll, uint32_t fall) {
+            static_cast<hdr10_metadata_t *>(data)->luminance({white, minimum, maximum, cll, fall});
+          },
+          .mastering_primaries = [](void *data, lanternbox_capture_contract_v1 *, uint32_t rx, uint32_t ry, uint32_t gx, uint32_t gy, uint32_t bx, uint32_t by, uint32_t wx, uint32_t wy) {
+            static_cast<hdr10_metadata_t *>(data)->mastering_primaries({rx, ry, gx, gy, bx, by, wx, wy});
+          },
+          .done = [](void *data, lanternbox_capture_contract_v1 *) {
+            static_cast<hdr10_metadata_t *>(data)->done();
+          },
+          .failed = [](void *data, lanternbox_capture_contract_v1 *, const char *) {
+            static_cast<hdr10_metadata_t *>(data)->failed();
+          },
+        };
+        hdr_contract.reset(lanternbox_capture_manager_v1_get_hdr10(interface.capture_manager.get(), output));
+        if (!hdr_contract || lanternbox_capture_contract_v1_add_listener(hdr_contract.get(), &listener, &hdr10) < 0 || wl_display_roundtrip(display.get()) < 0 || !hdr10.valid()) {
+          BOOST_LOG(error) << "[wlgrab] Lanternbox HDR contract failed, is incomplete, malformed or unsupported"sv;
+          return -1;
+        }
+        dmabuf.required_fourcc = hdr10_metadata_t::fourcc;
+#endif
+      }
 
       offset_x = monitor->viewport.offset_x;
       offset_y = monitor->viewport.offset_y;
@@ -151,6 +201,37 @@ namespace wl {
       BOOST_LOG(debug) << "[wlgrab] Logical Desktop Resolution: "sv << env_logical_width << 'x' << env_logical_height;
 
       return 0;
+    }
+
+    /**
+     * @brief Report HDR only after a validated contract on this capture connection.
+     * @return True while the immutable HDR contract is held and valid.
+     */
+    bool is_hdr() override {
+      return hdr_contract && hdr10.valid();
+    }
+
+    /**
+     * @brief Export the negotiated ST2086 metadata without changing its units.
+     * @param metadata Destination metadata; cleared when no valid contract exists.
+     * @return True when negotiated HDR metadata is available.
+     */
+    bool get_hdr_metadata(SS_HDR_METADATA &metadata) override {
+      if (!is_hdr()) {
+        metadata = {};
+        return false;
+      }
+      return hdr10.get_metadata(metadata);
+    }
+
+    /**
+     * @brief Prevent an HDR source from being encoded as SDR or by an incompatible codec.
+     * @param name FFmpeg codec requested by the encoder.
+     * @param config Requested stream configuration.
+     * @return True for the existing SDR path or a compatible HDR VAAPI codec.
+     */
+    bool is_codec_supported(std::string_view name, const ::video::config_t &config) override {
+      return !hdr_contract || (is_hdr() && config.dynamicRange == 1 && config.chromaSamplingType == 0 && (name == "hevc_vaapi"sv || name == "av1_vaapi"sv));
     }
 
     /**
@@ -197,6 +278,10 @@ namespace wl {
      * @return Capture status reported to the streaming pipeline.
      */
     platf::capture_e request_frame(std::chrono::milliseconds timeout, bool cursor) {
+      if (hdr_contract && !hdr10.valid()) {
+        BOOST_LOG(error) << "[wlgrab] Lanternbox HDR contract is no longer valid"sv;
+        return platf::capture_e::error;
+      }
       auto to = std::chrono::steady_clock::now() + timeout;
 
       // Dispatch events until we get a new frame or the timeout expires
@@ -208,6 +293,9 @@ namespace wl {
         }
       } while (dmabuf.status == dmabuf_t::WAITING);
 
+      if (dmabuf.status == dmabuf_t::ERROR || (hdr_contract && !hdr10.valid())) {
+        return platf::capture_e::error;
+      }
       auto current_frame = dmabuf.current_frame;
 
       if (
@@ -227,6 +315,8 @@ namespace wl {
 
     wl::display_t display;  ///< Wayland display connection used for capture.
     interface_t interface;  ///< Wayland registry interfaces required by screencopy.
+    hdr10_metadata_t hdr10;  ///< Validated metadata for this connection and selected output.
+    util::safe_ptr<lanternbox_capture_contract_v1, lanternbox_capture_contract_v1_destroy> hdr_contract;  ///< Destroyed after pending captures and before the connection.
     dmabuf_t dmabuf;  ///< DMA-BUF feedback and format state advertised by the compositor.
 
     wl_output *output;  ///< Wayland output selected for capture.
@@ -351,6 +441,10 @@ namespace wl {
      * @return Constructed AVCodec encode device object.
      */
     std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(platf::pix_fmt_e pix_fmt) override {
+      if (hdr_contract) {
+        BOOST_LOG(error) << "[wlgrab] Lanternbox HDR forbids RAM conversion"sv;
+        return nullptr;
+      }
 #ifdef SUNSHINE_BUILD_VAAPI
       if (mem_type == platf::mem_type_e::vaapi) {
         return va::make_avcodec_encode_device(width, height, false);
@@ -489,9 +583,21 @@ namespace wl {
     std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(platf::pix_fmt_e pix_fmt) override {
 #ifdef SUNSHINE_BUILD_VAAPI
       if (mem_type == platf::mem_type_e::vaapi) {
+        if (hdr_contract) {
+          if (!is_hdr() || pix_fmt != platf::pix_fmt_e::p010) {
+            BOOST_LOG(error) << "[wlgrab] Lanternbox HDR conversion requires a valid contract and P010"sv;
+            return nullptr;
+          }
+          return va::make_hdr10_encode_device(width, height, 0, 0);
+        }
         return va::make_avcodec_encode_device(width, height, 0, 0, true);
       }
 #endif
+
+      if (hdr_contract) {
+        BOOST_LOG(error) << "[wlgrab] Lanternbox HDR forbids non-VAAPI conversion fallback"sv;
+        return nullptr;
+      }
 
 #ifdef SUNSHINE_BUILD_CUDA
       if (mem_type == platf::mem_type_e::cuda) {
