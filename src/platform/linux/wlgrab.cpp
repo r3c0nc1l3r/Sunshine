@@ -7,6 +7,7 @@
 
 // local includes
 #include "cuda.h"
+#include "lanternbox_hdr.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/video.h"
@@ -97,6 +98,11 @@ namespace wl {
       }
       display.roundtrip();
 
+      if (interface.monitors.empty()) {
+        BOOST_LOG(error) << "[wlgrab] No Wayland output is available"sv;
+        return -1;
+      }
+
       auto monitor = interface.monitors[0].get();
 
       if (!display_name.empty()) {
@@ -120,6 +126,92 @@ namespace wl {
       }
 
       output = monitor->output;
+      lanternbox_output = monitor->lanternbox || static_cast<bool>(interface.capture_manager);
+
+      bool eligible_hdr = false;
+#ifdef SUNSHINE_BUILD_VAAPI
+      eligible_hdr = config.dynamicRange == 1 && hwdevice_type == platf::mem_type_e::vaapi &&
+                     config.chromaSamplingType == 0 && (config.videoFormat == 1 || config.videoFormat == 2) &&
+                     interface.dmabuf_interface && wl_proxy_get_version((wl_proxy *) interface.screencopy_manager) >= 3;
+#endif
+      if (interface.capture_manager && wl_proxy_get_version((wl_proxy *) interface.capture_manager.get()) >= 2) {
+        session_state.request_hdr(eligible_hdr);
+        static const lanternbox_capture_session_v2_listener session_listener {
+          .mode = [](void *data, lanternbox_capture_session_v2 *, uint32_t mode) {
+            static_cast<capture_session_t *>(data)->mode(mode);
+          },
+          .format = [](void *data, lanternbox_capture_session_v2 *, uint32_t gen, uint32_t fourcc, uint32_t primaries, uint32_t transfer, uint32_t range) {
+            static_cast<capture_session_t *>(data)->format({gen, fourcc, primaries, transfer, range});
+          },
+          .luminance = [](void *data, lanternbox_capture_session_v2 *, uint32_t white, uint32_t min, uint32_t max, uint32_t cll, uint32_t fall) {
+            static_cast<capture_session_t *>(data)->luminance({white, min, max, cll, fall});
+          },
+          .mastering_primaries = [](void *data, lanternbox_capture_session_v2 *, uint32_t rx, uint32_t ry, uint32_t gx, uint32_t gy, uint32_t bx, uint32_t by, uint32_t wx, uint32_t wy) {
+            static_cast<capture_session_t *>(data)->mastering_primaries({rx, ry, gx, gy, bx, by, wx, wy});
+          },
+          .prepared = [](void *data, lanternbox_capture_session_v2 *) {
+            static_cast<capture_session_t *>(data)->prepared();
+          },
+          .ready = [](void *data, lanternbox_capture_session_v2 *, uint32_t epoch) {
+            static_cast<capture_session_t *>(data)->ready(epoch);
+          },
+          .failed = [](void *data, lanternbox_capture_session_v2 *, const char *reason) {
+            BOOST_LOG(error) << "[wlgrab] Lanternbox capture session failed: " << (reason ? reason : "unknown");
+            static_cast<capture_session_t *>(data)->failed();
+          },
+        };
+        session.reset(lanternbox_capture_manager_v1_get_session(interface.capture_manager.get(), output, eligible_hdr ? 1 : 0));
+        if (!session || lanternbox_capture_session_v2_add_listener(session.get(), &session_listener, &session_state) < 0) {
+          BOOST_LOG(error) << "[wlgrab] Unable to create Lanternbox capture session"sv;
+          return -1;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (!session_state.valid() && !session_state.terminal()) {
+          const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+          if (remaining.count() <= 0 || !display.dispatch(remaining)) {
+            break;
+          }
+        }
+        if (!session_state.valid()) {
+          BOOST_LOG(error) << "[wlgrab] Invalid or timed out Lanternbox capture session preparation"sv;
+          return -1;
+        }
+        if (session_state.is_hdr()) {
+          dmabuf.required_fourcc = hdr10_metadata_t::fourcc;
+        }
+      } else if (eligible_hdr && interface.capture_manager) {
+#ifdef SUNSHINE_BUILD_VAAPI
+        /**
+         * @brief Forward immutable contract events into the strict metadata collector.
+         * @details Static callbacks reference display-owned state that outlives all capture requests.
+         */
+        static const lanternbox_capture_contract_v1_listener listener {
+          .format = [](void *data, lanternbox_capture_contract_v1 *, uint32_t generation, uint32_t fourcc, uint32_t primaries, uint32_t transfer, uint32_t full_range) {
+            static_cast<hdr10_metadata_t *>(data)->format({generation, fourcc, primaries, transfer, full_range});
+          },
+          .luminance = [](void *data, lanternbox_capture_contract_v1 *, uint32_t white, uint32_t minimum, uint32_t maximum, uint32_t cll, uint32_t fall) {
+            static_cast<hdr10_metadata_t *>(data)->luminance({white, minimum, maximum, cll, fall});
+          },
+          .mastering_primaries = [](void *data, lanternbox_capture_contract_v1 *, uint32_t rx, uint32_t ry, uint32_t gx, uint32_t gy, uint32_t bx, uint32_t by, uint32_t wx, uint32_t wy) {
+            static_cast<hdr10_metadata_t *>(data)->mastering_primaries({rx, ry, gx, gy, bx, by, wx, wy});
+          },
+          .done = [](void *data, lanternbox_capture_contract_v1 *) {
+            static_cast<hdr10_metadata_t *>(data)->done();
+          },
+          .failed = [](void *data, lanternbox_capture_contract_v1 *, const char *) {
+            static_cast<hdr10_metadata_t *>(data)->failed();
+          },
+        };
+        hdr_contract.reset(lanternbox_capture_manager_v1_get_hdr10(interface.capture_manager.get(), output));
+        if (!hdr_contract || lanternbox_capture_contract_v1_add_listener(hdr_contract.get(), &listener, &hdr10) < 0 || wl_display_roundtrip(display.get()) < 0 || !hdr10.valid()) {
+          BOOST_LOG(error) << "[wlgrab] Lanternbox HDR contract failed, is incomplete, malformed or unsupported"sv;
+          return -1;
+        }
+        dmabuf.required_fourcc = hdr10_metadata_t::fourcc;
+#endif
+      }
+
+      dmabuf.reject_rgb10 = lanternbox_output && !is_hdr();
 
       offset_x = monitor->viewport.offset_x;
       offset_y = monitor->viewport.offset_y;
@@ -151,6 +243,40 @@ namespace wl {
       BOOST_LOG(debug) << "[wlgrab] Logical Desktop Resolution: "sv << env_logical_width << 'x' << env_logical_height;
 
       return 0;
+    }
+
+    /**
+     * @brief Report HDR only after a validated contract on this capture connection.
+     * @return True while the immutable HDR contract is held and valid.
+     */
+    bool is_hdr() override {
+      return (session && session_state.is_hdr()) || (hdr_contract && hdr10.valid());
+    }
+
+    /**
+     * @brief Export the negotiated ST2086 metadata without changing its units.
+     * @param metadata Destination metadata; cleared when no valid contract exists.
+     * @return True when negotiated HDR metadata is available.
+     */
+    bool get_hdr_metadata(SS_HDR_METADATA &metadata) override {
+      if (!is_hdr()) {
+        metadata = {};
+        return false;
+      }
+      return session ? session_state.get_metadata(metadata) : hdr10.get_metadata(metadata);
+    }
+
+    /**
+     * @brief Prevent an HDR source from being encoded as SDR or by an incompatible codec.
+     * @param name FFmpeg codec requested by the encoder.
+     * @param config Requested stream configuration.
+     * @return True for the existing SDR path or a compatible HDR VAAPI codec.
+     */
+    bool is_codec_supported(std::string_view name, const ::video::config_t &config) override {
+      if (lanternbox_output && config.dynamicRange && !is_hdr()) {
+        return false;
+      }
+      return !is_hdr() || (config.dynamicRange == 1 && config.chromaSamplingType == 0 && (name == "hevc_vaapi"sv || name == "av1_vaapi"sv));
     }
 
     /**
@@ -197,7 +323,36 @@ namespace wl {
      * @return Capture status reported to the streaming pipeline.
      */
     platf::capture_e request_frame(std::chrono::milliseconds timeout, bool cursor) {
+      if (hdr_contract && !hdr10.valid()) {
+        BOOST_LOG(error) << "[wlgrab] Lanternbox HDR contract is no longer valid"sv;
+        return platf::capture_e::error;
+      }
       auto to = std::chrono::steady_clock::now() + timeout;
+      if (session) {
+        if (!session_state.valid()) {
+          dmabuf.cancel();
+          return platf::capture_e::error;
+        }
+        if (!session_state.color_epoch()) {
+          if (!session_state.activating()) {
+            return platf::capture_e::error;
+          }
+          lanternbox_capture_session_v2_activate(session.get());
+          while (session_state.valid() && !session_state.color_epoch()) {
+            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(to - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0 || !display.dispatch(remaining)) {
+              session_state.failed();
+              dmabuf.cancel();
+              BOOST_LOG(error) << "[wlgrab] Timed out awaiting Lanternbox producer readiness"sv;
+              return platf::capture_e::error;
+            }
+          }
+          if (!session_state.valid()) {
+            dmabuf.cancel();
+            return platf::capture_e::error;
+          }
+        }
+      }
 
       // Dispatch events until we get a new frame or the timeout expires
       dmabuf.listen(interface.screencopy_manager, interface.dmabuf_interface, &interface.supported_modifiers, output, cursor);
@@ -206,8 +361,12 @@ namespace wl {
         if (remaining_time_ms.count() < 0 || !display.dispatch(remaining_time_ms)) {
           return platf::capture_e::timeout;
         }
-      } while (dmabuf.status == dmabuf_t::WAITING);
+      } while (dmabuf.status == dmabuf_t::WAITING && (!session || session_state.valid()));
 
+      if (dmabuf.status == dmabuf_t::ERROR || (hdr_contract && !hdr10.valid()) || (session && !session_state.valid())) {
+        dmabuf.cancel();
+        return platf::capture_e::error;
+      }
       auto current_frame = dmabuf.current_frame;
 
       if (
@@ -221,12 +380,17 @@ namespace wl {
       return platf::capture_e::ok;
     }
 
+    bool lanternbox_output {false};  ///< Lanternbox capture requires its effective intent to match encoding.
     platf::mem_type_e mem_type;  ///< Mem type.
 
     std::chrono::nanoseconds delay;  ///< Delay before the timer task becomes eligible to run.
 
     wl::display_t display;  ///< Wayland display connection used for capture.
     interface_t interface;  ///< Wayland registry interfaces required by screencopy.
+    hdr10_metadata_t hdr10;  ///< Validated metadata for this connection and selected output.
+    util::safe_ptr<lanternbox_capture_contract_v1, lanternbox_capture_contract_v1_destroy> hdr_contract;  ///< Destroyed after pending captures and before the connection.
+    capture_session_t session_state;  ///< Strict v2 session event state.
+    util::safe_ptr<lanternbox_capture_session_v2, lanternbox_capture_session_v2_destroy> session;  ///< Lease retained until pending capture cleanup.
     dmabuf_t dmabuf;  ///< DMA-BUF feedback and format state advertised by the compositor.
 
     wl_output *output;  ///< Wayland output selected for capture.
@@ -351,6 +515,10 @@ namespace wl {
      * @return Constructed AVCodec encode device object.
      */
     std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(platf::pix_fmt_e pix_fmt) override {
+      if (is_hdr()) {
+        BOOST_LOG(error) << "[wlgrab] Lanternbox HDR forbids RAM conversion"sv;
+        return nullptr;
+      }
 #ifdef SUNSHINE_BUILD_VAAPI
       if (mem_type == platf::mem_type_e::vaapi) {
         return va::make_avcodec_encode_device(width, height, false);
@@ -489,9 +657,21 @@ namespace wl {
     std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(platf::pix_fmt_e pix_fmt) override {
 #ifdef SUNSHINE_BUILD_VAAPI
       if (mem_type == platf::mem_type_e::vaapi) {
+        if (is_hdr()) {
+          if (!is_hdr() || pix_fmt != platf::pix_fmt_e::p010) {
+            BOOST_LOG(error) << "[wlgrab] Lanternbox HDR conversion requires a valid contract and P010"sv;
+            return nullptr;
+          }
+          return va::make_hdr10_encode_device(width, height, 0, 0);
+        }
         return va::make_avcodec_encode_device(width, height, 0, 0, true);
       }
 #endif
+
+      if (is_hdr()) {
+        BOOST_LOG(error) << "[wlgrab] Lanternbox HDR forbids non-VAAPI conversion fallback"sv;
+        return nullptr;
+      }
 
 #ifdef SUNSHINE_BUILD_CUDA
       if (mem_type == platf::mem_type_e::cuda) {

@@ -640,10 +640,60 @@ namespace egl {
   };
 
   /**
+   * @brief Check and consume errors from the dedicated HDR GL context.
+   * @return True if no errors were pending.
+   */
+  bool hdr10_gl_ok();
+  /**
+   * @brief Import the contracted ABGR2101010 source as an RGB10 texture.
+   * @param display Importing EGL display.
+   * @param source Full-range BT.2020/PQ DMA-BUF description.
+   * @return Imported image, or empty on format, precision or GL failure.
+   */
+  std::optional<rgb_t> import_hdr10_source(display_t::pointer display, const surface_descriptor_t &source);
+  /**
+   * @brief Allocate and clear a normalized RGB10 black probe texture.
+   * @param width Probe width.
+   * @param height Probe height.
+   * @return Black image, or empty on GL failure.
+   */
+  std::optional<rgb_t> create_hdr10_blank(int width, int height);
+  /**
+   * @brief Import renderable R16/GR1616 P010 planes without reducing precision.
+   * @param display Importing EGL display.
+   * @param fds Owned DMA-BUF descriptors.
+   * @param y Luma plane description.
+   * @param uv Chroma plane description.
+   * @return Imported planes, or empty on format, precision or GL failure.
+   */
+  std::optional<nv12_t> import_hdr10_target(display_t::pointer display, std::array<file_t, nv12_img_t::num_fds> &&fds, const surface_descriptor_t &y, const surface_descriptor_t &uv);
+
+  /**
    * @brief EGL/OpenGL scaler and colorspace conversion pipeline.
    */
   class sws_t {
   public:
+    /**
+     * @brief Build only the HDR10 RGB10/P010 pipeline, preserving source sampling.
+     * @param in_width Capture width.
+     * @param in_height Capture height.
+     * @param out_width Even encoder width.
+     * @param out_height Even encoder height.
+     * @return Converter, or empty on allocation, shader or GL failure.
+     */
+    static std::optional<sws_t> make_hdr10(int in_width, int in_height, int out_width, int out_height);
+    /**
+     * @brief Render P010 with range-correct bars and strict GL error propagation.
+     * @param img Source descriptor; external cursor pixels are forbidden.
+     * @param offset_x Source crop X offset.
+     * @param offset_y Source crop Y offset.
+     * @param texture Imported or black RGB10 texture.
+     * @param fb P010 output framebuffers.
+     * @param full_range Whether encoder YCbCr uses full range.
+     * @return Zero on success, otherwise minus one.
+     */
+    int convert_hdr10(img_descriptor_t &img, int offset_x, int offset_y, GLuint texture, gl::frame_buf_t &fb, bool full_range);
+
     /**
      * @brief Create a software-scaling pipeline that renders to NV12 planes.
      *

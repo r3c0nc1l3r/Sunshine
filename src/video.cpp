@@ -676,7 +676,7 @@ namespace video {
    * @brief Synchronous capture thread state.
    */
   struct capture_thread_sync_ctx_t {
-    encode_session_ctx_queue_t encode_session_ctx_queue {30};  ///< Encode session ctx queue.
+    encode_session_ctx_queue_t encode_session_ctx_queue {30, encode_session_ctx_queue_t::overflow_policy_e::reject};  ///< Encode session ctx queue.
   };
 
   /**
@@ -2282,6 +2282,11 @@ namespace video {
         }
       }
 
+      // HDR10 needs mastering-display/content-light SEI; retain sei=0 for all SDR, including 10-bit SDR.
+      if (colorspace_is_hdr(colorspace) && video_format.name == "hevc_vaapi"sv) {
+        av_dict_set(&options, "sei", "hdr", 0);
+      }
+
       // Allow the encoding device a final opportunity to set/unset or override any options
       encode_device->init_codec_options(ctx.get(), &options);
 
@@ -2665,6 +2670,26 @@ namespace video {
   }
 
   /**
+   * @brief Normalize an unsupported Lanternbox HDR request to the prepared SDR capture intent.
+   * @param disp Prepared capture display.
+   * @param encoder Selected encoder.
+   * @param config Requested stream configuration.
+   * @return Configuration matching the effective capture intent.
+   */
+  config_t resolve_capture_range(platf::display_t &disp, const encoder_t &encoder, config_t config) {
+#ifdef __linux__
+    if (config.dynamicRange && !disp.is_hdr() && !disp.is_codec_supported(encoder.codec_from_config(config).name, config)) {
+      BOOST_LOG(warning) << "Capture prepared SDR; falling back to 8-bit SDR encoding"sv;
+      config.dynamicRange = 0;
+    }
+#else
+    (void) disp;
+    (void) encoder;
+#endif
+    return config;
+  }
+
+  /**
    * @brief Create synced session.
    *
    * @param disp Display connection or display handle.
@@ -2678,13 +2703,14 @@ namespace video {
 
     encode_session.ctx = &ctx;
 
-    auto encode_device = make_encode_device(*disp, encoder, ctx.config);
+    auto effective_config = resolve_capture_range(*disp, encoder, ctx.config);
+    auto encode_device = make_encode_device(*disp, encoder, effective_config);
     if (!encode_device) {
       return std::nullopt;
     }
 
     // absolute mouse coordinates require that the dimensions of the screen are known
-    ctx.touch_port_events->raise(make_port(disp, ctx.config));
+    ctx.touch_port_events->raise(make_port(disp, effective_config));
 
     // Update client with our current HDR display state
     hdr_info_t hdr_info = std::make_unique<hdr_info_raw_t>(false);
@@ -2697,7 +2723,7 @@ namespace video {
     }
     ctx.hdr_events->raise(std::move(hdr_info));
 
-    auto session = make_encode_session(disp, encoder, ctx.config, img.width, img.height, std::move(encode_device));
+    auto session = make_encode_session(disp, encoder, effective_config, img.width, img.height, std::move(encode_device));
     if (!session) {
       return std::nullopt;
     }
@@ -2720,13 +2746,15 @@ namespace video {
    * @param encode_session_ctx_queue Pending synchronized session context queue.
    * @param display_names Cached display names.
    * @param display_p Active display index.
+   * @param last_join Receives the last caller's completion signal.
    * @return Encoder loop result.
    */
   encode_e encode_run_sync(
     std::vector<std::unique_ptr<sync_session_ctx_t>> &synced_session_ctxs,
     encode_session_ctx_queue_t &encode_session_ctx_queue,
     std::vector<std::string> &display_names,
-    int &display_p
+    int &display_p,
+    safe::signal_t *&last_join
   ) {
     const auto &encoder = *chosen_encoder;
 
@@ -2801,8 +2829,12 @@ namespace video {
         KITTY_WHILE_LOOP(auto pos = std::begin(synced_sessions), pos != std::end(synced_sessions), {
           auto ctx = pos->ctx;
           if (ctx->shutdown_event->peek()) {
-            // Let waiting thread know it can delete shutdown_event
-            ctx->join_event->raise(true);
+            // The last caller is released after the display and images are gone.
+            if (synced_sessions.size() == 1) {
+              last_join = ctx->join_event;
+            } else {
+              ctx->join_event->raise(true);
+            }
 
             pos = synced_sessions.erase(pos);
             synced_session_ctxs.erase(std::find_if(std::begin(synced_session_ctxs), std::end(synced_session_ctxs), [&ctx_p = ctx](auto &ctx) {
@@ -2877,6 +2909,16 @@ namespace video {
    * @brief Run synchronous capture and encode work on the capture thread.
    */
   void captureThreadSync() {
+    safe::signal_t *last_join = nullptr;
+    std::vector<safe::signal_t *> pending_joins;
+    auto release_callers = util::fail_guard([&]() {
+      if (last_join) {
+        last_join->raise(true);
+      }
+      for (auto *join : pending_joins) {
+        join->raise(true);
+      }
+    });
     auto ref = capture_thread_sync.ref();
 
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
@@ -2887,12 +2929,12 @@ namespace video {
 
       for (auto &ctx : synced_session_ctxs) {
         ctx->shutdown_event->raise(true);
-        ctx->join_event->raise(true);
+        pending_joins.push_back(ctx->join_event);
       }
 
       for (auto &ctx : ctx.unsafe()) {
         ctx.shutdown_event->raise(true);
-        ctx.join_event->raise(true);
+        pending_joins.push_back(ctx.join_event);
       }
     });
 
@@ -2902,7 +2944,7 @@ namespace video {
 
     std::vector<std::string> display_names;
     int display_p = -1;
-    while (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p) == encode_e::reinit) {}
+    while (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p, last_join) == encode_e::reinit) {}
   }
 
   /**
@@ -2967,13 +3009,14 @@ namespace video {
 
       auto &encoder = *chosen_encoder;
 
-      auto encode_device = make_encode_device(*display, encoder, config);
+      auto effective_config = resolve_capture_range(*display, encoder, config);
+      auto encode_device = make_encode_device(*display, encoder, effective_config);
       if (!encode_device) {
         return;
       }
 
       // absolute mouse coordinates require that the dimensions of the screen are known
-      touch_port_event->raise(make_port(display.get(), config));
+      touch_port_event->raise(make_port(display.get(), effective_config));
 
       // Update client with our current HDR display state
       hdr_info_t hdr_info = std::make_unique<hdr_info_raw_t>(false);
@@ -2991,7 +3034,7 @@ namespace video {
         frame_nr,
         mail,
         images,
-        config,
+        effective_config,
         display,
         std::move(encode_device),
         ref->reinit_event,
@@ -3026,6 +3069,30 @@ namespace video {
   ) {
     config = resolve_dynamic_range(*chosen_encoder, config);
 
+#ifdef __linux__
+    // The capture thread shares its first display with every encoder context.
+    // Keep opposite requested intents out until the last capture reference has
+    // shut down and its display and queued images have been released.
+    static std::mutex capture_mode_mutex;
+    static unsigned capture_mode_users = 0;
+    static bool capture_mode_hdr = false;
+    const bool requested_hdr = config.dynamicRange != 0;
+    {
+      std::lock_guard lock {capture_mode_mutex};
+      if (capture_mode_users && capture_mode_hdr != requested_hdr) {
+        BOOST_LOG(error) << "Cannot share capture between SDR and HDR streams; stop the existing streams first"sv;
+        mail->event<bool>(mail::shutdown)->raise(true);
+        return;
+      }
+      capture_mode_hdr = requested_hdr;
+      ++capture_mode_users;
+    }
+    auto mode_guard = util::fail_guard([&]() {
+      std::lock_guard lock {capture_mode_mutex};
+      --capture_mode_users;
+    });
+#endif
+
     auto idr_events = mail->event<bool>(mail::idr);
 
     idr_events->raise(true);
@@ -3034,17 +3101,25 @@ namespace video {
     } else {
       safe::signal_t join_event;
       auto ref = capture_thread_sync.ref();
-      ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
-        &join_event,
-        mail->event<bool>(mail::shutdown),
-        mail::man->queue<packet_t>(mail::video_packets),
-        std::move(idr_events),
-        mail->event<hdr_info_t>(mail::hdr),
-        mail->event<input::touch_port_t>(mail::touch_port),
-        config,
-        1,
-        channel_data,
-      });
+      if (!ref) {
+        mail->event<bool>(mail::shutdown)->raise(true);
+        return;
+      }
+      if (!ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
+            &join_event,
+            mail->event<bool>(mail::shutdown),
+            mail::man->queue<packet_t>(mail::video_packets),
+            std::move(idr_events),
+            mail->event<hdr_info_t>(mail::hdr),
+            mail->event<input::touch_port_t>(mail::touch_port),
+            config,
+            1,
+            channel_data,
+          })) {
+        BOOST_LOG(error) << "Synchronous capture worker is stopping or its queue is full"sv;
+        mail->event<bool>(mail::shutdown)->raise(true);
+        return;
+      }
 
       // Wait for join signal
       join_event.view();
