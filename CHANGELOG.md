@@ -3,7 +3,9 @@
 Fork changes on top of the upstream base. Upstream's own changelog is at
 https://github.com/LizardByte/Sunshine/releases.
 
-## Unreleased
+## v2026.914.233613-lb.3
+Upstream base: `63d35f702ee9` (nightly `2026.914.233613`). Arch packages `sunshine 2026.914.233613.10-1` (CUDA off)
+and `sunshine 2026.914.233613.11-1` (CUDA on). Both sort above the lb.2 test packages `.7` and `.8`.
 
 ### Fixed
 - Capture: when a backend keeps reporting a display re-init without ever capturing a frame (for example wlroots capture
