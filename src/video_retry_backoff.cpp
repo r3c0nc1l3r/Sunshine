@@ -1,6 +1,6 @@
 /**
  * @file src/video_retry_backoff.cpp
- * @brief Definitions for the backoff between failed encode runs.
+ * @brief Definitions for the backoff between failed encode runs and display re-inits.
  */
 
 // standard includes
@@ -38,5 +38,14 @@ namespace video {
 
   void retry_backoff_t::reset() {
     _failures = 0;
+  }
+
+  std::chrono::milliseconds reinit_delay(retry_backoff_t &backoff, bool requested, bool frame_since_open, std::chrono::milliseconds lifetime) {
+    if (requested) {
+      backoff.reset();
+      return std::chrono::milliseconds::zero();
+    }
+
+    return backoff.on_run_end(lifetime, !frame_since_open);
   }
 }  // namespace video

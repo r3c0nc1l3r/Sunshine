@@ -1699,6 +1699,12 @@ namespace video {
     platf::set_thread_name("video::capture");
     platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
+    // A backend can fail every capture() with a reinit while reopening the display still succeeds,
+    // which would otherwise spin. Back off while re-inits keep producing no frames.
+    video::retry_backoff_t reinit_backoff {100ms, 2s, 1s};
+    bool frame_since_open = false;
+    auto display_opened_at = std::chrono::steady_clock::now();
+
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
@@ -1711,6 +1717,7 @@ namespace video {
           }
 
           if (frame_captured) {
+            frame_since_open = true;
             capture_ctx->images->raise(img);
           }
 
@@ -1735,15 +1742,20 @@ namespace video {
 
       auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
 
+      bool requested_reinit = false;
       if (artificial_reinit && status != platf::capture_e::error) {
         status = platf::capture_e::reinit;
 
+        requested_reinit = true;
         artificial_reinit = false;
       }
 
       switch (status) {
         case platf::capture_e::reinit:
           {
+            // Taken before the release wait below, so that wait cannot make a quick failure look like a healthy run.
+            const auto lifetime = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - display_opened_at);
+
             reinit_event.raise(true);
 
             // Some classes of images contain references to the display --> display won't delete unless img is deleted
@@ -1779,6 +1791,23 @@ namespace video {
               std::this_thread::sleep_for(20ms);
             }
 
+            if (const auto delay = video::reinit_delay(reinit_backoff, requested_reinit, frame_since_open, lifetime); delay > 0ms) {
+              // Release the display during the wait
+              disp.reset();
+
+              BOOST_LOG(warning) << "Display re-init produced no frames "sv << reinit_backoff.consecutive_failures()
+                                 << " time(s), retrying in "sv << delay.count() << "ms"sv;
+
+              // Sleep in slices so a session stop or a display switch request is noticed quickly
+              for (auto waited = 0ms; waited < delay && capture_ctx_queue->running(); waited += 20ms) {
+                if (switch_display_event->peek()) {
+                  reinit_backoff.reset();
+                  break;
+                }
+                std::this_thread::sleep_for(20ms);
+              }
+            }
+
             while (capture_ctx_queue->running()) {
               // Release the display before reenumerating displays, since some capture backends
               // only support a single display session per device/application.
@@ -1803,6 +1832,8 @@ namespace video {
             }
 
             display_wp = disp;
+            frame_since_open = false;
+            display_opened_at = std::chrono::steady_clock::now();
 
             reinit_event.reset();
             continue;

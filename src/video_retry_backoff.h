@@ -1,6 +1,6 @@
 /**
  * @file src/video_retry_backoff.h
- * @brief Declarations for the backoff between failed encode runs.
+ * @brief Declarations for the backoff between failed encode runs and display re-inits.
  */
 #pragma once
 
@@ -53,4 +53,18 @@ namespace video {
     std::chrono::milliseconds _healthy_run;  ///< Run duration from which a failure is not quick.
     std::uint32_t _failures {0};  ///< Consecutive quick failures.
   };
+
+  /**
+   * @brief Get the delay before the next display re-init.
+   *
+   * A requested re-init (a display switch) resets the backoff and is not delayed. Otherwise the re-init counts as a
+   * failure when no frame was captured since the display was opened.
+   *
+   * @param backoff Backoff shared by the consecutive re-inits.
+   * @param requested Whether the re-init was requested, rather than reported by the capture backend.
+   * @param frame_since_open Whether a frame was captured since the display was opened.
+   * @param lifetime How long the display was open before this re-init.
+   * @return Delay to wait before reopening the display; zero when none is needed.
+   */
+  std::chrono::milliseconds reinit_delay(retry_backoff_t &backoff, bool requested, bool frame_since_open, std::chrono::milliseconds lifetime);
 }  // namespace video
