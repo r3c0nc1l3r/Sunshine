@@ -6,6 +6,10 @@ https://github.com/LizardByte/Sunshine/releases.
 ## Unreleased
 
 ### Fixed
+- Capture: when a backend keeps reporting a display re-init without ever capturing a frame (for example wlroots capture
+  without a usable DRM render node), the capture thread now waits 100 ms, doubling up to 2 s, between re-inits instead
+  of spinning and flooding the log. A display switch, a session stop, or a re-init after frames were captured is not
+  delayed (#52).
 - Portal capture: a portal helper that never opened a PipeWire remote no longer closes fd 0 when it is destroyed (for
   example at startup when the portal is unavailable). Its fd and D-Bus pointers now start unset (#39).
 - The default gamepad setting is copied from one gamepad list call; it was read from a list buffer freed during static
