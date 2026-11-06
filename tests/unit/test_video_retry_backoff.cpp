@@ -119,3 +119,68 @@ TEST(RetryBackoffTest, ResetForgetsFailures) {
   EXPECT_EQ(backoff.consecutive_failures(), 0u);
   EXPECT_EQ(backoff.on_run_end(0ms, true), 100ms);
 }
+
+/**
+ * @brief A requested re-init (display switch) resets an accumulated backoff and returns zero (reinit_delay).
+ */
+TEST(ReinitDelayTest, RequestedResetsBackoffAndReturnsZero) {
+  auto backoff = make_backoff();
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 0ms), 100ms);
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 0ms), 200ms);
+  ASSERT_EQ(backoff.consecutive_failures(), 2u);
+
+  EXPECT_EQ(video::reinit_delay(backoff, true, false, 0ms), 0ms);
+  EXPECT_EQ(backoff.consecutive_failures(), 0u);
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 0ms), 100ms);
+}
+
+/**
+ * @brief A requested re-init returns zero even when the previous run was quick and captured no frame (reinit_delay).
+ */
+TEST(ReinitDelayTest, RequestedIgnoresQuickNoFrameRun) {
+  auto backoff = make_backoff();
+  EXPECT_EQ(video::reinit_delay(backoff, true, false, 0ms), 0ms);
+  EXPECT_EQ(backoff.consecutive_failures(), 0u);
+}
+
+/**
+ * @brief A frame captured since the display was opened gives no delay and resets, even for a short lifetime (reinit_delay).
+ */
+TEST(ReinitDelayTest, FrameSinceOpenReturnsZeroAndResets) {
+  auto backoff = make_backoff();
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 0ms), 100ms);
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 0ms), 200ms);
+
+  EXPECT_EQ(video::reinit_delay(backoff, false, true, 10ms), 0ms);
+  EXPECT_EQ(backoff.consecutive_failures(), 0u);
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 0ms), 100ms);
+}
+
+/**
+ * @brief Repeated quick re-inits without a frame back off 100, 200, 400 ms ... capped at 2 s, and are counted (reinit_delay).
+ */
+TEST(ReinitDelayTest, QuickNoFrameReinitsGrowAndCap) {
+  auto backoff = make_backoff();
+  const std::chrono::milliseconds expected[] = {100ms, 200ms, 400ms, 800ms, 1600ms, 2000ms, 2000ms};
+  std::uint32_t count = 0;
+  for (const auto delay : expected) {
+    EXPECT_EQ(video::reinit_delay(backoff, false, false, 50ms), delay);
+    EXPECT_EQ(backoff.consecutive_failures(), ++count);
+  }
+}
+
+/**
+ * @brief A lifetime of at least the healthy run returns zero and resets, but 999 ms is still quick (reinit_delay).
+ */
+TEST(ReinitDelayTest, LongLifetimeReturnsZeroAndResets) {
+  auto backoff = make_backoff();
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 999ms), 100ms);
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 999ms), 200ms);
+
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 1s), 0ms);
+  EXPECT_EQ(backoff.consecutive_failures(), 0u);
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 0ms), 100ms);
+
+  EXPECT_EQ(video::reinit_delay(backoff, false, false, 30s), 0ms);
+  EXPECT_EQ(backoff.consecutive_failures(), 0u);
+}
