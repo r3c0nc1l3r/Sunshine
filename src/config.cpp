@@ -4,11 +4,14 @@
  */
 // standard includes
 #include <algorithm>
+#include <charconv>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -865,6 +868,9 @@ namespace config {
     true,  // always send scancodes
     true,  // high resolution scrolling
     true,  // native pen/touch support
+    "virtualhid",  // backend
+    {},  // lanternbox_input_socket
+    std::nullopt,  // lanternbox_compositor_uid
   };
 
   /**
@@ -1607,6 +1613,43 @@ namespace config {
   void apply_config(std::unordered_map<std::string, std::string> &&vars) {
     log_config_settings(vars, true);
 
+    // Validate these settings before applying the rest of the configuration.
+    string_f(vars, "input_backend", input.backend);
+    const bool socket_supplied = vars.contains("lanternbox_input_socket");
+    string_f(vars, "lanternbox_input_socket", input.lanternbox_input_socket);
+    std::string compositor_uid;
+    const bool uid_supplied = vars.contains("lanternbox_compositor_uid");
+    string_f(vars, "lanternbox_compositor_uid", compositor_uid);
+    const bool capture_supplied = vars.contains("capture");
+    string_f(vars, "capture", video.capture);
+
+    if (input.backend != "virtualhid" && input.backend != "lanternbox-seat") {
+      throw std::invalid_argument("input_backend must be virtualhid or lanternbox-seat");
+    }
+    if (uid_supplied) {
+      std::uint32_t uid = 0;
+      const auto result = std::from_chars(compositor_uid.data(), compositor_uid.data() + compositor_uid.size(), uid, 10);
+      if (compositor_uid.empty() || result.ec != std::errc {} || result.ptr != compositor_uid.data() + compositor_uid.size() || uid == std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("lanternbox_compositor_uid must be a decimal Linux UID in range 0..4294967294");
+      }
+      input.lanternbox_compositor_uid = uid;
+    }
+    if (input.backend == "lanternbox-seat") {
+#if !defined(__linux__) || defined(__ANDROID__)
+      throw std::invalid_argument("input_backend=lanternbox-seat requires Linux");
+#endif
+      const auto &path = input.lanternbox_input_socket;
+      if (!socket_supplied || path.size() < 2 || path.front() != '/' || path.back() == '/' || path.find('\0') != std::string::npos || path.size() > 107) {
+        throw std::invalid_argument("lanternbox_input_socket must be an absolute Unix socket pathname of at most 107 bytes");
+      }
+      if (!uid_supplied || !input.lanternbox_compositor_uid) {
+        throw std::invalid_argument("lanternbox_compositor_uid is required for input_backend=lanternbox-seat");
+      }
+      if (!capture_supplied || video.capture != "wlr") {
+        throw std::invalid_argument("input_backend=lanternbox-seat requires capture=wlr");
+      }
+    }
+
     int_f(vars, "qp", video.qp);
     int_between_f(vars, "hevc_mode", video.hevc_mode, {0, 3});
     int_between_f(vars, "av1_mode", video.av1_mode, {0, 3});
@@ -1697,7 +1740,6 @@ namespace config {
     int_f(vars, "vk_tune", video.vk.tune);
     int_f(vars, "vk_rc_mode", video.vk.rc_mode);
 
-    string_f(vars, "capture", video.capture);
     string_f(vars, "encoder", video.encoder);
     string_f(vars, "adapter_name", video.adapter_name);
     string_f(vars, "output_name", video.output_name);
@@ -2037,6 +2079,8 @@ namespace config {
       // the path is incorrect or inaccessible.
       apply_config(std::move(vars));
       config_loaded = true;
+    } catch (const std::invalid_argument &err) {
+      BOOST_LOG(fatal) << "Invalid configuration: "sv << err.what();
     } catch (const std::filesystem::filesystem_error &err) {
       BOOST_LOG(fatal) << "Failed to apply config: "sv << err.what();
     } catch (const boost::filesystem::filesystem_error &err) {

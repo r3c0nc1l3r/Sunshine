@@ -7,6 +7,7 @@
 // standard includes
 #include <bitset>
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -306,6 +307,10 @@ namespace config {
 
     bool high_resolution_scrolling;  ///< Enable high-resolution mouse-wheel events.
     bool native_pen_touch;  ///< Enable native pen and touch injection.
+
+    std::string backend;  ///< Input backend: virtualhid or lanternbox-seat.
+    std::string lanternbox_input_socket;  ///< Absolute private-seat socket path.
+    std::optional<std::uint32_t> lanternbox_compositor_uid;  ///< Required server UID in the guest namespace.
   };
 
   namespace flag {

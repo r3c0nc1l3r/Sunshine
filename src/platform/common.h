@@ -711,6 +711,8 @@ namespace platf {
      * @retval capture_e::error On error
      * @retval capture_e::reinit When need of reinitialization
      */
+    // Backend initialization, capture and GPU-resource destruction share the
+    // owning capture thread; callbacks execute on that thread as well.
     virtual capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) = 0;
 
     /**
@@ -727,6 +729,24 @@ namespace platf {
      * @return Capture status reported to the streaming pipeline.
      */
     virtual int dummy_img(img_t *img) = 0;
+
+    /**
+     * @brief Publish one copied frame through an optional private-input barrier.
+     * @param img Actual copied frame handed to the encoder publication slot.
+     * @param publish Bounded in-memory publication only; must not encode, wait, or perform I/O.
+     * @return True only if the live publication accepted the frame.
+     */
+    virtual bool publish_input_frame(const img_t &img, const std::function<bool()> &publish) {
+      return publish();
+    }
+
+    /**
+     * @brief Close private input and acknowledge producer cleanup before capture teardown.
+     * @return False if the owner must retain this display and abort further capture changes.
+     */
+    virtual bool prepare_input_transition() {
+      return true;
+    }
 
     /**
      * @brief Create AVCodec encode device.

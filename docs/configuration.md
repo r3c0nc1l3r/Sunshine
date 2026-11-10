@@ -313,6 +313,41 @@ supported on the current platform.
     </tr>
 </table>
 
+### input_backend
+
+`input_backend` selects input handling. Its default is `virtualhid` on all platforms. The value
+`lanternbox-seat` selects the experimental Linux private-seat backend and requires `capture = wlr`, an absolute
+`lanternbox_input_socket` pathname no longer than 107 bytes, and `lanternbox_compositor_uid` as a decimal
+Linux UID from 0 through 4294967294. Unknown backends and invalid private-seat configuration fail at startup.
+The compositor UID identifies the socket server in the guest namespace; the producer UID is configured on
+LanternBox, not here. Example:
+
+@code{}
+input_backend = lanternbox-seat
+capture = wlr
+lanternbox_input_socket = /run/lanternbox-private-input/seat.sock
+lanternbox_compositor_uid = <compositor-uid>
+@endcode
+
+This backend requires a compatible LanternBox private-seat server and private-output Wayland extension.
+It authenticates the configured compositor UID on the input socket and requires the capture Wayland
+connection to have the same peer PID and UID. An absent socket, failed authentication or unqualified
+capture keeps input unavailable; it never falls back to virtual HID.
+
+Provision the guest-local socket directory with compositor UID ownership, the private producer group,
+and mode `0750`. The compositor creates its socket with mode `0660`; Sunshine may traverse and connect
+but must not have directory write access. Use a separate Sunshine service UID and narrowly scoped access
+to the Wayland runtime socket, render node and audio endpoint. This boundary does not protect against
+host or guest root, or a compromised authorized producer.
+
+The initial implementation supports one private-input stream and one full, untransformed output.
+Capture changes and reconnects require a fresh cleanup handshake and post-snapshot copied frame.
+Additional simultaneous streams are rejected. Failed cleanup acknowledgement disables further private
+sessions until Sunshine restarts. Controllers, touch, pen and text injection are unsupported in this mode.
+Do not expose `/dev/input`, `/dev/uinput` or `/dev/uhid` to the guest for this backend. Host Sunshine
+keeps its defaults. Full paired capture and attempted-device-access qualification remains required
+before deployment.
+
 ### gamepad_driver
 
 <table>

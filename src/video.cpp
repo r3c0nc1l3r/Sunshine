@@ -652,6 +652,37 @@ namespace video {
    */
   using encode_e = platf::capture_e;
 
+  /** @brief A failed private cleanup barrier blocks further private sessions until process restart. */
+  static std::atomic<bool> private_capture_blocked {false};
+  /** @brief At most one private capture stream may own the process-wide input mapping. */
+  static std::atomic<bool> private_stream_owned {false};
+
+  /** @brief Admission follows all capture configuration copies, including retiring capture threads. */
+  struct private_stream_lease {
+    /** @brief Release admission only after the final capture owner is gone. */
+    ~private_stream_lease() {
+      private_stream_owned.store(false, std::memory_order_release);
+    }
+  };
+
+  /** @brief Retain the one failed display until process shutdown; never change its capture resources without ACK. */
+  static std::shared_ptr<platf::display_t> private_quarantined_display;
+
+  /**
+   * @brief Complete the fallible barrier or quarantine the display and prevent further private capture.
+   * @param display Display to retire; moved to quarantine if cleanup fails.
+   * @return True if no display requires cleanup or the barrier succeeds.
+   */
+  bool retire_input_mapping(std::shared_ptr<platf::display_t> &display) {
+    if (display && !display->prepare_input_transition()) {
+      private_capture_blocked.store(true, std::memory_order_release);
+      private_quarantined_display = std::move(display);
+      BOOST_LOG(error) << "Private input cleanup failed; capture retained and private sessions disabled until restart";
+      return false;
+    }
+    return true;
+  }
+
   /**
    * @brief Capture thread context shared with the encoder session.
    */
@@ -1593,6 +1624,9 @@ namespace video {
     int display_p = -1;
     refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
     auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+    auto retire_on_exit = util::fail_guard([&]() {
+      retire_input_mapping(disp);
+    });
     if (!disp) {
       return;
     }
@@ -1718,7 +1752,15 @@ namespace video {
 
           if (frame_captured) {
             frame_since_open = true;
-            capture_ctx->images->raise(img);
+            if (capture_ctx->config.private_seat_stream) {
+              if (!img || !disp->publish_input_frame(*img, [&]() {
+                    return capture_ctx->images->try_raise(img);
+                  })) {
+                return false;
+              }
+            } else {
+              capture_ctx->images->raise(img);
+            }
           }
 
           ++capture_ctx;
@@ -1741,6 +1783,9 @@ namespace video {
       };
 
       auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
+      if (!retire_input_mapping(disp)) {
+        return;
+      }
 
       bool requested_reinit = false;
       if (artificial_reinit && status != platf::capture_e::error) {
@@ -2730,7 +2775,13 @@ namespace video {
   ) {
     const auto &encoder = *chosen_encoder;
 
+    // Independent of session erasure/join notification: release admission only
+    // after this function's cleanup guard has retired the old display.
+    std::shared_ptr<void> private_capture_lease;
     std::shared_ptr<platf::display_t> disp;
+    auto retire_on_exit = util::fail_guard([&]() {
+      retire_input_mapping(disp);
+    });
 
     auto switch_display_event = mail::man->event<int>(mail::switch_display);
 
@@ -2742,6 +2793,8 @@ namespace video {
 
       synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*ctx)));
     }
+
+    private_capture_lease = synced_session_ctxs.front()->config.private_input_lease;
 
     while (encode_session_ctx_queue.running()) {
       // Refresh display names since a display removal might have caused the reinitialization
@@ -2798,6 +2851,26 @@ namespace video {
           synced_sessions.emplace_back(std::move(*encode_session));
         }
 
+        // The synchronous encoder consumes this published slot after the gate
+        // is released; conversion and packet encoding never hold that gate.
+        std::shared_ptr<platf::img_t> published_image;
+        if (frame_captured && !synced_session_ctxs.empty() && synced_session_ctxs.front()->config.private_seat_stream) {
+          if (!img || !disp->publish_input_frame(*img, [&]() {
+                const bool live = std::any_of(synced_sessions.begin(), synced_sessions.end(), [](const auto &session) {
+                  return !session.ctx->shutdown_event->peek();
+                });
+                if (live) {
+                  published_image = img;
+                }
+                return live;
+              })) {
+            ec = platf::capture_e::error;
+            return false;
+          }
+        } else {
+          published_image = img;
+        }
+
         KITTY_WHILE_LOOP(auto pos = std::begin(synced_sessions), pos != std::end(synced_sessions), {
           auto ctx = pos->ctx;
           if (ctx->shutdown_event->peek()) {
@@ -2821,7 +2894,7 @@ namespace video {
             ctx->idr_events->pop();
           }
 
-          if (frame_captured && pos->session->convert(*img)) {
+          if (frame_captured && pos->session->convert(*published_image)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             ctx->shutdown_event->raise(true);
 
@@ -2860,6 +2933,10 @@ namespace video {
       };
 
       auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
+      if (!retire_input_mapping(disp)) {
+        return encode_e::error;
+      }
+
       switch (status) {
         case platf::capture_e::reinit:
         case platf::capture_e::error:
@@ -3024,7 +3101,26 @@ namespace video {
     config_t config,
     void *channel_data
   ) {
+    bool owns_private_stream = false;
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (config::input.backend == "lanternbox-seat") {
+      bool expected = false;
+      if (private_capture_blocked.load(std::memory_order_acquire) || !private_stream_owned.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        BOOST_LOG(error) << "Private input supports one stream and requires a healthy capture cleanup barrier";
+        mail->event<bool>(mail::shutdown)->raise(true);
+        return;
+      }
+      config.private_input_lease = std::make_shared<private_stream_lease>();
+      owns_private_stream = true;
+    }
+#endif
+    if (owns_private_stream && !input::claim_private_stream(mail)) {
+      BOOST_LOG(error) << "Private input stream mailbox is unavailable";
+      mail->event<bool>(mail::shutdown)->raise(true);
+      return;
+    }
     config = resolve_dynamic_range(*chosen_encoder, config);
+    config.private_seat_stream = owns_private_stream;
 
     auto idr_events = mail->event<bool>(mail::idr);
 

@@ -173,7 +173,8 @@ namespace wl {
     return wl_display_get_registry(display_internal.get());
   }
 
-  monitor_t::monitor_t(wl_output *output):
+  monitor_t::monitor_t(wl_output *output, std::uint32_t global_id):
+      global_id {global_id},
       output {output},
       wl_listener {
         .geometry = &CLASS_CALL(monitor_t, wl_geometry),
@@ -191,18 +192,28 @@ namespace wl {
   }
 
   inline void monitor_t::xdg_name(zxdg_output_v1 *, const char *name) {
+    if (private_metadata_changed) {
+      private_metadata_changed();
+    }
     this->name = name;
 
     BOOST_LOG(info) << "[wayland] Name: "sv << this->name;
   }
 
   void monitor_t::xdg_description(zxdg_output_v1 *, const char *description) {
+    if (private_metadata_changed) {
+      private_metadata_changed();
+    }
     this->description = description;
 
     BOOST_LOG(info) << "[wayland] Found monitor: "sv << this->description;
   }
 
   void monitor_t::xdg_position(zxdg_output_v1 *, std::int32_t x, std::int32_t y) {
+    if (private_metadata_changed) {
+      private_metadata_changed();
+    }
+    position_received = true;
     viewport.offset_x = x;
     viewport.offset_y = y;
 
@@ -210,9 +221,21 @@ namespace wl {
   }
 
   void monitor_t::xdg_size(zxdg_output_v1 *, std::int32_t width, std::int32_t height) {
+    if (private_metadata_changed) {
+      private_metadata_changed();
+    }
+    size_received = true;
     viewport.logical_width = width;
     viewport.logical_height = height;
     BOOST_LOG(info) << "[wayland] Logical size: "sv << width << 'x' << height;
+  }
+
+  void monitor_t::wl_geometry(wl_output *, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, const char *, const char *, std::int32_t value) {
+    if (private_metadata_changed) {
+      private_metadata_changed();
+    }
+    geometry_received = true;
+    transform = value;
   }
 
   void monitor_t::wl_mode(
@@ -228,6 +251,10 @@ namespace wl {
       return;
     }
 
+    mode_received = true;
+    if (private_metadata_changed) {
+      private_metadata_changed();
+    }
     viewport.width = width;
     viewport.height = height;
   }
@@ -254,8 +281,25 @@ namespace wl {
   }
 
   void interface_t::listen(wl_registry *registry) {
+    if (registry_listening) {
+      return;
+    }
+    registry_listening = true;
+#ifndef __FreeBSD__
+    capture_display = nullptr;
+#endif
     wl_registry_add_listener(registry, &listener, this);
   }
+
+#ifndef __FreeBSD__
+  void interface_t::listen_capture(wl_display *display) {
+    if (!display || registry_listening) {
+      return;
+    }
+    listen(wl_display_get_registry(display));
+    capture_display = display;
+  }
+#endif
 
   void interface_t::dmabuf_format(zwp_linux_dmabuf_v1 *zwp_linux_dmabuf, uint32_t format) {
   }
@@ -273,15 +317,25 @@ namespace wl {
     const char *interface,
     std::uint32_t version
   ) {
+#ifndef __FreeBSD__
+    if (private_registry_changed) {
+      private_registry_changed();
+    }
+#endif
     BOOST_LOG(debug) << "[wayland] Available interface: "sv << interface << '(' << id << ") version "sv << version;
 
     if (!std::strcmp(interface, wl_output_interface.name)) {
       BOOST_LOG(info) << "[wayland] Found interface: "sv << interface << '(' << id << ") version "sv << version;
       monitors.emplace_back(
         std::make_unique<monitor_t>(
-          (wl_output *) wl_registry_bind(registry, id, &wl_output_interface, 2)
+          (wl_output *) wl_registry_bind(registry, id, &wl_output_interface, 2),
+          id
         )
       );
+#ifndef __FreeBSD__
+    } else if (!std::strcmp(interface, lanternbox_private_output_manager_v1_interface.name) && version >= 1 && !private_output_manager) {
+      private_output_manager = (lanternbox_private_output_manager_v1 *) wl_registry_bind(registry, id, &lanternbox_private_output_manager_v1_interface, 1);
+#endif
     } else if (!std::strcmp(interface, zxdg_output_manager_v1_interface.name)) {
       BOOST_LOG(info) << "[wayland] Found interface: "sv << interface << '(' << id << ") version "sv << version;
       output_manager = (zxdg_output_manager_v1 *) wl_registry_bind(registry, id, &zxdg_output_manager_v1_interface, version);
@@ -302,6 +356,11 @@ namespace wl {
   }
 
   void interface_t::del_interface(wl_registry *registry, uint32_t id) {
+#ifndef __FreeBSD__
+    if (private_registry_changed) {
+      private_registry_changed();
+    }
+#endif
     BOOST_LOG(info) << "[wayland] Delete: "sv << id;
   }
 

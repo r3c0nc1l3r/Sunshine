@@ -20,6 +20,9 @@ using namespace std::literals;
 namespace platf {
   platform_caps::caps_t get_capabilities() {
     platform_caps::caps_t caps = 0;
+    if (config::input.backend == "lanternbox-seat") {
+      return caps;
+    }
     const auto runtime = virtualhid::create_runtime();
     if (!runtime) {
       return caps;
@@ -36,6 +39,9 @@ namespace platf {
   }
 
   std::optional<util::point_t> get_mouse_loc(input_t & /*input*/) {
+    if (config::input.backend == "lanternbox-seat") {
+      return std::nullopt;
+    }
 #ifdef SUNSHINE_BUILD_X11
     auto *display = XOpenDisplay(nullptr);
     if (!display) {
@@ -72,8 +78,12 @@ namespace platf {
       gamepads = virtualhid::static_supported_gamepads();
       return gamepads;
     }
+    if (config::input.backend == "lanternbox-seat") {
+      gamepads = virtualhid::static_supported_gamepads();
+      return gamepads;
+    }
 
-    gamepads = virtualhid::supported_gamepads(virtualhid::get_input_context(*input).runtime.get());
+    gamepads = virtualhid::supported_gamepads(virtualhid::get_runtime(*input));
     return gamepads;
   }
 }  // namespace platf

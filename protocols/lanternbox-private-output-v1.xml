@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="lanternbox_private_output_v1">
+  <copyright>Copyright 2026 LanternBox contributors. SPDX-License-Identifier: MIT</copyright>
+  <interface name="lanternbox_private_output_manager_v1" version="1">
+    <description summary="bind capture to the private seat output">Binds the output selected on this Wayland connection to a compositor-issued output identity and epoch.</description>
+    <enum name="error"><entry name="invalid_output" value="0" summary="output is not the compositor output"/></enum>
+    <request name="bind_output">
+      <arg name="binding" type="new_id" interface="lanternbox_private_output_v1"/>
+      <arg name="output" type="object" interface="wl_output"/>
+    </request>
+  </interface>
+  <interface name="lanternbox_private_output_v1" version="1">
+    <request name="destroy" type="destructor"/>
+    <event name="snapshot">
+      <arg name="output_id_hi" type="uint"/><arg name="output_id_lo" type="uint"/>
+      <arg name="epoch_hi" type="uint"/><arg name="epoch_lo" type="uint"/>
+      <arg name="physical_w" type="uint"/><arg name="physical_h" type="uint"/>
+      <arg name="logical_w" type="uint"/><arg name="logical_h" type="uint"/>
+    </event>
+    <event name="invalidated"><arg name="epoch_hi" type="uint"/><arg name="epoch_lo" type="uint"/></event>
+  </interface>
+</protocol>

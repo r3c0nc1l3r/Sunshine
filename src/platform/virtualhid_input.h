@@ -18,6 +18,27 @@
 // local includes
 #include "src/platform/common.h"
 
+#if defined(__linux__) && !defined(__ANDROID__)
+namespace platf::private_seat_input {
+  class context;
+}
+
+namespace platf {
+  /**
+   * @brief Return the private-seat context, or null for the legacy backend.
+   * @param input Platform input backend.
+   * @return Private-seat context, or null.
+   */
+  private_seat_input::context *private_seat_context(input_t &input);
+  /**
+   * @brief Obtain weak-safe shared ownership of the selected private context.
+   * @param input Platform input backend.
+   * @return Shared private-seat context, or null.
+   */
+  std::shared_ptr<private_seat_input::context> private_seat_context_shared(input_t &input);
+}  // namespace platf
+#endif
+
 namespace platf::virtualhid {
 
   /**
@@ -77,6 +98,14 @@ namespace platf::virtualhid {
    * @return Shared libvirtualhid input context.
    */
   input_context_t &get_input_context(input_t &input);
+#if defined(__linux__) && !defined(__ANDROID__)
+  /**
+   * @brief Return the optional legacy runtime for Linux capability probing.
+   * @param input Platform input backend.
+   * @return Legacy runtime, or null when unavailable.
+   */
+  lvh::Runtime *get_runtime(input_t &input);
+#endif
 
   /**
    * @brief Return the per-client libvirtualhid context from a platform input backend.
