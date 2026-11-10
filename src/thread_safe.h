@@ -35,9 +35,19 @@ namespace safe {
      */
     template<class... Args>
     void raise(Args &&...args) {
+      static_cast<void>(try_raise(std::forward<Args>(args)...));
+    }
+
+    /**
+     * @brief Publish a value only while the event is running.
+     * @param args Arguments forwarded to the stored value.
+     * @return Whether this value was stored, atomically with the running check.
+     */
+    template<class... Args>
+    bool try_raise(Args &&...args) {
       std::lock_guard lg {_lock};
       if (!_continue) {
-        return;
+        return false;
       }
 
       if constexpr (std::is_same_v<std::optional<T>, status_t>) {
@@ -47,6 +57,7 @@ namespace safe {
       }
 
       _cv.notify_all();
+      return true;
     }
 
     /**

@@ -63,7 +63,7 @@ namespace input {
   /**
    * @brief Probe whether the platform can create virtual gamepads.
    *
-   * @return True when at least one configured gamepad backend is available.
+   * @return True when no configured gamepad backend is available (probe failure).
    */
   bool probe_gamepads();
 
@@ -71,9 +71,17 @@ namespace input {
    * @brief Recreate shared libvirtualhid keyboard and mouse devices after a license-state change.
    *
    * The work is serialized with streamed input so both backends can switch
-   * safely between the Windows HID and SendInput paths.
+   * safely between the Windows HID and SendInput paths. Private-seat mode has no
+   * virtual devices to recreate, so this operation is inert there.
    */
   void refresh_virtual_input();
+
+  /**
+   * @brief Admit only the input mailbox associated with the sole private capture stream.
+   * @param mail Exact mailbox used by that video stream.
+   * @return Whether its input state exists and was admitted; legacy mode always succeeds.
+   */
+  bool claim_private_stream(const safe::mail_t &mail);
 
   /**
    * @brief Allocate and initialize platform input state for a stream.

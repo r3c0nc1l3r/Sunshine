@@ -10,11 +10,13 @@ extern "C" {
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -34,6 +36,13 @@ extern "C" {
 #include "logging.h"
 #include "platform/common.h"
 #include "platform/virtualhid_input.h"
+#if defined(__linux__) && !defined(__ANDROID__)
+  #include "platform/linux/private_seat_input.h"
+
+  #include <cerrno>
+  #include <libvirtualhid/linux_key_mapping.hpp>
+  #include <poll.h>
+#endif
 #include "thread_pool.h"
 #include "utility.h"
 
@@ -167,6 +176,70 @@ namespace input {
   static std::array<std::uint8_t, 5> mouse_press {};
 
   static platf::input_t platf_input;
+#if defined(__linux__) && !defined(__ANDROID__)
+  static platf::private_seat_input::key_tracker private_keys;  ///< Process-wide evdev contributor state.
+  static std::mutex private_handle_mutex;  ///< Protects publication of the weak capture handle.
+  static std::weak_ptr<platf::private_seat_input::context> private_handle;  ///< Published weak owner handle.
+
+  std::weak_ptr<platf::private_seat_input::context> private_seat_handle() {
+    std::lock_guard lock {private_handle_mutex};
+    return private_handle;
+  }
+
+  /**
+   * @brief Poll one private socket without blocking, then schedule the next generation-checked tick.
+   * @param weak Weak context handle.
+   * @param token Generation required for this pump.
+   */
+  void pump_private(std::weak_ptr<platf::private_seat_input::context> weak, std::uint64_t token) {
+    task_pool.pushDelayed([weak, token]() {
+      auto context = weak.lock();
+      if (!context || context->generation() != token || context->fd() < 0) {
+        return;
+      }
+      pollfd pfd {context->fd(), context->poll_events(), 0};
+      int result = ::poll(&pfd, 1, 0);
+      if (result < 0 && errno != EINTR) {
+        context->reset();
+        return;
+      }
+      if (!context->drive(result > 0 ? pfd.revents : 0, private_seat::client::clock::now())) {
+        return;
+      }
+      if (context->generation() == token) {
+        pump_private(weak, token);
+      }
+    },
+                          10ms);
+  }
+
+  static std::uint64_t private_state_generation = 0;  ///< Generation reflected in dispatcher state.
+  static std::atomic<std::uint32_t> private_next_stream_id {1};  ///< Per-stream contributor namespace.
+
+  /**
+   * @brief Allocate a contributor namespace without wrapping.
+   * @return A nonzero stream ID, or zero on exhaustion.
+   */
+  std::uint32_t allocate_private_stream_id() {
+    auto id = private_next_stream_id.load(std::memory_order_relaxed);
+    while (id != std::numeric_limits<std::uint32_t>::max()) {
+      if (private_next_stream_id.compare_exchange_weak(id, id + 1, std::memory_order_relaxed)) {
+        return id;
+      }
+    }
+    return 0;
+  }
+
+  void clear_private_state(std::uint64_t generation);
+
+  /**
+   * @brief Return the selected private context, if present.
+   * @return Selected context, or null.
+   */
+  platf::private_seat_input::context *private_context() {
+    return platf_input && config::input.backend == "lanternbox-seat" ? platf::private_seat_context(platf_input) : nullptr;
+  }
+#endif
 #ifdef SUNSHINE_TESTS
   /**
    * @brief Recorder that unit tests install in place of the platform keyboard.
@@ -296,8 +369,21 @@ namespace input {
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;  ///< Touch port event.
     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
 
-    std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
+    /** @brief Input data tagged with the producer generation at enqueue. */
+    struct queued_packet {
+      std::vector<std::uint8_t> bytes;  ///< Validated packet bytes.
+      std::uint64_t generation = 0;  ///< Producer generation, zero for legacy mode.
+    };
+
+    std::list<queued_packet> input_queue;  ///< Validated input packets waiting for processing.
     std::mutex input_queue_lock;  ///< Input queue lock.
+#if defined(__linux__) && !defined(__ANDROID__)
+    const std::uint32_t private_stream_id = allocate_private_stream_id();  ///< Unique contributor namespace.
+    std::atomic<bool> private_enabled {true};  ///< False immediately when the stream disconnects.
+    safe::mail_raw_t::event_t<input::touch_port_t> private_capture_mail;  ///< Admission identity, guarded by the retained-input mutex.
+    std::uint64_t private_generation = 0;  ///< Dispatcher generation for local modifier state.
+    std::unordered_map<std::uint16_t, unsigned> private_modifier_counts;  ///< Physical VK contributor counts.
+#endif
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;  ///< Mouse left button timeout.
 
@@ -402,6 +488,10 @@ namespace input {
    * @param mail Mailbox for the resumed stream connection.
    */
   void rebind_input(const std::shared_ptr<input_t> &input, const safe::mail_t &mail) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    // Private admission is assigned synchronously by alloc/claim; a delayed
+    // rebind must not disable or enable a newer capture owner.
+#endif
     input->touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     input->feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
 
@@ -824,7 +914,12 @@ namespace input {
     if (input->mouse_left_button_timeout == DISABLE_LEFT_BUTTON_DELAY) {
       input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
     }
-
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (auto *context = private_context()) {
+      context->absolute_packet(util::endian::big(packet->x), util::endian::big(packet->y), util::endian::big(packet->width), util::endian::big(packet->height));
+      return;
+    }
+#endif
     float x = util::endian::big(packet->x);
     float y = util::endian::big(packet->y);
 
@@ -904,7 +999,14 @@ namespace input {
      * when the last mouse coordinates were absolute
      */
     if (button == BUTTON_LEFT && release && !input->mouse_left_button_timeout) {
+#if defined(__linux__) && !defined(__ANDROID__)
+      const auto private_token = private_context() ? private_context()->generation() : 0;
+#endif
       auto f = [=]() {
+#if defined(__linux__) && !defined(__ANDROID__)
+        if (private_token && (!input->private_enabled.load(std::memory_order_acquire) || !private_context() || private_context()->generation() != private_token || !private_context()->active()))
+          return;
+#endif
         auto left_released = mouse_press[BUTTON_LEFT];
         if (left_released) {
           // Already released left button
@@ -1154,6 +1256,69 @@ namespace input {
     auto release = util::endian::little(packet->header.magic) == KEY_UP_EVENT_MAGIC;
     auto keyCode = packet->keyCode & 0x00FF;
 
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (auto *context = private_context()) {
+      if (!input->private_enabled.load(std::memory_order_acquire) || !context->active()) {
+        return;
+      }
+      if (!input->private_stream_id) {
+        return;
+      }
+      const auto contributor = (std::uint64_t(input->private_stream_id) << 32) | make_kpid(keyCode, packet->flags);
+      if (release && !private_keys.held(contributor)) {
+        return;
+      }
+      if (!release && private_keys.held(contributor)) {
+        return;
+      }
+      if (!release && input->shortcutFlags == input_t::SHORTCUT && apply_shortcut(keyCode) > 0) {
+        return;
+      }
+      auto convert = [](int key) {
+        return lvh::key_code_to_linux(static_cast<lvh::KeyboardKeyCode>(key));
+      };
+      const int evdev = convert(map_keycode(keyCode));
+      if (!release && (evdev <= 0 || evdev > 0xffff)) {
+        return;
+      }
+      if (is_modifier(keyCode)) {
+        auto &count = input->private_modifier_counts[keyCode];
+        if (release) {
+          if (count && --count == 0) {
+            update_modifier_state(*input, keyCode, true);
+          }
+        } else if (count++ == 0) {
+          update_modifier_state(*input, keyCode, false);
+        }
+      }
+      int modifiers = packet->modifiers;
+      if (config::input.key_rightalt_to_key_win && input->alt_keys.right_pressed && !input->alt_keys.left_pressed) {
+        modifiers &= ~MODIFIER_ALT;
+      }
+      std::vector<std::uint16_t> synthetic;
+      if (!release && !is_modifier(keyCode)) {
+        if (!(input->shortcutFlags & input_t::SHIFT) && (modifiers & MODIFIER_SHIFT)) {
+          synthetic.push_back(convert(VKEY_SHIFT));
+        }
+        if (!(input->shortcutFlags & input_t::CTRL) && (modifiers & MODIFIER_CTRL)) {
+          synthetic.push_back(convert(VKEY_CONTROL));
+        }
+        if (!(input->shortcutFlags & input_t::ALT) && (modifiers & MODIFIER_ALT)) {
+          synthetic.push_back(convert(VKEY_MENU));
+        }
+      }
+      auto emit = [context](std::uint16_t code, bool down) {
+        return context->send_key(code, down);
+      };
+      const bool sent = release ? private_keys.up(contributor, emit) : private_keys.down(contributor, static_cast<std::uint16_t>(evdev), synthetic, emit);
+      if (!sent) {
+        context->reset();
+        return;
+      }
+      update_shortcutFlags(*input, keyCode, release);
+      return;
+    }
+#endif
     update_modifier_state(*input, keyCode, release);
 
     // Right-alt maps to meta, so it must not also register as ALT
@@ -2027,6 +2192,7 @@ namespace input {
     // 'entry' backs the 'payload' pointer, so they must remain in scope together
     std::vector<uint8_t> entry;
     PNV_INPUT_HEADER payload;
+    std::uint64_t generation = 0;
 
     // Lock the input queue while batching, but release it before sending
     // the input to the OS. This avoids potentially lengthy lock contention
@@ -2040,14 +2206,18 @@ namespace input {
       }
 
       // Pop off the first entry, which we will send
-      entry = input->input_queue.front();
+      generation = input->input_queue.front().generation;
+      entry = std::move(input->input_queue.front().bytes);
       payload = (PNV_INPUT_HEADER) entry.data();
       input->input_queue.pop_front();
 
       // Try to batch with remaining items on the queue
       auto i = input->input_queue.begin();
       while (i != input->input_queue.end()) {
-        auto batchable_entry = *i;
+        if (generation != 0 || i->generation != generation) {
+          break;
+        }
+        auto batchable_entry = i->bytes;
         auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
 
         auto batch_result = batch(payload, batchable_payload);
@@ -2064,8 +2234,20 @@ namespace input {
       }
     }
 
-    // Print the final input packet
-    input::print((void *) payload);
+    // Private packets are never logged and stale generations do not mutate state.
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (auto *context = private_context()) {
+      if (!input->private_enabled.load(std::memory_order_acquire) || generation != context->generation() || !context->active()) {
+        return;
+      }
+      if (private_state_generation != generation) {
+        clear_private_state(generation);
+      }
+    } else
+#endif
+    {
+      input::print((void *) payload);
+    }
 
     // Send the batched input to the OS
     switch (util::endian::little(payload->magic)) {
@@ -2138,7 +2320,13 @@ namespace input {
 
     {
       std::lock_guard<std::mutex> lg(input->input_queue_lock);
-      input->input_queue.push_back(std::move(input_data));
+      std::uint64_t generation = 0;
+#if defined(__linux__) && !defined(__ANDROID__)
+      if (auto *context = private_context()) {
+        generation = context->generation();
+      }
+#endif
+      input->input_queue.push_back({std::move(input_data), generation});
     }
     task_pool.push(passthrough_next_message, input);
   }
@@ -2194,6 +2382,47 @@ namespace input {
     }
   }
 
+#if defined(__linux__) && !defined(__ANDROID__)
+  /**
+   * @brief Invalidate all private input state on the serialized dispatcher.
+   * @param generation Generation associated with the reset.
+   */
+  void clear_private_state(std::uint64_t generation) {
+    if (private_state_generation == generation) {
+      return;
+    }
+    private_state_generation = generation;
+    private_keys.reset();
+    key_press.clear();
+    mouse_press.fill(0);
+    if (key_press_repeat_id) {
+      task_pool.cancel(key_press_repeat_id);
+    }
+    key_press_repeat_id = nullptr;
+    auto &retained = retained_input_state();
+    std::lock_guard lock {retained.mutex};
+    for (auto &[id, stream] : retained.inputs) {
+      static_cast<void>(id);
+      if (stream->mouse_left_button_timeout > DISABLE_LEFT_BUTTON_DELAY) {
+        task_pool.cancel(stream->mouse_left_button_timeout);
+      }
+      stream->mouse_left_button_timeout = nullptr;
+      stream->shortcutFlags = 0;
+      stream->shift_keys = {};
+      stream->control_keys = {};
+      stream->alt_keys = {};
+      stream->private_modifier_counts.clear();
+      stream->accumulated_vscroll_delta = 0;
+      stream->accumulated_hscroll_delta = 0;
+      stream->private_generation = generation;
+      std::lock_guard queue_lock {stream->input_queue_lock};
+      stream->input_queue.remove_if([generation](const auto &packet) {
+        return packet.generation != generation;
+      });
+    }
+  }
+#endif
+
   /**
    * @brief Reset all pressed input state for a disconnected stream.
    *
@@ -2209,6 +2438,20 @@ namespace input {
    * @brief Reset the object to its initial empty state.
    */
   void reset(std::shared_ptr<input_t> &input) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (private_context()) {
+      if (!input->private_enabled.exchange(false, std::memory_order_acq_rel)) {
+        return;
+      }
+      const auto generation = private_context()->generation();
+      task_pool.push([generation]() {
+        if (auto *context = private_context(); context && context->generation() == generation) {
+          context->reset();
+        }
+      });
+      return;
+    }
+#endif
     task_pool.cancel(key_press_repeat_id);
     task_pool.cancel(input->mouse_left_button_timeout);
 
@@ -2225,7 +2468,28 @@ namespace input {
     }
 
     if (!inputs.empty()) {
-      dispatch_input_task([inputs = std::move(inputs)]() {
+#if defined(__linux__) && !defined(__ANDROID__)
+      if (private_context()) {
+        for (const auto &[id, stream] : inputs) {
+          static_cast<void>(id);
+          stream->private_enabled.store(false, std::memory_order_release);
+        }
+      }
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
+      const auto producer_generation = private_context() ? private_context()->generation() : 0;
+#endif
+      dispatch_input_task([inputs = std::move(inputs)
+#if defined(__linux__) && !defined(__ANDROID__)
+                             ,
+                           producer_generation
+#endif
+      ]() {
+#if defined(__linux__) && !defined(__ANDROID__)
+        if (auto *context = private_context(); context && context->generation() == producer_generation) {
+          context->reset();
+        }
+#endif
         destroy_gamepads(inputs);
       });
     }
@@ -2245,7 +2509,23 @@ namespace input {
       state.inputs.erase(iter);
     }
 
-    dispatch_input_task([input = std::move(input)]() {
+#if defined(__linux__) && !defined(__ANDROID__)
+    const bool owned_private = private_context() && input->private_enabled.exchange(false, std::memory_order_acq_rel);
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
+    const auto producer_generation = owned_private ? private_context()->generation() : 0;
+#endif
+    dispatch_input_task([input = std::move(input)
+#if defined(__linux__) && !defined(__ANDROID__)
+                           ,
+                         producer_generation
+#endif
+    ]() {
+#if defined(__linux__) && !defined(__ANDROID__)
+      if (auto *context = private_context(); context && context->generation() == producer_generation) {
+        context->reset();
+      }
+#endif
       destroy_gamepads(input);
     });
   }
@@ -2266,6 +2546,17 @@ namespace input {
         state.inputs.swap(inputs);
       }
       destroy_gamepads(inputs);
+#if defined(__linux__) && !defined(__ANDROID__)
+      {
+        std::lock_guard lock {private_handle_mutex};
+        private_handle.reset();
+      }
+      if (auto *context = private_context()) {
+        context->on_reset({});
+        context->reset();
+        private_keys.reset();
+      }
+#endif
       platf_input.reset();
     }
   };
@@ -2275,7 +2566,32 @@ namespace input {
    */
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init() {
     platf_input = platf::input();
-
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (auto *context = private_context()) {
+      auto owner = platf::private_seat_context_shared(platf_input);
+      context->set_dispatcher([](std::function<void()> task) {
+        if (!task_pool.running()) {
+          return false;
+        }
+        task_pool.push(std::move(task));
+        return true;
+      },
+                              pump_private);
+      context->on_reset([weak = std::weak_ptr<platf::private_seat_input::context>(owner)](std::uint64_t generation) {
+        dispatch_input_task([weak, generation]() {
+          auto current = weak.lock();
+          if (current && current->generation() == generation) {
+            clear_private_state(generation);
+            current->reset_complete(generation);
+          }
+        });
+      });
+      {
+        std::lock_guard lock {private_handle_mutex};
+        private_handle = owner;
+      }
+    }
+#endif
     return std::make_unique<deinit_t>();
   }
 
@@ -2290,6 +2606,13 @@ namespace input {
   }
 
   void refresh_virtual_input() {
+#if defined(__linux__) && !defined(__ANDROID__)
+    // License/device refresh belongs to virtual HID. A private seat has no
+    // devices to recreate and must keep its qualified capture generation.
+    if (config::input.backend == "lanternbox-seat") {
+      return;
+    }
+#endif
     dispatch_input_task([]() {
       if (platf_input) {
         task_pool.cancel(key_press_repeat_id);
@@ -2303,9 +2626,36 @@ namespace input {
     });
   }
 
-  /**
-   * @brief Allocate and initialize platform input state for a stream.
-   */
+  // Admission is documented in input.h.
+  bool claim_private_stream(const safe::mail_t &mail) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (config::input.backend == "lanternbox-seat") {
+      auto event = mail->event<input::touch_port_t>(mail::touch_port);
+      auto &state = retained_input_state();
+      std::lock_guard lock {state.mutex};
+      std::shared_ptr<input_t> selected;
+      for (const auto &[id, stream] : state.inputs) {
+        static_cast<void>(id);
+        if (stream->private_capture_mail == event) {
+          selected = stream;
+        }
+      }
+      if (!selected) {
+        return false;
+      }
+      for (const auto &[id, stream] : state.inputs) {
+        static_cast<void>(id);
+        if (stream != selected && stream->private_enabled.load(std::memory_order_acquire)) {
+          return false;
+        }
+      }
+      selected->private_enabled.store(true, std::memory_order_release);
+    }
+#endif
+    return true;
+  }
+
+  // Allocation is documented in input.h.
   std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id) {
     std::shared_ptr<input_t> input;
     bool resumed = false;
@@ -2315,12 +2665,20 @@ namespace input {
       const auto iter = state.inputs.find(session_id);
       if (iter != state.inputs.end()) {
         input = iter->second;
+#if defined(__linux__) && !defined(__ANDROID__)
+        input->private_enabled.store(config::input.backend != "lanternbox-seat", std::memory_order_release);
+        input->private_capture_mail = mail->event<input::touch_port_t>(mail::touch_port);
+#endif
         resumed = true;
       } else {
         input = std::make_shared<input_t>(
           mail->event<input::touch_port_t>(mail::touch_port),
           mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)
         );
+#if defined(__linux__) && !defined(__ANDROID__)
+        input->private_enabled.store(config::input.backend != "lanternbox-seat", std::memory_order_release);
+        input->private_capture_mail = mail->event<input::touch_port_t>(mail::touch_port);
+#endif
         state.inputs.try_emplace(std::move(session_id), input);
       }
     }
@@ -2332,11 +2690,14 @@ namespace input {
     }
 
     // Workaround to ensure new frames will be captured when a client connects
-    task_pool.pushDelayed([]() {
-      platf::move_mouse(platf_input, 1, 1);
-      platf::move_mouse(platf_input, -1, -1);
-    },
-                          100ms);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (!private_context())
+#endif
+      task_pool.pushDelayed([]() {
+        platf::move_mouse(platf_input, 1, 1);
+        platf::move_mouse(platf_input, -1, -1);
+      },
+                            100ms);
 
     return input;
   }

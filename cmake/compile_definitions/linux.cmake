@@ -216,12 +216,18 @@ if(WAYLAND_FOUND)
     GEN_WAYLAND("${WAYLAND_PROTOCOLS_DIR}" "unstable/xdg-output" xdg-output-unstable-v1)
     GEN_WAYLAND("${WAYLAND_PROTOCOLS_DIR}" "unstable/linux-dmabuf" linux-dmabuf-unstable-v1)
     GEN_WAYLAND("${CMAKE_SOURCE_DIR}/third-party/wlr-protocols" "unstable" wlr-screencopy-unstable-v1)
+    if(NOT FREEBSD)
+        GEN_WAYLAND("${CMAKE_SOURCE_DIR}/protocols" "" lanternbox-private-output-v1)
+    endif()
 
     include_directories(
             SYSTEM
             ${WAYLAND_INCLUDE_DIRS}
     )
 
+    if(NOT FREEBSD)
+        list(APPEND PLATFORM_TARGET_FILES "${CMAKE_SOURCE_DIR}/src/platform/linux/private_seat_wayland.cpp")
+    endif()
     list(APPEND PLATFORM_LIBRARIES ${WAYLAND_LIBRARIES} gbm)
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/platform/linux/wlgrab.cpp"
@@ -302,6 +308,11 @@ set(LIBEVDEV_CUSTOM_LIBRARY "${EVDEV_LIBRARY}")
 
 list(APPEND PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/linux/input/virtualhid.cpp")
+if(NOT FREEBSD)
+    list(APPEND PLATFORM_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/private_seat_client.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/private_seat_input.cpp")
+endif()
 
 # AppImage and Flatpak
 if (${SUNSHINE_BUILD_APPIMAGE})

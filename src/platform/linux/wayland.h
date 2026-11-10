@@ -8,6 +8,7 @@
 #include <array>
 #include <bitset>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -18,6 +19,9 @@
   #include <linux-dmabuf-unstable-v1.h>
   #include <wlr-screencopy-unstable-v1.h>
   #include <xdg-output-unstable-v1.h>
+  #ifndef __FreeBSD__
+    #include <lanternbox-private-output-v1.h>
+  #endif
 #endif
 
 // local includes
@@ -340,8 +344,9 @@ namespace wl {
      * @brief Track a Wayland output and its advertised modes.
      *
      * @param output Wayland output object being described.
+     * @param global_id Registry global identifier for the output, or zero if unknown.
      */
-    explicit monitor_t(wl_output *output);
+    explicit monitor_t(wl_output *output, std::uint32_t global_id = 0);
 
     monitor_t(monitor_t &&) = delete;
     monitor_t(const monitor_t &) = delete;
@@ -399,7 +404,7 @@ namespace wl {
      * @param model Monitor model string reported by Wayland.
      * @param transform Wayland output transform value.
      */
-    void wl_geometry(wl_output *wl_output, std::int32_t x, std::int32_t y, std::int32_t physical_width, std::int32_t physical_height, std::int32_t subpixel, const char *make, const char *model, std::int32_t transform) {}
+    void wl_geometry(wl_output *wl_output, std::int32_t x, std::int32_t y, std::int32_t physical_width, std::int32_t physical_height, std::int32_t subpixel, const char *make, const char *model, std::int32_t transform);
 
     /**
      * @brief Store the active pixel mode reported by wl-output.
@@ -427,10 +432,17 @@ namespace wl {
      */
     void wl_scale(wl_output *wl_output, std::int32_t factor) {}
 
+    std::function<void()> private_metadata_changed;  ///< Private binding invalidation observer.
+    std::uint32_t global_id;  ///< Registry identity for explicit selection.
+    bool geometry_received {false};  ///< Whether wl-output geometry was received.
+    bool position_received {false};  ///< Whether xdg-output position was received.
+    bool size_received {false};  ///< Whether xdg-output size was received.
+    bool mode_received {false};  ///< Whether a current mode was received.
+    std::int32_t transform {-1};  ///< Advertised wl-output transform.
     wl_output *output;  ///< Wayland output associated with this monitor.
     std::string name;  ///< xdg-output name used for display selection.
     std::string description;  ///< xdg-output description used for logs and UI.
-    platf::touch_port_t viewport;  ///< Logical monitor bounds used to scale absolute input.
+    platf::touch_port_t viewport {};  ///< Logical monitor bounds used to scale absolute input.
     wl_output_listener wl_listener;  ///< Callback table for wl-output events.
     zxdg_output_v1_listener xdg_listener;  ///< Callback table for xdg-output events.
   };
@@ -468,6 +480,19 @@ namespace wl {
      * @param registry Wayland registry announcing globals.
      */
     void listen(wl_registry *registry);
+  #ifndef __FreeBSD__
+    /**
+     * @brief Discover globals on the actual capture connection, enabling private binding.
+     * @param display Wayland display used for capture.
+     */
+    void listen_capture(wl_display *display);
+    /** @brief Display associated with listen_capture, or null for legacy discovery. */
+    wl_display *capture_display {nullptr};
+    /** @brief Optional private-output manager, available only after registry discovery. */
+    lanternbox_private_output_manager_v1 *private_output_manager {nullptr};
+    /** @brief Exclusive registry-change observer owned by the private binding. */
+    std::function<void()> private_registry_changed;
+  #endif
 
     /**
      * @brief Test whether a required Wayland global was advertised.
@@ -508,6 +533,7 @@ namespace wl {
     void del_interface(wl_registry *registry, uint32_t id);
 
     std::bitset<MAX_INTERFACES> interface;
+    bool registry_listening {false};  ///< Prevent mixing registry discovery across displays.
     wl_registry_listener listener;
     zwp_linux_dmabuf_v1_listener dmabuf_listener;
   };

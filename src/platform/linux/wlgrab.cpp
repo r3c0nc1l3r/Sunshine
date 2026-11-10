@@ -3,6 +3,7 @@
  * @brief Definitions for wlgrab capture.
  */
 // standard includes
+#include <limits>
 #include <thread>
 
 // local includes
@@ -13,6 +14,10 @@
 #include "vaapi.h"
 #include "wayland.h"
 #include "wayland_stats.h"
+#ifndef __FreeBSD__
+  #include "private_seat_input.h"
+  #include "private_seat_wayland.h"
+#endif
 
 using namespace std::literals;
 
@@ -52,6 +57,11 @@ namespace wl {
    */
   class wlr_t: public platf::display_t {
   public:
+    /** @brief Retire private capture before the Wayland members are destroyed. */
+    ~wlr_t() override {
+      retire_private_capture();
+    }
+
     /**
      * @brief Initialize Wayland screencopy capture for the selected output.
      *
@@ -72,11 +82,34 @@ namespace wl {
 
       mem_type = hwdevice_type;
 
+#ifndef __FreeBSD__
+      if (config.private_seat_stream) {
+        private_handle = input::private_seat_handle();
+        transition = platf::private_seat_input::begin_capture_transition(private_handle, {});
+        if (!transition) {
+          BOOST_LOG(error) << "[wlgrab] Private-seat cleanup acknowledgement unavailable"sv;
+          return -1;
+        }
+        private_started = true;
+        capture_generation = platf::private_seat_input::allocate_capture_generation();
+        if (!capture_generation || config.width <= 0 || config.height <= 0) {
+          return -1;
+        }
+        gate = std::make_shared<platf::private_seat_input::capture_gate>();
+        stream_width = config.width;
+        stream_height = config.height;
+      }
+#endif
       if (display.init()) {
         return -1;
       }
 
-      interface.listen(display.registry());
+#ifndef __FreeBSD__
+      if (private_started) {
+        interface.listen_capture(display.get());
+      } else
+#endif
+        interface.listen(display.registry());
 
       display.roundtrip();
 
@@ -97,6 +130,12 @@ namespace wl {
       }
       display.roundtrip();
 
+#ifndef __FreeBSD__
+      if (private_started && interface.monitors.size() != 1) {
+        BOOST_LOG(error) << "[wlgrab] Private capture requires exactly one output"sv;
+        return -1;
+      }
+#endif
       auto monitor = interface.monitors[0].get();
 
       if (!display_name.empty()) {
@@ -119,6 +158,57 @@ namespace wl {
         }
       }
 
+#ifndef __FreeBSD__
+      if (private_started) {
+        private_seat::wayland_selection selection {monitor->output, monitor->name, monitor->global_id, {0, 0, static_cast<std::uint32_t>(monitor->viewport.width), static_cast<std::uint32_t>(monitor->viewport.height)}};
+        std::string binding_error;
+        binding = private_seat::wayland_binding::bind(display.get(), interface, selection, transition->peer, capture_generation, [weak = private_handle, owner_gate = gate, producer = transition->producer_generation](std::uint64_t, bool available) {
+          if (available) {
+            return;
+          }
+          owner_gate->invalidate();
+          if (auto ctx = weak.lock()) {
+            ctx->post([producer](auto &current) {
+              if (current.generation() == producer) {
+                current.reset();
+              }
+            });
+          }
+        },
+                                                      binding_error);
+        if (!binding) {
+          BOOST_LOG(error) << "[wlgrab] Private output binding failed: "sv << binding_error;
+          return -1;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (!binding->snapshot() && !binding->invalid()) {
+          auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+          if (remaining.count() <= 0 || !display.dispatch(remaining)) {
+            break;
+          }
+        }
+        auto snap = binding->snapshot();
+        const auto &welcome = transition->welcome;
+        if (!snap || binding->invalid() || snap->generation != capture_generation || snap->output_id != welcome.identity.output_id || snap->epoch != welcome.identity.epoch || snap->physical_width != welcome.physical_width || snap->physical_height != welcome.physical_height || snap->logical_width != welcome.logical_width || snap->logical_height != welcome.logical_height) {
+          BOOST_LOG(error) << "[wlgrab] Private output snapshot does not match WELCOME"sv;
+          return -1;
+        }
+        snapshot_proof.wayland_peer = snap->peer;
+        snapshot_proof.producer_generation = transition->producer_generation;
+        snapshot_proof.output_id = snap->output_id;
+        snapshot_proof.epoch = snap->epoch;
+        snapshot_proof.capture_generation = capture_generation;
+        snapshot_proof.snapshot_sequence = 1;
+        request_sequence = 1;
+        snapshot_proof.physical_width = snap->physical_width;
+        snapshot_proof.physical_height = snap->physical_height;
+        snapshot_proof.logical_width = snap->logical_width;
+        snapshot_proof.logical_height = snap->logical_height;
+        snapshot_proof.stream_width = stream_width;
+        snapshot_proof.stream_height = stream_height;
+        snapshot_proof.sole_full_normal_origin = true;
+      }
+#endif
       output = monitor->output;
 
       offset_x = monitor->viewport.offset_x;
@@ -179,6 +269,7 @@ namespace wl {
       const auto counters = wl::stats::snapshot();
       if (wl::stats::over_cap(counters)) {
         BOOST_LOG(warning) << "[wayland] Too many live capture buffers, reinitializing capture: "sv << wl::stats::format(counters, platf::count_open_fds());
+        invalidate_private_capture();
         return platf::capture_e::reinit;
       }
 
@@ -186,6 +277,11 @@ namespace wl {
         BOOST_LOG(info) << "[wayland] capture buffers: "sv << wl::stats::format(counters, platf::count_open_fds());
       }
 
+#ifndef __FreeBSD__
+      if (private_started && status != platf::capture_e::ok) {
+        invalidate_private_capture();
+      }
+#endif
       return status;
     }
 
@@ -199,6 +295,18 @@ namespace wl {
     platf::capture_e request_frame(std::chrono::milliseconds timeout, bool cursor) {
       auto to = std::chrono::steady_clock::now() + timeout;
 
+#ifndef __FreeBSD__
+      if (private_started) {
+        if (!binding || binding->invalid() || !binding->snapshot() || request_sequence == std::numeric_limits<std::uint64_t>::max()) {
+          return platf::capture_e::reinit;
+        }
+        frame_proof = snapshot_proof;
+        frame_proof.frame_output_id = snapshot_proof.output_id;
+        frame_proof.frame_epoch = snapshot_proof.epoch;
+        frame_proof.frame_capture_generation = capture_generation;
+        frame_proof.frame_request_sequence = ++request_sequence;
+      }
+#endif
       // Dispatch events until we get a new frame or the timeout expires
       dmabuf.listen(interface.screencopy_manager, interface.dmabuf_interface, &interface.supported_modifiers, output, cursor);
       do {
@@ -211,6 +319,9 @@ namespace wl {
       auto current_frame = dmabuf.current_frame;
 
       if (
+#ifndef __FreeBSD__
+        (private_started && (!binding || binding->invalid() || !binding->snapshot() || binding->snapshot()->output_id != frame_proof.frame_output_id || binding->snapshot()->epoch != frame_proof.frame_epoch || binding->snapshot()->generation != frame_proof.frame_capture_generation)) ||
+#endif
         dmabuf.status == dmabuf_t::REINIT ||
         current_frame->sd.width != width ||
         current_frame->sd.height != height
@@ -218,6 +329,123 @@ namespace wl {
         return platf::capture_e::reinit;
       }
 
+#ifndef __FreeBSD__
+      if (private_started) {
+        frame_proof.frame_width = current_frame->sd.width;
+        frame_proof.frame_height = current_frame->sd.height;
+      }
+#endif
+      return platf::capture_e::ok;
+    }
+
+    /** @brief Retire the gate immediately and reset its producer asynchronously. */
+    void invalidate_private_capture() {
+#ifndef __FreeBSD__
+      if (!private_started) {
+        return;
+      }
+      if (gate) {
+        gate->invalidate();
+      }
+      if (binding && !binding->invalid()) {
+        binding->invalidate();
+      } else if (auto ctx = private_handle.lock()) {
+        const auto producer = transition->producer_generation;
+        ctx->post([producer](auto &current) {
+          if (current.generation() == producer) {
+            current.reset();
+          }
+        });
+      }
+#endif
+    }
+
+    /**
+     * @brief Close the gate and wait outside it for server-side cleanup before teardown.
+     * @return True if cleanup is complete or unnecessary.
+     */
+    bool retire_private_capture() {
+#ifndef __FreeBSD__
+      if (!private_started || retired) {
+        return true;
+      }
+      invalidate_private_capture();
+      if (!qualification_posted) {
+        // The initial WELCOME already acknowledged cleanup before display.init.
+        // No READY could have been queued without a published frame, so this
+        // inactive producer cannot own pressed state or a capture mapping.
+        retired = true;
+        return true;
+      }
+      auto replacement = platf::private_seat_input::begin_capture_transition(private_handle, gate);
+      if (!replacement) {
+        BOOST_LOG(error) << "[wlgrab] Private-seat teardown cleanup acknowledgement unavailable"sv;
+        return false;
+      } else if (auto ctx = private_handle.lock()) {
+        const auto producer = replacement->producer_generation;
+        ctx->post([producer](auto &current) {
+          if (current.generation() == producer) {
+            current.reset();
+          }
+        });
+      }
+      retired = true;
+#endif
+      return true;
+    }
+
+    /**
+     * @brief Enforce the fallible cleanup barrier before the capture owner releases this display.
+     * @return True if the cleanup barrier succeeds.
+     */
+    bool prepare_input_transition() override {
+      return retire_private_capture();
+    }
+
+    /**
+     * @brief Publish copied pixels into the encoder's bounded in-memory slot.
+     * @param img Captured image associated with the publication.
+     * @param publish Callback that publishes the image.
+     * @return True if publication and any required qualification enqueue succeed.
+     */
+    bool publish_input_frame(const platf::img_t &img, const std::function<bool()> &publish) override {
+#ifndef __FreeBSD__
+      if (private_started) {
+        bool enqueue_qualification = false;
+        {
+          std::lock_guard lock {gate->mutex};
+          if (!gate->valid || !binding || binding->invalid() || !binding->snapshot() || img.width != frame_proof.frame_width || img.height != frame_proof.frame_height || frame_proof.frame_epoch != binding->snapshot()->epoch || frame_proof.frame_capture_generation != capture_generation || !publish()) {
+            return false;
+          }
+          frame_proof.latest_published_sequence = frame_proof.frame_request_sequence;
+          frame_proof.post_snapshot_frame_published = true;
+          gate->latest = frame_proof;
+          enqueue_qualification = !qualification_posted;
+        }
+        if (enqueue_qualification) {
+          qualification_posted = platf::private_seat_input::post_capture_qualification(private_handle, gate);
+          if (!qualification_posted) {
+            invalidate_private_capture();
+            return false;
+          }
+        }
+        return true;
+      }
+#endif
+      return publish();
+    }
+
+    /**
+     * @brief Preserve the capture callback's continuation semantics.
+     * @param push Callback accepting the captured image.
+     * @param img Image to publish.
+     * @return Timeout when the callback continues, or ok when it stops.
+     */
+    platf::capture_e publish_frame(const push_captured_image_cb_t &push, std::shared_ptr<platf::img_t> img) {
+      if (push(std::move(img), true)) {
+        return platf::capture_e::timeout;
+      }
+      invalidate_private_capture();
       return platf::capture_e::ok;
     }
 
@@ -228,6 +456,23 @@ namespace wl {
     wl::display_t display;  ///< Wayland display connection used for capture.
     interface_t interface;  ///< Wayland registry interfaces required by screencopy.
     dmabuf_t dmabuf;  ///< DMA-BUF feedback and format state advertised by the compositor.
+#ifndef __FreeBSD__
+    std::weak_ptr<platf::private_seat_input::context> private_handle;  ///< Dispatcher context.
+    std::optional<platf::private_seat_input::capture_transition> transition;  ///< Fresh cleanup acknowledgement.
+    std::shared_ptr<platf::private_seat_input::capture_gate> gate;  ///< Capture/input publication barrier.
+    std::unique_ptr<private_seat::wayland_binding> binding;  ///< Destroyed before the interface and display.
+    platf::private_seat_input::capture_proof snapshot_proof {};  ///< Immutable capture snapshot evidence.
+    platf::private_seat_input::capture_proof frame_proof {};  ///< Current request evidence.
+    std::uint64_t capture_generation = 0;  ///< Process-unique capture instance.
+    std::uint64_t request_sequence = 0;  ///< Checked request counter.
+    /** @var wl::wlr_t::stream_width
+     * @brief Configured encoder width.
+     */
+    std::uint32_t stream_width = 0, stream_height = 0;  ///< Configured encoder height.
+    bool private_started = false;  ///< Fresh producer was acquired.
+    bool retired = false;  ///< Teardown has already run.
+    bool qualification_posted = false;  ///< One bounded dispatcher qualification per capture instance.
+#endif
 
     wl_output *output;  ///< Wayland output selected for capture.
     wl::stats::periodic_gate_t stats_gate {60s};  ///< Limits the capture buffer statistics log line to about once a minute.
@@ -238,6 +483,11 @@ namespace wl {
    */
   class wlr_ram_t: public wlr_t {
   public:
+    /** @brief Retire private capture before derived resources are destroyed. */
+    ~wlr_ram_t() override {
+      retire_private_capture();
+    }
+
     platf::capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
       auto next_frame = std::chrono::steady_clock::now();
 
@@ -252,15 +502,24 @@ namespace wl {
           case platf::capture_e::reinit:
           case platf::capture_e::error:
           case platf::capture_e::interrupted:
+            invalidate_private_capture();
             return status;
           case platf::capture_e::timeout:
+#ifndef __FreeBSD__
+            if (private_started) {
+              return platf::capture_e::reinit;
+            }
+#endif
             if (!push_captured_image_cb(std::move(img_out), false)) {
               return platf::capture_e::ok;
             }
             break;
           case platf::capture_e::ok:
-            if (!push_captured_image_cb(std::move(img_out), true)) {
-              return platf::capture_e::ok;
+            {
+              auto result = publish_frame(push_captured_image_cb, std::move(img_out));
+              if (result != platf::capture_e::timeout) {
+                return result;
+              }
             }
             break;
           default:
@@ -391,6 +650,11 @@ namespace wl {
    */
   class wlr_vram_t: public wlr_t {
   public:
+    /** @brief Retire private capture before derived resources are destroyed. */
+    ~wlr_vram_t() override {
+      retire_private_capture();
+    }
+
     platf::capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
       auto next_frame = std::chrono::steady_clock::now();
 
@@ -405,15 +669,24 @@ namespace wl {
           case platf::capture_e::reinit:
           case platf::capture_e::error:
           case platf::capture_e::interrupted:
+            invalidate_private_capture();
             return status;
           case platf::capture_e::timeout:
+#ifndef __FreeBSD__
+            if (private_started) {
+              return platf::capture_e::reinit;
+            }
+#endif
             if (!push_captured_image_cb(std::move(img_out), false)) {
               return platf::capture_e::ok;
             }
             break;
           case platf::capture_e::ok:
-            if (!push_captured_image_cb(std::move(img_out), true)) {
-              return platf::capture_e::ok;
+            {
+              auto result = publish_frame(push_captured_image_cb, std::move(img_out));
+              if (result != platf::capture_e::timeout) {
+                return result;
+              }
             }
             break;
           default:

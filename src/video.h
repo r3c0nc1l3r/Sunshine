@@ -6,6 +6,7 @@
 
 // standard includes
 #include <chrono>
+#include <memory>
 #include <string_view>
 
 // local includes
@@ -39,6 +40,8 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    bool private_seat_stream = false;  ///< True only for an actual stream capture; encoder probes never activate private input.
+    std::shared_ptr<void> private_input_lease;  ///< Retains exclusive admission until every capture/encoder configuration is retired.
   };
 
   namespace amf {

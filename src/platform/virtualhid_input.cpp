@@ -15,6 +15,7 @@
 #include <numbers>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
@@ -22,6 +23,9 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "virtualhid_input.h"
+#if defined(__linux__) && !defined(__ANDROID__)
+  #include "src/platform/linux/private_seat_input.h"
+#endif
 
 using namespace std::literals;
 
@@ -523,6 +527,11 @@ namespace platf::virtualhid {
   }
 
   std::unique_ptr<lvh::Runtime> create_runtime(lvh::BackendKind backend) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (config::input.backend == "lanternbox-seat") {
+      return nullptr;
+    }
+#endif
     lvh::RuntimeOptions options;
     options.backend = backend;
     return lvh::Runtime::create(options);
@@ -1001,7 +1010,21 @@ namespace platf {
    * @brief Global libvirtualhid devices shared by clients.
    */
   struct input_raw_t {
+  #if defined(__linux__) && !defined(__ANDROID__)
+    std::unique_ptr<virtualhid::input_context_t> virtualhid;  ///< Optional legacy input context.
+    std::shared_ptr<private_seat_input::context> private_seat;  ///< Optional private input context.
+
+    /** @brief Construct only the selected backend. */
+    input_raw_t() {
+      if (config::input.backend == "lanternbox-seat") {
+        private_seat = std::make_shared<private_seat_input::context>();
+      } else {
+        virtualhid = std::make_unique<virtualhid::input_context_t>();
+      }
+    }
+  #else
     virtualhid::input_context_t virtualhid;  ///< libvirtualhid input context.
+  #endif
   };
 
   namespace {
@@ -1015,10 +1038,20 @@ namespace platf {
        *
        * @param input Platform input backend that receives the event.
        */
+  #if defined(__linux__) && !defined(__ANDROID__)
+      explicit client_input_raw_t(input_t &input) {
+        if (input->virtualhid) {
+          virtualhid = std::make_unique<virtualhid::client_context_t>(*input->virtualhid);
+        }
+      }
+
+      std::unique_ptr<virtualhid::client_context_t> virtualhid;  ///< Optional per-client legacy devices.
+  #else
       explicit client_input_raw_t(input_t &input):
           virtualhid {input->virtualhid} {}
 
       virtualhid::client_context_t virtualhid;  ///< libvirtualhid client context.
+  #endif
     };
 
   }  // namespace
@@ -1035,6 +1068,30 @@ namespace platf {
     std::default_delete<input_raw_t> {}(input);
   }
 
+  #if defined(__linux__) && !defined(__ANDROID__)
+  virtualhid::input_context_t &virtualhid::get_input_context(input_t &input) {
+    if (!input->virtualhid) {
+      throw std::logic_error("libvirtualhid context is unavailable with private-seat input");
+    }
+    return *input->virtualhid;
+  }
+
+  lvh::Runtime *virtualhid::get_runtime(input_t &input) {
+    return input->virtualhid ? input->virtualhid->runtime.get() : nullptr;
+  }
+
+  private_seat_input::context *private_seat_context(input_t &input) {
+    return input->private_seat.get();
+  }
+
+  std::shared_ptr<private_seat_input::context> private_seat_context_shared(input_t &input) {
+    return input->private_seat;
+  }
+
+  virtualhid::client_context_t &virtualhid::get_client_context(client_input_t *input) {
+    return *static_cast<client_input_raw_t *>(input)->virtualhid;
+  }
+  #else
   virtualhid::input_context_t &virtualhid::get_input_context(input_t &input) {
     return input->virtualhid;
   }
@@ -1042,71 +1099,174 @@ namespace platf {
   virtualhid::client_context_t &virtualhid::get_client_context(client_input_t *input) {
     return static_cast<client_input_raw_t *>(input)->virtualhid;
   }
+  #endif
 #endif
 
+  namespace {
+    /** @brief Return the legacy context after private dispatch has been excluded. */
+    virtualhid::input_context_t &legacy_input_context(input_t &input) {
+#if defined(__linux__) && !defined(__ANDROID__)
+      return *input->virtualhid;
+#else
+      return virtualhid::get_input_context(input);
+#endif
+    }
+  }  // namespace
+
   void move_mouse(input_t &input, int deltaX, int deltaY) {
-    virtualhid::move_mouse(virtualhid::get_input_context(input), deltaX, deltaY);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      private_seat_context(input)->move(deltaX, deltaY);
+      return;
+    }
+#endif
+    virtualhid::move_mouse(legacy_input_context(input), deltaX, deltaY);
   }
 
   void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y) {
-    virtualhid::abs_mouse(virtualhid::get_input_context(input), touch_port, x, y);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      // Private absolute packets are handled before legacy coordinate conversion.
+      return;
+    }
+#endif
+    virtualhid::abs_mouse(legacy_input_context(input), touch_port, x, y);
   }
 
   void button_mouse(input_t &input, int button, bool release) {
-    virtualhid::button_mouse(virtualhid::get_input_context(input), button, release);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      private_seat_context(input)->button(button, release);
+      return;
+    }
+#endif
+    virtualhid::button_mouse(legacy_input_context(input), button, release);
   }
 
   void scroll(input_t &input, int high_res_distance) {
-    virtualhid::scroll(virtualhid::get_input_context(input), high_res_distance);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      private_seat_context(input)->axis(high_res_distance, false);
+      return;
+    }
+#endif
+    virtualhid::scroll(legacy_input_context(input), high_res_distance);
   }
 
   void hscroll(input_t &input, int high_res_distance) {
-    virtualhid::hscroll(virtualhid::get_input_context(input), high_res_distance);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      private_seat_context(input)->axis(high_res_distance, true);
+      return;
+    }
+#endif
+    virtualhid::hscroll(legacy_input_context(input), high_res_distance);
   }
 
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags) {
-    virtualhid::keyboard_update(virtualhid::get_input_context(input), modcode, release, flags);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      private_seat_context(input)->key(modcode, release, flags);
+      return;
+    }
+#endif
+    virtualhid::keyboard_update(legacy_input_context(input), modcode, release, flags);
   }
 
   void unicode(input_t &input, const char *utf8, int size) {
-    virtualhid::unicode(virtualhid::get_input_context(input), utf8, size);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      BOOST_LOG(warning) << "Private-seat does not support Unicode input"sv;
+      return;
+    }
+#endif
+    virtualhid::unicode(legacy_input_context(input), utf8, size);
   }
 
   void touch_update(client_input_t *input, const touch_port_t &touch_port, const touch_input_t &touch) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (!static_cast<client_input_raw_t *>(input)->virtualhid) {
+      BOOST_LOG(warning) << "Private-seat does not support touch or pen"sv;
+      return;
+    }
+#endif
     virtualhid::touch_update(virtualhid::get_client_context(input), touch_port, touch);
   }
 
   void pen_update(client_input_t *input, const touch_port_t &touch_port, const pen_input_t &pen) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (!static_cast<client_input_raw_t *>(input)->virtualhid) {
+      BOOST_LOG(warning) << "Private-seat does not support touch or pen"sv;
+      return;
+    }
+#endif
     virtualhid::pen_update(virtualhid::get_client_context(input), touch_port, pen);
   }
 
 #ifndef _WIN32
   int alloc_gamepad(input_t &input, const gamepad_id_t &id, const gamepad_arrival_t &metadata, feedback_queue_t feedback_queue) {
-    return virtualhid::alloc_gamepad(virtualhid::get_input_context(input), id, metadata, std::move(feedback_queue));
+  #if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      BOOST_LOG(warning) << "Private-seat does not support gamepads"sv;
+      return -1;
+    }
+  #endif
+    return virtualhid::alloc_gamepad(legacy_input_context(input), id, metadata, std::move(feedback_queue));
   }
 
   int rebind_gamepad(input_t &input, const gamepad_id_t &id, feedback_queue_t feedback_queue) {
-    return virtualhid::rebind_gamepad(virtualhid::get_input_context(input), id, std::move(feedback_queue));
+  #if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      BOOST_LOG(warning) << "Private-seat does not support gamepads"sv;
+      return -1;
+    }
+  #endif
+    return virtualhid::rebind_gamepad(legacy_input_context(input), id, std::move(feedback_queue));
   }
 
   void free_gamepad(input_t &input, int nr) {
-    virtualhid::free_gamepad(virtualhid::get_input_context(input), nr);
+  #if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      return;
+    }
+  #endif
+    virtualhid::free_gamepad(legacy_input_context(input), nr);
   }
 
   void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state) {
-    virtualhid::gamepad_update(virtualhid::get_input_context(input), nr, gamepad_state);
+  #if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      return;
+    }
+  #endif
+    virtualhid::gamepad_update(legacy_input_context(input), nr, gamepad_state);
   }
 
   void gamepad_touch(input_t &input, const gamepad_touch_t &touch) {
-    virtualhid::gamepad_touch(virtualhid::get_input_context(input), touch);
+  #if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      return;
+    }
+  #endif
+    virtualhid::gamepad_touch(legacy_input_context(input), touch);
   }
 
   void gamepad_motion(input_t &input, const gamepad_motion_t &motion) {
-    virtualhid::gamepad_motion(virtualhid::get_input_context(input), motion);
+  #if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      return;
+    }
+  #endif
+    virtualhid::gamepad_motion(legacy_input_context(input), motion);
   }
 
   void gamepad_battery(input_t &input, const gamepad_battery_t &battery) {
-    virtualhid::gamepad_battery(virtualhid::get_input_context(input), battery);
+  #if defined(__linux__) && !defined(__ANDROID__)
+    if (private_seat_context(input)) {
+      return;
+    }
+  #endif
+    virtualhid::gamepad_battery(legacy_input_context(input), battery);
   }
 #endif
 

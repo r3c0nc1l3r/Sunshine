@@ -68,7 +68,12 @@ elseif(UNIX)
 endif()
 
 # libvirtualhid
-add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libvirtualhid")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    include("${CMAKE_SOURCE_DIR}/cmake/libvirtualhid_linux_patch.cmake")
+    sunshine_add_patched_libvirtualhid()
+else()
+    add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libvirtualhid")
+endif()
 list(APPEND SUNSHINE_EXTERNAL_LIBRARIES libvirtualhid::libvirtualhid)
 list(APPEND PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/virtualhid_input.h"
