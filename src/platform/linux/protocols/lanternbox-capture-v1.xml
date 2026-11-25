@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="lanternbox_capture_v1">
+  <copyright>Copyright 2026 lanternbox contributors. MIT license.</copyright>
+  <interface name="lanternbox_capture_manager_v1" version="2">
+    <description summary="explicit HDR capture agreement">
+      Version 1 exists only in a fixed HDR session and never changes the color mode.
+      Version 2 also supports prepared per-session intent when available.
+      A capturer must negotiate on the SAME wl_display connection used for
+      wlr-screencopy, before requesting frames. Version 1 supports only HDR10
+      dmabuf capture; no shm or mixed SDR/HDR capture is supported.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="get_hdr10">
+      <description summary="opt this connection into HDR10 for this output">
+        Creates a contract. Wait for done and validate every field before making
+        screencopy requests. The contract remains immutable for its lifetime;
+        generation identifies color semantics, not output dimensions. Mode/size
+        changes still invalidate pending screencopy frames in the usual way.
+        Keep this object alive while capturing. Destroying the last contract for
+        an output revokes permission for subsequent capture requests.
+      </description>
+      <arg name="id" type="new_id" interface="lanternbox_capture_contract_v1"/>
+      <arg name="output" type="object" interface="wl_output"/>
+    </request>
+    <request name="get_session" since="2">
+      <description summary="prepare immutable per-session capture intent">
+        Preparation is a probe: it acquires no lease and does not change output
+        color. requested_mode is 0 for SDR or 1 for HDR. An unavailable HDR
+        request prepares SDR instead; invalid metadata fails explicitly. Keep
+        the session on the same connection as its screencopy requests.
+      </description>
+      <arg name="id" type="new_id" interface="lanternbox_capture_session_v2"/>
+      <arg name="output" type="object" interface="wl_output"/>
+      <arg name="requested_mode" type="uint" enum="lanternbox_capture_session_v2.mode"/>
+    </request>
+  </interface>
+  <interface name="lanternbox_capture_contract_v1" version="2">
+    <description summary="immutable HDR10 capture contract">
+      Events are sent once, ending with done, or failed alone. The output is
+      the wl_output supplied to get_hdr10. All fields must be validated before
+      capturing. RGB is full range and BT.2020/ST2084; there is no YCbCr matrix
+      implied by this RGB contract. Consumer YCbCr conversion must use BT.2020
+      non-constant luminance, with encoder range signaled separately.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <event name="format">
+      <description summary="pixel encoding">
+        Version 1: generation=1, fourcc=DRM_FORMAT_ABGR2101010 (0x30334241),
+        primaries=9 and transfer_function=16 (H.273 codes), full_range=1.
+        Packed little-endian pixel: R bits 0..9, G 10..19, B 20..29, A 30..31.
+        Alpha is always 3. RGB code values span 0..1023, PQ normalized to
+        10000 cd/m2 independently of the virtual display peak.
+      </description>
+      <arg name="generation" type="uint"/>
+      <arg name="fourcc" type="uint"/>
+      <arg name="primaries" type="uint"/>
+      <arg name="transfer_function" type="uint"/>
+      <arg name="full_range" type="uint"/>
+    </event>
+    <event name="luminance">
+      <description summary="luminance metadata">
+        reference_white and mastering_max are in cd/m2. mastering_min is in
+        0.0001 cd/m2. max_cll and max_fall are in cd/m2; zero means unknown,
+        never substitute the virtual display peak for unknown content metadata.
+      </description>
+      <arg name="reference_white" type="uint"/>
+      <arg name="mastering_min" type="uint"/>
+      <arg name="mastering_max" type="uint"/>
+      <arg name="max_cll" type="uint"/>
+      <arg name="max_fall" type="uint"/>
+    </event>
+    <event name="mastering_primaries">
+      <description summary="mastering chromaticities">
+        CIE 1931 xy coordinates in units of 0.00002 (ST2086 units, multiply
+        by 50000). Order is red, green, blue, white. Version 1 uses BT.2020 D65.
+      </description>
+      <arg name="red_x" type="uint"/><arg name="red_y" type="uint"/>
+      <arg name="green_x" type="uint"/><arg name="green_y" type="uint"/>
+      <arg name="blue_x" type="uint"/><arg name="blue_y" type="uint"/>
+      <arg name="white_x" type="uint"/><arg name="white_y" type="uint"/>
+    </event>
+    <event name="done"/>
+    <event name="failed"><arg name="reason" type="string"/></event>
+  </interface>
+  <interface name="lanternbox_capture_session_v2" version="2">
+    <description summary="prepared capture intent and producer readiness">
+      The effective mode is immutable. A successful SDR preparation emits mode
+      then prepared; HDR emits mode, format, luminance, mastering_primaries,
+      then prepared. No HDR metadata is emitted for SDR. A failure emits
+      failed and invalidates the object; only destroy is then permitted.
+      Preparation never changes the output. Capture requires activate and ready
+      on this same connection. Concurrent mixed-mode admission is unspecified:
+      an implementation must not claim readiness for an unsatisfied intent.
+    </description>
+    <enum name="mode"><entry name="sdr" value="0"/><entry name="hdr" value="1"/></enum>
+    <enum name="error"><entry name="invalid_state" value="0" summary="request is invalid in this state"/></enum>
+    <request name="destroy" type="destructor">
+      <description summary="release this session">Release its lease, if any. In automatic mode the output returns to SDR after the last HDR lease is released.</description>
+    </request>
+    <request name="activate">
+      <description summary="acquire capture lease and await producer present">
+        Valid only after prepared. Requests receive ready in request order,
+        unless a terminal failed cancels outstanding acknowledgements.
+        Repeated activation is idempotent for lease ownership and must still
+        acknowledge each request. ready follows a full producer
+        present matching the effective mode and current color epoch; it is not
+        merely an output configuration acknowledgement.
+      </description>
+    </request>
+    <event name="mode"><arg name="effective_mode" type="uint" enum="mode"/></event>
+    <event name="format">
+      <description summary="HDR format">Identical color semantics and field units to the version 1 format event; generation is 1 and is not the ready epoch.</description>
+      <arg name="generation" type="uint"/><arg name="fourcc" type="uint"/>
+      <arg name="primaries" type="uint"/><arg name="transfer_function" type="uint"/><arg name="full_range" type="uint"/>
+    </event>
+    <event name="luminance">
+      <description summary="HDR luminance">Identical fields and units to the version 1 luminance event.</description>
+      <arg name="reference_white" type="uint"/><arg name="mastering_min" type="uint"/><arg name="mastering_max" type="uint"/>
+      <arg name="max_cll" type="uint"/><arg name="max_fall" type="uint"/>
+    </event>
+    <event name="mastering_primaries">
+      <description summary="HDR chromaticities">Identical fields and units to the version 1 mastering_primaries event.</description>
+      <arg name="red_x" type="uint"/><arg name="red_y" type="uint"/><arg name="green_x" type="uint"/><arg name="green_y" type="uint"/>
+      <arg name="blue_x" type="uint"/><arg name="blue_y" type="uint"/><arg name="white_x" type="uint"/><arg name="white_y" type="uint"/>
+    </event>
+    <event name="prepared"/>
+    <event name="ready">
+      <description summary="matching full producer present completed">Nonzero runtime color epoch; separate from metadata generation and output size/frame fence generation.</description>
+      <arg name="color_epoch" type="uint"/>
+    </event>
+    <event name="failed"><description summary="session invalidated">Terminal failure, including malformed HDR metadata or admission/activation failure. No ready follows a failure.</description><arg name="reason" type="string"/></event>
+  </interface>
+</protocol>

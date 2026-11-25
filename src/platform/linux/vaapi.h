@@ -14,6 +14,39 @@ namespace egl {
 
 namespace va {
   /**
+   * @brief Create an opt-in VRAM converter for full-range BT.2020/PQ ABGR2101010 to P010.
+   * @param width Source crop width.
+   * @param height Source crop height.
+   * @param offset_x Source crop X offset.
+   * @param offset_y Source crop Y offset.
+   * @return HDR-only encode device, or null on initialization failure.
+   */
+  std::unique_ptr<platf::avcodec_encode_device_t> make_hdr10_encode_device(int width, int height, int offset_x, int offset_y);
+
+  /**
+   * @brief Create the HDR converter using only an explicitly supplied render device.
+   * @param width Source crop width.
+   * @param height Source crop height.
+   * @param card Owned render-node descriptor; no adapter discovery or fallback is performed.
+   * @param offset_x Source crop X offset.
+   * @param offset_y Source crop Y offset.
+   * @return HDR-only encode device, or null on initialization failure.
+   */
+  std::unique_ptr<platf::avcodec_encode_device_t> make_hdr10_encode_device(int width, int height, file_t &&card, int offset_x, int offset_y);
+
+  /**
+   * @brief Initialize a VAAPI hardware context on the HDR converter's selected descriptor.
+   * @param device HDR device returned by make_hdr10_encode_device; it must outlive its frames.
+   * @param context Empty output reference, receiving an owned AVBufferRef on success.
+   * @return Zero on success; negative on invalid arguments or VAAPI initialization failure.
+   * @details Use av_hwframe_ctx_alloc on the returned buffer with VAAPI/P010; call init_hwframes before
+   * av_hwframe_ctx_init, then allocate a VAAPI frame and transfer its ownership with set_frame.
+   * The frame can be downloaded into a caller-owned P010 frame with av_hwframe_transfer_data.
+   * Callers must not interpret the backend-specific data pointer.
+   */
+  int initialize_hdr10_hwdevice(platf::avcodec_encode_device_t &device, AVBufferRef **context);
+
+  /**
    * Width --> Width of the image
    * Height --> Height of the image
    * offset_x --> Horizontal offset of the image in the texture

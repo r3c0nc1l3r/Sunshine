@@ -7,6 +7,20 @@ https://github.com/LizardByte/Sunshine/releases.
 Upstream base: `63d35f702ee9` (nightly `2026.914.233613`). Arch package `sunshine 2026.914.233613.12-1` (CUDA on;
 universal for both AMD VA-API and NVIDIA NVENC hosts).
 
+### Added
+- Experimental Lanternbox v2 per-session SDR/HDR negotiation: probes prepare without
+  switching the display, capture waits for producer readiness, and unavailable HDR
+  falls back to SDR encoding. Opposite simultaneous capture intents fail explicitly.
+  Compilation and SDR/HDR transition qualification are pending for this extension.
+- Opt-in Lanternbox HDR10 wlr contract negotiation and validated RGB10/PQ metadata on the capture connection,
+  a separate checked VAAPI VRAM RGB10-to-P010 converter with high-precision shaders and HDR-only HEVC VAAPI SEI.
+  The converter preserves already-PQ values, encoder YCbCr range and exact 10-bit packing, and rejects precision,
+  import, render and fallback failures. Remote release/docs/metadata checks and isolated synthetic GPU/capture
+  qualification passed; real-client presentation and broader coverage remain required. Default SDR shaders,
+  factories, formats and encoder options are unchanged.
+- Opt-in, supervised synthetic capture-to-HEVC qualification verifies decoded HDR patches and HDR control metadata;
+  it rejects blank startup IDRs, inherited socket descriptors and unsafe multi-output setups.
+
 ### Fixed
 - CUDA GL-interop (`gl_cuda_vram_t`): create, synchronize, and destroy the conversion stream through the CUDA Driver API
   (`cuStreamCreate`/`cuStreamSynchronize`/`cuStreamDestroy`) using FFmpeg's `AVCUDADeviceContext` instead of the CUDA
