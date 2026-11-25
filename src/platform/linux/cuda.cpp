@@ -112,6 +112,54 @@ namespace cuda {
   }
 
   /**
+   * @brief CUDA Driver API stream handle released with `cuStreamDestroy`.
+   */
+  using driver_stream_t = util::safe_ptr<CUstream_st, freeStream>;
+
+  /**
+   * @brief RAII guard that pushes an FFmpeg-owned CUDA context onto the calling thread.
+   */
+  class ctx_push_t {
+  public:
+    /**
+     * @brief Push the given CUDA context onto the calling thread's context stack.
+     *
+     * @param ctx Borrowed CUDA context handle to make current.
+     */
+    explicit ctx_push_t(CUcontext ctx):
+        pushed(false) {
+      if (ctx && cdf && check(cdf->cuCtxPushCurrent(ctx), "Couldn't push CUDA context: ") == 0) {
+        pushed = true;
+      }
+    }
+
+    ctx_push_t(const ctx_push_t &) = delete;
+    ctx_push_t &operator=(const ctx_push_t &) = delete;
+
+    /**
+     * @brief Pop the CUDA context if it was pushed by this guard.
+     */
+    ~ctx_push_t() {
+      if (pushed && cdf) {
+        CUcontext popped = nullptr;
+        CU_CHECK_IGNORE(cdf->cuCtxPopCurrent(&popped), "Couldn't pop CUDA context");
+      }
+    }
+
+    /**
+     * @brief Check whether the CUDA context was successfully pushed.
+     *
+     * @return True if the context is active on this thread, false otherwise.
+     */
+    explicit operator bool() const {
+      return pushed;
+    }
+
+  private:
+    bool pushed;  ///< Whether cuCtxPushCurrent succeeded and must be popped on destruction.
+  };
+
+  /**
    * @brief Unregister a CUDA graphics resource if it is still registered.
    *
    * @param resource CUDA graphics resource being mapped or unmapped.
@@ -408,6 +456,13 @@ namespace cuda {
   class gl_cuda_vram_t: public platf::avcodec_encode_device_t {
   public:
     /**
+     * @brief Release CUDA interop resources before EGL textures and FFmpeg context are torn down.
+     */
+    ~gl_cuda_vram_t() override {
+      release_cuda_resources();
+    }
+
+    /**
      * @brief Initialize the GL->CUDA encoding device.
      * @param in_width Width of captured frames.
      * @param in_height Height of captured frames.
@@ -463,6 +518,8 @@ namespace cuda {
      * @return 0 on success or -1 on failure.
      */
     int set_frame(AVFrame *frame, AVBufferRef *hw_frames_ctx_buf) override {
+      release_cuda_resources();
+
       this->hwframe.reset(frame);
       this->frame = frame;
 
@@ -505,13 +562,19 @@ namespace cuda {
       }
 
       auto cuda_ctx = (AVCUDADeviceContext *) hw_frames_ctx->device_ctx->hwctx;
+      cuda_ctx_handle = cuda_ctx->cuda_ctx;
+      auto rollback = util::fail_guard([this]() {
+        release_cuda_resources();
+      });
 
-      stream = make_stream();
-      if (!stream) {
+      ctx_push_t push(cuda_ctx_handle);
+      if (!push) {
         return -1;
       }
 
-      cuda_ctx->stream = stream.get();
+      CUstream raw_stream = nullptr;
+      CU_CHECK(cdf->cuStreamCreate(&raw_stream, CU_STREAM_DEFAULT), "Couldn't create cuda stream");
+      stream.reset(raw_stream);
 
       if (is_yuv444) {
         CU_CHECK(cdf->cuGraphicsGLRegisterImage(&cu_res.y_res, yuv444->tex[0], GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY), "Couldn't register Y texture");
@@ -521,6 +584,9 @@ namespace cuda {
         CU_CHECK(cdf->cuGraphicsGLRegisterImage(&cu_res.y_res, nv12->tex[0], GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY), "Couldn't register Y plane texture");
         CU_CHECK(cdf->cuGraphicsGLRegisterImage(&cu_res.uv_res, nv12->tex[1], GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY), "Couldn't register UV plane texture");
       }
+
+      cuda_ctx->stream = stream.get();
+      rollback.disable();
       return 0;
     }
 
@@ -557,9 +623,17 @@ namespace cuda {
         // Perform the color conversion and scaling in GL
         sws.convert_yuv444(yuv444->buf);
 
+        ctx_push_t push(cuda_ctx_handle);
+        if (!push) {
+          return -1;
+        }
+
         // Map the GL textures to read for CUDA
         std::array<CUgraphicsResource, 3> resources = {{cu_res.y_res.get(), cu_res.u_res.get(), cu_res.v_res.get()}};
         CU_CHECK(cdf->cuGraphicsMapResources(resources.size(), resources.data(), stream.get()), "Couldn't map GL textures in CUDA");
+        auto unmap_guard = util::fail_guard([&]() {
+          CU_CHECK_IGNORE(cdf->cuGraphicsUnmapResources(resources.size(), resources.data(), stream.get()), "Couldn't unmap GL textures from CUDA");
+        });
 
         // Copy from the GL textures to the target CUDA frame
         for (int i = 0; i < 3; i++) {
@@ -576,15 +650,24 @@ namespace cuda {
           CU_CHECK_IGNORE(cdf->cuMemcpy2DAsync(&cpy, stream.get()), "Couldn't copy texture to CUDA frame");
         }
         // Unmap the textures to allow modification from GL again
+        unmap_guard.disable();
         CU_CHECK(cdf->cuGraphicsUnmapResources(resources.size(), resources.data(), stream.get()), "Couldn't unmap GL textures from CUDA");
 
       } else {
         // Perform the color conversion and scaling in GL
         sws.convert_nv12(nv12->buf);
 
+        ctx_push_t push(cuda_ctx_handle);
+        if (!push) {
+          return -1;
+        }
+
         // Map the GL textures to read for CUDA
         std::array<CUgraphicsResource, 2> resources = {{cu_res.y_res.get(), cu_res.uv_res.get()}};
         CU_CHECK(cdf->cuGraphicsMapResources(resources.size(), resources.data(), stream.get()), "Couldn't map GL textures in CUDA");
+        auto unmap_guard = util::fail_guard([&]() {
+          CU_CHECK_IGNORE(cdf->cuGraphicsUnmapResources(resources.size(), resources.data(), stream.get()), "Couldn't unmap GL textures from CUDA");
+        });
 
         // Copy from the GL textures to the target CUDA frame
         for (int i = 0; i < 2; i++) {
@@ -601,6 +684,7 @@ namespace cuda {
           CU_CHECK_IGNORE(cdf->cuMemcpy2DAsync(&cpy, stream.get()), "Couldn't copy texture to CUDA frame");
         }
         // Unmap the textures to allow modification from GL again
+        unmap_guard.disable();
         CU_CHECK(cdf->cuGraphicsUnmapResources(resources.size(), resources.data(), stream.get()), "Couldn't unmap GL textures from CUDA");
       }
 
@@ -614,14 +698,51 @@ namespace cuda {
       sws.apply_colorspace(colorspace, is_yuv444);
     }
 
+    /**
+     * @brief Release CUDA interop resources and stream while the FFmpeg-owned CUDA context is active.
+     */
+    void release_cuda_resources() {
+      if (cuda_ctx_handle) {
+        if (hwframe && hwframe->hw_frames_ctx) {
+          auto *hw_frames_ctx = (AVHWFramesContext *) hwframe->hw_frames_ctx->data;
+          if (hw_frames_ctx && hw_frames_ctx->device_ctx && hw_frames_ctx->device_ctx->hwctx) {
+            auto *cuda_ctx = (AVCUDADeviceContext *) hw_frames_ctx->device_ctx->hwctx;
+            if (cuda_ctx->stream == stream.get()) {
+              cuda_ctx->stream = nullptr;
+            }
+          }
+        }
+        ctx_push_t push(cuda_ctx_handle);
+        if (push) {
+          if (stream) {
+            CU_CHECK_IGNORE(cdf->cuStreamSynchronize(stream.get()), "Couldn't synchronize cuda stream");
+          }
+          cu_res = {};
+          stream.reset();
+        } else {
+          BOOST_LOG(warning) << "Skipping CUDA resource teardown because CUDA context could not be pushed"sv;
+          (void) cu_res.y_res.release();
+          (void) cu_res.u_res.release();
+          (void) cu_res.v_res.release();
+          (void) cu_res.uv_res.release();
+          (void) stream.release();
+        }
+        cuda_ctx_handle = nullptr;
+      } else {
+        cu_res = {};
+        stream.reset();
+      }
+    }
+
     file_t file;  ///< File descriptor for the imported DMA-BUF.
     gbm::gbm_t gbm;  ///< GBM device used for buffer allocation..
     egl::display_t display;  ///< EGL display used to import captured frames.
     egl::ctx_t ctx;  ///< EGL context used to import captured frames.
 
-    // This must be destroyed before display_t
-    stream_t stream;  ///< CUDA stream used for asynchronous conversion work.
+    // This must be destroyed before display_t (and after release_cuda_resources() frees stream/cu_res)
     frame_t hwframe;  ///< FFmpeg hardware frame backed by CUDA resources.
+    CUcontext cuda_ctx_handle {nullptr};  ///< Borrowed FFmpeg CUDA context kept alive by hwframe.
+    driver_stream_t stream;  ///< CUDA Driver API stream used for asynchronous conversion work.
 
     egl::sws_t sws;  ///< Software scaler used for CUDA frame conversion fallback paths.
     egl::nv12_t nv12;  ///< EGL/OpenGL resources used for NV12 output frames.

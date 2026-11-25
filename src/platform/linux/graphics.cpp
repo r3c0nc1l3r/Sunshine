@@ -1003,11 +1003,22 @@ namespace egl {
       return std::nullopt;
     }
 
+    // Drain any prior GL errors so TexStorage2D failures (e.g. GL_OUT_OF_MEMORY) are detected cleanly
+    gl_drain_errors;
+
     gl::ctx.BindTexture(GL_TEXTURE_2D, nv12->tex[0]);
     gl::ctx.TexStorage2D(GL_TEXTURE_2D, 1, y_format, width, height);
+    if (auto err = gl::ctx.GetError(); err != GL_NO_ERROR) {
+      BOOST_LOG(error) << "Couldn't allocate NV12 Y texture storage: [0x"sv << util::hex(err).to_string_view() << ']';
+      return std::nullopt;
+    }
 
     gl::ctx.BindTexture(GL_TEXTURE_2D, nv12->tex[1]);
     gl::ctx.TexStorage2D(GL_TEXTURE_2D, 1, uv_format, width >> fmt_desc->log2_chroma_w, height >> fmt_desc->log2_chroma_h);
+    if (auto err = gl::ctx.GetError(); err != GL_NO_ERROR) {
+      BOOST_LOG(error) << "Couldn't allocate NV12 UV texture storage: [0x"sv << util::hex(err).to_string_view() << ']';
+      return std::nullopt;
+    }
 
     nv12->buf.bind(std::begin(nv12->tex), std::end(nv12->tex));
 
@@ -1050,14 +1061,29 @@ namespace egl {
       return std::nullopt;
     }
 
+    // Drain any prior GL errors so TexStorage2D failures (e.g. GL_OUT_OF_MEMORY) are detected cleanly
+    gl_drain_errors;
+
     gl::ctx.BindTexture(GL_TEXTURE_2D, yuv444->tex[0]);
     gl::ctx.TexStorage2D(GL_TEXTURE_2D, 1, y_format, width, height);
+    if (auto err = gl::ctx.GetError(); err != GL_NO_ERROR) {
+      BOOST_LOG(error) << "Couldn't allocate YUV444 Y texture storage: [0x"sv << util::hex(err).to_string_view() << ']';
+      return std::nullopt;
+    }
 
     gl::ctx.BindTexture(GL_TEXTURE_2D, yuv444->tex[1]);
     gl::ctx.TexStorage2D(GL_TEXTURE_2D, 1, u_format, width, height);
+    if (auto err = gl::ctx.GetError(); err != GL_NO_ERROR) {
+      BOOST_LOG(error) << "Couldn't allocate YUV444 U texture storage: [0x"sv << util::hex(err).to_string_view() << ']';
+      return std::nullopt;
+    }
 
     gl::ctx.BindTexture(GL_TEXTURE_2D, yuv444->tex[2]);
     gl::ctx.TexStorage2D(GL_TEXTURE_2D, 1, v_format, width, height);
+    if (auto err = gl::ctx.GetError(); err != GL_NO_ERROR) {
+      BOOST_LOG(error) << "Couldn't allocate YUV444 V texture storage: [0x"sv << util::hex(err).to_string_view() << ']';
+      return std::nullopt;
+    }
 
     yuv444->buf.bind(std::begin(yuv444->tex), std::end(yuv444->tex));
 
@@ -1383,8 +1409,13 @@ namespace egl {
     }
 
     auto tex = gl::tex_t::make(2);
+    gl_drain_errors;
     gl::ctx.BindTexture(GL_TEXTURE_2D, tex[0]);
     gl::ctx.TexStorage2D(GL_TEXTURE_2D, 1, gl_format, in_width, in_height);
+    if (auto err = gl::ctx.GetError(); err != GL_NO_ERROR) {
+      BOOST_LOG(error) << "Couldn't allocate SWS texture storage: [0x"sv << util::hex(err).to_string_view() << ']';
+      return std::nullopt;
+    }
 
     if (is_yuv444) {
       return make_yuv444(in_width, in_height, out_width, out_height, std::move(tex));

@@ -3,6 +3,20 @@
 Fork changes on top of the upstream base. Upstream's own changelog is at
 https://github.com/LizardByte/Sunshine/releases.
 
+## v2026.914.233613-lb.4
+Upstream base: `63d35f702ee9` (nightly `2026.914.233613`). Arch package `sunshine 2026.914.233613.12-1` (CUDA on;
+universal for both AMD VA-API and NVIDIA NVENC hosts).
+
+### Fixed
+- CUDA GL-interop (`gl_cuda_vram_t`): create, synchronize, and destroy the conversion stream through the CUDA Driver API
+  (`cuStreamCreate`/`cuStreamSynchronize`/`cuStreamDestroy`) using FFmpeg's `AVCUDADeviceContext` instead of the CUDA
+  Runtime API (`cudaStreamCreate`). Avoiding the CUDA Runtime API stops it from permanently retaining the GPU's primary
+  CUDA context (~106 MiB VRAM per idle NVIDIA instance after encoder probing or session end). Also guards
+  `cuGraphicsUnmapResources` on error paths in `convert()` and rolls back partial registration on `set_frame()` failure.
+- EGL texture allocation (`create_nv12_target`, `create_yuv444_target`, `sws_t::make`): check OpenGL errors after
+  `glTexStorage2D` so VRAM exhaustion fails cleanly with the GL error (e.g. `GL_OUT_OF_MEMORY`) instead of
+  passing unallocated textures to `cuGraphicsGLRegisterImage` (`CUDA_ERROR_NOT_SUPPORTED`).
+
 ## v2026.914.233613-lb.3
 Upstream base: `63d35f702ee9` (nightly `2026.914.233613`). Arch packages `sunshine 2026.914.233613.10-1` (CUDA off)
 and `sunshine 2026.914.233613.11-1` (CUDA on). Both sort above the lb.2 test packages `.7` and `.8`.
